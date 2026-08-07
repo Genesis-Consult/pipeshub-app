@@ -1,6 +1,10 @@
 import asyncio
+import base64
+import binascii
 import json
+import mimetypes
 import uuid
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from logging import Logger
@@ -326,20 +330,87 @@ class BookStackConnector(BaseConnector):
                 detail="BookStack connector not initialized"
             )
 
-        record_id = record.external_record_id.split('/')[1]
-        markdown_response = await self.data_source.export_page_markdown(record_id)
-        if not markdown_response.success:
+        record_type, separator, record_id = record.external_record_id.partition('/')
+        if not separator or not record_id:
             raise HTTPException(
-                status_code=HttpStatusCode.NOT_FOUND.value,
-                detail="Record not found or access denied"
+                status_code=HttpStatusCode.BAD_REQUEST.value,
+                detail="Invalid BookStack record identifier"
             )
-        raw_markdown = markdown_response.data.get("markdown")
 
-        return create_stream_record_response(
-            raw_markdown,
-            filename=record.record_name,
-            mime_type=record.mime_type,
-            fallback_filename=f"record_{record.id}"
+        if record_type == "page":
+            markdown_response = await self.data_source.export_page_markdown(record_id)
+            if not markdown_response.success:
+                raise HTTPException(
+                    status_code=HttpStatusCode.NOT_FOUND.value,
+                    detail="Record not found or access denied"
+                )
+            raw_markdown = markdown_response.data.get("markdown")
+            if not isinstance(raw_markdown, str):
+                raise HTTPException(
+                    status_code=HttpStatusCode.NOT_FOUND.value,
+                    detail="Record content is unavailable"
+                )
+
+            async def page_stream() -> AsyncGenerator[bytes, None]:
+                yield raw_markdown.encode("utf-8")
+
+            return create_stream_record_response(
+                page_stream(),
+                filename=record.record_name,
+                mime_type=record.mime_type,
+                fallback_filename=f"record_{record.id}"
+            )
+
+        if record_type == "attachment":
+            try:
+                attachment_id = int(record_id)
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=HttpStatusCode.BAD_REQUEST.value,
+                    detail="Invalid BookStack attachment identifier"
+                ) from exc
+
+            attachment_response = await self.data_source.get_attachment(attachment_id)
+            if not attachment_response.success or not attachment_response.data:
+                raise HTTPException(
+                    status_code=HttpStatusCode.NOT_FOUND.value,
+                    detail="Attachment not found or access denied"
+                )
+
+            attachment = attachment_response.data
+            if attachment.get("external"):
+                raise HTTPException(
+                    status_code=HttpStatusCode.UNPROCESSABLE_ENTITY.value,
+                    detail="External-link attachments are not downloaded"
+                )
+
+            encoded_content = attachment.get("content")
+            if not isinstance(encoded_content, str):
+                raise HTTPException(
+                    status_code=HttpStatusCode.NOT_FOUND.value,
+                    detail="Attachment content is unavailable"
+                )
+            try:
+                attachment_bytes = base64.b64decode(encoded_content, validate=True)
+            except (binascii.Error, ValueError, TypeError) as exc:
+                raise HTTPException(
+                    status_code=HttpStatusCode.BAD_GATEWAY.value,
+                    detail="BookStack returned invalid attachment content"
+                ) from exc
+
+            async def attachment_stream() -> AsyncGenerator[bytes, None]:
+                yield attachment_bytes
+
+            return create_stream_record_response(
+                attachment_stream(),
+                filename=record.record_name,
+                mime_type=record.mime_type,
+                fallback_filename=f"attachment_{record_id}"
+            )
+
+        raise HTTPException(
+            status_code=HttpStatusCode.BAD_REQUEST.value,
+            detail="Unsupported BookStack record type"
         )
 
     def _get_app_users(self, users: List[Dict]) -> List[AppUser]:
@@ -1593,10 +1664,11 @@ class BookStackConnector(BaseConnector):
 
         roles_details = await self.list_roles_with_details()
         users = await self.get_all_users()
+        page_contexts = None
 
         #if no sync point, initialize cursor and run _sync_users else run _sync_users_incremental
         if full_sync or not bookstack_record_sync_point.get('timestamp'):
-            await self._sync_records_full(roles_details, users)
+            page_contexts = await self._sync_records_full(roles_details, users)
             await self.record_sync_point.update_sync_point(
                 bookstack_record_sync_key,
                 {"timestamp": current_timestamp}
@@ -1609,7 +1681,9 @@ class BookStackConnector(BaseConnector):
                 {"timestamp": current_timestamp}
             )
 
-    async def _sync_records_full(self, roles_details: Dict[int, Dict], users: List[AppUser]) -> None:
+        await self._sync_attachments(page_contexts, roles_details)
+
+    async def _sync_records_full(self, roles_details: Dict[int, Dict], users: List[AppUser]) -> Dict[int, Dict]:
         """
         Sync all pages from BookStack as Record objects, handling new/updated/deleted records.
         """
@@ -1630,6 +1704,7 @@ class BookStackConnector(BaseConnector):
         )
 
         batch_records: List[Tuple[FileRecord, List[Permission]]] = []
+        page_contexts: Dict[int, Dict] = {}
         offset = 0
 
         while True:
@@ -1667,6 +1742,9 @@ class BookStackConnector(BaseConnector):
 
             # Process each page from the current API response
             for page in pages_page:
+                page_id = page.get("id")
+                if page_id is not None:
+                    page_contexts[int(page_id)] = page
                 record_update = await self._process_bookstack_page(page, roles_details, users)
 
                 if not record_update:
@@ -1707,6 +1785,294 @@ class BookStackConnector(BaseConnector):
             await self.data_entities_processor.on_new_records(batch_records)
 
         self.logger.info("✅ Finished syncing all page records.")
+        return page_contexts
+
+    async def _collect_syncable_pages(self) -> Dict[int, Dict]:
+        """Return the pages in connector scope, keyed by BookStack page ID."""
+        book_ids, book_ids_operator = self._get_book_id_filter()
+        modified_after, modified_before, created_after, created_before = self._get_date_filters()
+        api_filters = self._build_date_filter_params(
+            modified_after=modified_after,
+            modified_before=modified_before,
+            created_after=created_after,
+            created_before=created_before,
+        )
+        pages: Dict[int, Dict] = {}
+        offset = 0
+
+        while True:
+            response = await self.data_source.list_pages(
+                count=self.batch_size,
+                offset=offset,
+                filter=api_filters,
+            )
+            if not response.success or not response.data or "content" not in response.data:
+                raise RuntimeError(f"Failed to fetch pages for attachment sync: {response.error}")
+
+            try:
+                payload = json.loads(response.data["content"])
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise RuntimeError("BookStack returned malformed page data") from exc
+
+            page_batch = payload.get("data", [])
+            if not page_batch:
+                break
+
+            for page in page_batch:
+                page_id = page.get("id")
+                page_book_id = page.get("book_id")
+                if page_id is None:
+                    continue
+                if book_ids:
+                    if book_ids_operator.value == "in" and page_book_id not in book_ids:
+                        continue
+                    if book_ids_operator.value == "not_in" and page_book_id in book_ids:
+                        continue
+                pages[int(page_id)] = page
+
+            offset += len(page_batch)
+            if offset >= payload.get("total", 0):
+                break
+
+        return pages
+
+    async def _list_all_attachments(self) -> List[Dict]:
+        """List every attachment visible to the connector token without partial reconciliation."""
+        attachments: List[Dict] = []
+        offset = 0
+
+        while True:
+            response = await self.data_source.list_attachments(
+                count=self.batch_size,
+                offset=offset,
+            )
+            if not response.success or not response.data:
+                raise RuntimeError(f"Failed to fetch BookStack attachments: {response.error}")
+
+            batch = response.data.get("data", [])
+            if not isinstance(batch, list):
+                raise RuntimeError("BookStack returned malformed attachment data")
+            if not batch:
+                break
+
+            attachments.extend(batch)
+            offset += len(batch)
+            if offset >= response.data.get("total", 0):
+                break
+
+        return attachments
+
+    async def _get_page_attachment_permissions(
+        self,
+        page: Dict,
+        roles_details: Dict[int, Dict],
+    ) -> Optional[Tuple[List[Permission], bool]]:
+        """Resolve attachment permissions from its parent page, failing closed on API errors."""
+        page_id = page.get("id")
+        response = await self.data_source.get_content_permissions(
+            content_type="page",
+            content_id=page_id,
+        )
+        if not response.success or not response.data:
+            self.logger.error(
+                "Skipping attachments for page %s because its permissions could not be read: %s",
+                page_id,
+                response.error,
+            )
+            return None
+
+        permissions = await self._parse_bookstack_permissions(
+            response.data,
+            roles_details,
+            "page",
+        )
+        fallback_permissions = response.data.get("fallback_permissions") or {}
+        inherit_permissions = fallback_permissions.get("inheriting", True)
+        return permissions, bool(inherit_permissions)
+
+    def _attachment_record_name(self, attachment: Dict) -> str:
+        name = str(attachment.get("name") or f"attachment-{attachment.get('id')}")
+        extension = str(attachment.get("extension") or "").strip(".").lower()
+        if extension and not name.lower().endswith(f".{extension}"):
+            return f"{name}.{extension}"
+        return name
+
+    async def _process_bookstack_attachment(
+        self,
+        attachment: Dict,
+        page: Dict,
+        permissions: List[Permission],
+        inherit_permissions: bool,
+    ) -> Optional[RecordUpdate]:
+        """Build a binary FileRecord and detect metadata/content changes."""
+        attachment_id = attachment.get("id")
+        page_id = page.get("id")
+        if attachment_id is None or page_id is None:
+            self.logger.warning("Skipping attachment with missing ID or parent page: %s", attachment)
+            return None
+
+        external_id = f"attachment/{attachment_id}"
+        async with self.data_store_provider.transaction() as tx_store:
+            existing_record = await tx_store.get_record_by_external_id(
+                connector_id=self.connector_id,
+                external_id=external_id,
+            )
+
+        parent_group_id = None
+        if page.get("book_id"):
+            parent_group_id = f"book/{page.get('book_id')}"
+        if page.get("chapter_id"):
+            parent_group_id = f"chapter/{page.get('chapter_id')}"
+
+        record_name = self._attachment_record_name(attachment)
+        extension = str(attachment.get("extension") or "").strip(".").lower() or None
+        mime_type = mimetypes.guess_type(record_name)[0] or MimeTypes.UNKNOWN.value
+        revision = str(attachment.get("updated_at") or attachment.get("created_at") or attachment_id)
+        source_updated_at = self._parse_timestamp(attachment.get("updated_at"))
+        source_created_at = self._parse_timestamp(attachment.get("created_at"))
+
+        is_new = existing_record is None
+        metadata_changed = False
+        content_changed = False
+        if existing_record:
+            metadata_changed = any([
+                existing_record.record_name != record_name,
+                existing_record.parent_external_record_id != f"page/{page_id}",
+                existing_record.external_record_group_id != parent_group_id,
+                existing_record.mime_type != mime_type,
+                getattr(existing_record, "extension", None) != extension,
+            ])
+            content_changed = existing_record.external_revision_id != revision
+
+        file_record = FileRecord(
+            id=existing_record.id if existing_record else str(uuid.uuid4()),
+            record_name=record_name,
+            external_record_id=external_id,
+            connector_name=Connectors.BOOKSTACK,
+            connector_id=self.connector_id,
+            record_type=RecordType.FILE.value,
+            parent_record_type=RecordType.FILE.value,
+            parent_external_record_id=f"page/{page_id}",
+            external_record_group_id=parent_group_id,
+            origin=OriginTypes.CONNECTOR.value,
+            org_id=self.data_entities_processor.org_id,
+            source_updated_at=source_updated_at,
+            updated_at=source_updated_at or source_created_at or 0,
+            source_created_at=source_created_at,
+            created_at=source_created_at or source_updated_at or 0,
+            version=0 if is_new else existing_record.version + 1,
+            external_revision_id=revision,
+            weburl=f"{self.bookstack_base_url.rstrip('/')}/attachments/{attachment_id}",
+            mime_type=mime_type,
+            extension=extension,
+            is_file=True,
+            size_in_bytes=getattr(existing_record, "size_in_bytes", 0) or 0,
+            inherit_permissions=inherit_permissions,
+            is_dependent_node=True,
+        )
+
+        return RecordUpdate(
+            record=file_record,
+            is_new=is_new,
+            is_updated=bool(existing_record and (metadata_changed or content_changed or permissions)),
+            is_deleted=False,
+            metadata_changed=metadata_changed,
+            content_changed=content_changed,
+            permissions_changed=bool(existing_record),
+            new_permissions=permissions,
+            external_record_id=external_id,
+        )
+
+    async def _sync_attachments(
+        self,
+        page_contexts: Optional[Dict[int, Dict]],
+        roles_details: Dict[int, Dict],
+    ) -> None:
+        """Synchronize uploaded files and reconcile removed attachments on every run."""
+        if page_contexts is None:
+            page_contexts = await self._collect_syncable_pages()
+
+        attachments = await self._list_all_attachments()
+        attachments_by_page: Dict[int, List[Dict]] = {}
+        for attachment in attachments:
+            page_id = attachment.get("uploaded_to")
+            if page_id is None or int(page_id) not in page_contexts:
+                continue
+            if attachment.get("external"):
+                self.logger.info(
+                    "Skipping external-link BookStack attachment %s; remote URLs are not fetched",
+                    attachment.get("id"),
+                )
+                continue
+            attachments_by_page.setdefault(int(page_id), []).append(attachment)
+
+        new_records: List[Tuple[FileRecord, List[Permission]]] = []
+        seen_external_ids: Set[str] = set()
+        unreconciled_page_ids: Set[int] = set()
+
+        for page_id, page in page_contexts.items():
+            current_attachments = attachments_by_page.get(page_id, [])
+            if not current_attachments:
+                continue
+            permission_result = await self._get_page_attachment_permissions(page, roles_details)
+            if permission_result is None:
+                unreconciled_page_ids.add(page_id)
+                continue
+            permissions, inherit_permissions = permission_result
+
+            for attachment in current_attachments:
+                update = await self._process_bookstack_attachment(
+                    attachment,
+                    page,
+                    permissions,
+                    inherit_permissions,
+                )
+                if not update or not update.record:
+                    continue
+
+                seen_external_ids.add(update.external_record_id)
+                if not self.indexing_filters.is_enabled(IndexingFilterKey.FILES, default=True):
+                    update.record.indexing_status = ProgressStatus.AUTO_INDEX_OFF.value
+
+                if update.is_new:
+                    new_records.append((update.record, update.new_permissions or []))
+                    if len(new_records) >= self.batch_size:
+                        await self.data_entities_processor.on_new_records(new_records)
+                        new_records = []
+                elif update.is_updated:
+                    await self._handle_record_updates(update)
+
+        if new_records:
+            await self.data_entities_processor.on_new_records(new_records)
+
+        stale_record_ids: List[str] = []
+        async with self.data_store_provider.transaction() as tx_store:
+            for page_id in page_contexts:
+                if page_id in unreconciled_page_ids:
+                    continue
+                child_records = await tx_store.get_records_by_parent(
+                    self.connector_id,
+                    f"page/{page_id}",
+                    RecordType.FILE.value,
+                )
+                for child in child_records:
+                    if (
+                        child.external_record_id.startswith("attachment/")
+                        and child.external_record_id not in seen_external_ids
+                    ):
+                        stale_record_ids.append(child.id)
+
+        if stale_record_ids:
+            await self.data_entities_processor.on_records_deleted_cascade(
+                list(dict.fromkeys(stale_record_ids)),
+                self.connector_id,
+            )
+
+        self.logger.info(
+            "✅ Finished syncing %d BookStack file attachments; removed %d stale records.",
+            len(seen_external_ids),
+            len(stale_record_ids),
+        )
 
     async def _process_bookstack_page(self, page: Dict, roles_details: Dict[int, Dict], users: List[AppUser]) -> Optional[RecordUpdate]:
         """
@@ -1938,16 +2304,45 @@ class BookStackConnector(BaseConnector):
         delete_response = event_responses.get("delete")
         if delete_response and delete_response.success and delete_response.data.get('data'):
             self.logger.info(f"Found {len(delete_response.data['data'])} page(s) to delete.")
-            # for event in delete_response.data['data']:
-            #     await self._handle_page_delete_event(event)
+            for event in delete_response.data['data']:
+                await self._handle_page_delete_event(event)
 
         # 5. Process Move Events
         move_response = event_responses.get("move")
         if move_response and move_response.success and move_response.data.get('data'):
             self.logger.info(f"Found {len(move_response.data['data'])} page(s) to move.")
-            self.logger.warning("!! method not implemented yet !!")
+            for event in move_response.data['data']:
+                await self._handle_page_upsert_event(
+                    event, roles_details, users,
+                    modified_after=modified_after,
+                    modified_before=modified_before,
+                    created_after=created_after,
+                    created_before=created_before,
+                    book_ids=book_ids,
+                    book_ids_operator=book_ids_operator,
+                )
 
         self.logger.info("✅ Finished incremental record sync.")
+
+    async def _handle_page_delete_event(self, event: Dict) -> None:
+        """Cascade a deleted BookStack page to its indexed attachments and vectors."""
+        page_id, _ = self._parse_id_and_name_from_event(event)
+        if page_id is None:
+            self.logger.warning("Could not parse deleted page ID from event: %s", event)
+            return
+
+        async with self.data_store_provider.transaction() as tx_store:
+            page_record = await tx_store.get_record_by_external_id(
+                connector_id=self.connector_id,
+                external_id=f"page/{page_id}",
+            )
+        if not page_record:
+            return
+
+        await self.data_entities_processor.on_records_deleted_cascade(
+            [page_record.id],
+            self.connector_id,
+        )
 
 
     async def _handle_page_upsert_event(

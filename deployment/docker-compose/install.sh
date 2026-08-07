@@ -764,6 +764,7 @@ if ! ${SKIP_WIZARD:-false}; then
 # ── Deployment meta ─────────────────────────────────────────────────────────
 DEPLOY_TYPE=${DEPLOY_TYPE}
 IMAGE_TAG=${IMAGE_TAG}
+PIPESHUB_IMAGE_REPOSITORY=${PIPESHUB_IMAGE_REPOSITORY:-pipeshubai/pipeshub-ai}
 # prebuilt = pull from Docker Hub | local = build from source (--build)
 IMAGE_SOURCE=${IMAGE_SOURCE}
 # Override sandbox image tag for local builds; leave blank to use compose default

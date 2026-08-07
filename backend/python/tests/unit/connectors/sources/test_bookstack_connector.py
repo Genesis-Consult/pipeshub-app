@@ -1772,9 +1772,11 @@ class TestSyncRecords:
         connector.list_roles_with_details = AsyncMock(return_value={})
         connector.get_all_users = AsyncMock(return_value=[])
         connector._sync_records_full = AsyncMock()
+        connector._sync_attachments = AsyncMock()
 
         await connector._sync_records()
         connector._sync_records_full.assert_awaited_once()
+        connector._sync_attachments.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_incremental_sync_route(self, connector):
@@ -1786,9 +1788,11 @@ class TestSyncRecords:
         connector.list_roles_with_details = AsyncMock(return_value={})
         connector.get_all_users = AsyncMock(return_value=[])
         connector._sync_records_incremental = AsyncMock()
+        connector._sync_attachments = AsyncMock()
 
         await connector._sync_records()
         connector._sync_records_incremental.assert_awaited_once()
+        connector._sync_attachments.assert_awaited_once()
 
 
 class TestSyncRecordsFull:

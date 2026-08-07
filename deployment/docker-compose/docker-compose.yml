@@ -23,7 +23,7 @@ services:
   # PipesHub AI — the all-in-one application container
   # ---------------------------------------------------------------------------
   pipeshub-ai:
-    image: pipeshubai/pipeshub-ai:${IMAGE_TAG:-latest}
+    image: ${PIPESHUB_IMAGE_REPOSITORY:-pipeshubai/pipeshub-ai}:${IMAGE_TAG:-latest}
     container_name: pipeshub-ai
     restart: always
     # build: is used only when `docker compose up --build` (or install.sh --build) is run.

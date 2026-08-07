@@ -983,9 +983,11 @@ class TestSyncRecords:
         connector.list_roles_with_details = AsyncMock(return_value={})
         connector.get_all_users = AsyncMock(return_value=[])
         connector._sync_records_full = AsyncMock()
+        connector._sync_attachments = AsyncMock()
 
         await connector._sync_records()
         connector._sync_records_full.assert_awaited_once()
+        connector._sync_attachments.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_incremental_sync_route(self, connector):
@@ -997,9 +999,11 @@ class TestSyncRecords:
         connector.list_roles_with_details = AsyncMock(return_value={})
         connector.get_all_users = AsyncMock(return_value=[])
         connector._sync_records_incremental = AsyncMock()
+        connector._sync_attachments = AsyncMock()
 
         await connector._sync_records()
         connector._sync_records_incremental.assert_awaited_once()
+        connector._sync_attachments.assert_awaited_once()
 
 
 class TestSyncRecordsFull:
@@ -2199,7 +2203,8 @@ class TestBookStackCoverageGaps:
             _make_response(data={"data": [{"detail": "(4) Moved"}]}),
         ])
         await connector._sync_records_incremental("2025-01-01T00:00:00Z", {}, [])
-        assert connector._handle_page_upsert_event.await_count == 2
+        # update, permission update, and move all refresh the current page record
+        assert connector._handle_page_upsert_event.await_count == 3
 
     @pytest.mark.asyncio
     async def test_page_upsert_empty_list_json_error_not_in_indexing_off(
