@@ -1940,7 +1940,6 @@ class BookStackConnector(BaseConnector):
                 existing_record.parent_external_record_id != f"page/{page_id}",
                 existing_record.external_record_group_id != parent_group_id,
                 existing_record.mime_type != mime_type,
-                getattr(existing_record, "extension", None) != extension,
             ])
             content_changed = existing_record.external_revision_id != revision
 

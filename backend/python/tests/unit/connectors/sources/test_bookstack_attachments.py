@@ -37,7 +37,7 @@ sys.modules.setdefault(
 from app.config.constants.arangodb import Connectors, OriginTypes  # noqa: E402
 from app.connectors.core.registry.filters import FilterCollection  # noqa: E402
 from app.connectors.sources.bookstack.connector import BookStackConnector  # noqa: E402
-from app.models.entities import FileRecord, RecordType  # noqa: E402
+from app.models.entities import FileRecord, Record, RecordType  # noqa: E402
 from app.models.permission import EntityType, Permission, PermissionType  # noqa: E402
 
 
@@ -262,6 +262,41 @@ async def test_changed_revision_reindexes_existing_attachment(connector) -> None
     assert update.content_changed is True
     assert update.record.id == "record-11"
     assert update.record.version == 2
+
+
+@pytest.mark.asyncio
+async def test_unchanged_attachment_from_neo4j_is_not_a_metadata_update(connector) -> None:
+    """Neo4j returns a base Record without the File node's extension field."""
+    existing = Record(
+        id="record-11",
+        org_id="org-1",
+        record_name="policy.pdf",
+        record_type=RecordType.FILE,
+        external_record_id="attachment/11",
+        external_revision_id="2026-08-04T10:00:00Z",
+        external_record_group_id="chapter/3",
+        parent_external_record_id="page/7",
+        parent_record_type=RecordType.FILE,
+        version=1,
+        origin=OriginTypes.CONNECTOR,
+        connector_name=Connectors.BOOKSTACK,
+        connector_id="connector-1",
+        mime_type="application/pdf",
+        created_at=1,
+        updated_at=1,
+    )
+    connector._test_tx.get_record_by_external_id = AsyncMock(return_value=existing)
+
+    update = await connector._process_bookstack_attachment(
+        attachment(),
+        page(),
+        [read_permission()],
+        True,
+    )
+
+    assert update.is_new is False
+    assert update.metadata_changed is False
+    assert update.content_changed is False
 
 
 @pytest.mark.asyncio
