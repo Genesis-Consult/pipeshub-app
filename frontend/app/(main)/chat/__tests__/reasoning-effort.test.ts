@@ -80,6 +80,7 @@ Object.defineProperty(window, 'localStorage', {
 
 const { useChatStore, ctxKeyFromAgent, ASSISTANT_CTX } = await import('../store');
 const { buildStreamChatRequestForSlot } = await import('../runtime');
+const { buildStreamRequestModeFields } = await import('../types');
 
 const initialSettings = useChatStore.getState().settings;
 
@@ -100,6 +101,17 @@ function resetStore() {
 
 beforeEach(() => resetStore());
 afterEach(() => resetStore());
+
+describe('default query mode', () => {
+  it('starts new assistant sessions in Internal Search mode', () => {
+    const settings = useChatStore.getState().settings;
+
+    expect(settings.queryMode).toBe('chat');
+    expect(buildStreamRequestModeFields(settings)).toEqual({
+      chatMode: 'internal_search',
+    });
+  });
+});
 
 describe('reasoningEffort store actions', () => {
   it('starts with no reasoning effort recorded for a context', () => {
