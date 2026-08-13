@@ -293,6 +293,28 @@ class TestHandleRecordPermissionsRole:
         tx_store.batch_create_edges.assert_awaited()
 
     @pytest.mark.asyncio
+    async def test_role_permission_can_reference_another_connector(self):
+        """Resolves an identity role synchronized by another connector."""
+        proc = _make_processor()
+        tx_store = _make_tx_store()
+        tx_store.get_app_role_by_external_id.return_value = MagicMock(id="role-1")
+        record = _make_record(connector_id="bullhorn-connector")
+        record.id = "rec-1"
+        permission = Permission(
+            external_id="5",
+            source_connector_id="bookstack-connector",
+            type=PermissionType.READ,
+            entity_type=EntityType.ROLE,
+        )
+
+        await proc._handle_record_permissions(record, [permission], tx_store)
+
+        tx_store.get_app_role_by_external_id.assert_awaited_once_with(
+            external_id="5", connector_id="bookstack-connector"
+        )
+        tx_store.batch_create_edges.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_role_permission_unknown_role_skipped(self):
         """Skips permission when role not found."""
         proc = _make_processor()
@@ -4584,6 +4606,36 @@ class TestKbUploadProcessRecord:
             result = await proc._process_record(record, [], tx_store)
 
         assert result.indexing_status != ProgressStatus.NOT_STARTED.value
+
+    @pytest.mark.asyncio
+    async def test_existing_record_replaces_stale_direct_permissions(self):
+        proc = _make_processor()
+        tx_store = _make_tx_store()
+        existing = MagicMock(
+            id="record-1",
+            external_revision_id="rev1",
+            indexing_status=ProgressStatus.COMPLETED.value,
+            weburl="https://example.com/old",
+            is_placeholder=False,
+            record_group_id=None,
+        )
+        tx_store.get_record_by_external_id = AsyncMock(return_value=existing)
+        record = _make_record(external_revision_id="rev1")
+        permission = Permission(
+            external_id="5",
+            source_connector_id="bookstack-connector",
+            type=PermissionType.READ,
+            entity_type=EntityType.ROLE,
+        )
+
+        with patch.object(proc, "_handle_record_permissions", new_callable=AsyncMock):
+            await proc._process_record(record, [permission], tx_store)
+
+        tx_store.delete_edges_to.assert_awaited_once_with(
+            to_id="record-1",
+            to_collection=CollectionNames.RECORDS.value,
+            collection=CollectionNames.PERMISSION.value,
+        )
 
 
 class TestOnRecordsDeletedCascade:

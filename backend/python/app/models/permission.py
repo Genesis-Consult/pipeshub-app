@@ -25,6 +25,7 @@ class EntityType(str, Enum):
 
 class Permission(BaseModel):
     external_id: Optional[str] = None
+    source_connector_id: Optional[str] = None
     email: Optional[str] = None
     type: PermissionType
     entity_type: EntityType

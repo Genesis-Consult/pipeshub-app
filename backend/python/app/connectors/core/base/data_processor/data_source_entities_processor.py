@@ -766,6 +766,9 @@ class DataSourceEntitiesProcessor:
 
         try:
             for permission in permissions:
+                source_connector_id = getattr(permission, "source_connector_id", None)
+                if not isinstance(source_connector_id, str) or not source_connector_id:
+                    source_connector_id = record.connector_id
                 # Permission edges: Entity (User/Group) → Record
                 to_id = record.id
                 to_collection = CollectionNames.RECORDS.value
@@ -795,7 +798,7 @@ class DataSourceEntitiesProcessor:
                     if permission.external_id:
                         # Look up group by external_id
                         user_group = await tx_store.get_user_group_by_external_id(
-                            connector_id=record.connector_id,
+                            connector_id=source_connector_id,
                             external_id=permission.external_id
                         )
 
@@ -808,7 +811,10 @@ class DataSourceEntitiesProcessor:
                 elif permission.entity_type == EntityType.ROLE.value:
                     user_role = None
                     if permission.external_id:
-                        user_role = await tx_store.get_app_role_by_external_id(external_id=permission.external_id, connector_id=record.connector_id)
+                        user_role = await tx_store.get_app_role_by_external_id(
+                            external_id=permission.external_id,
+                            connector_id=source_connector_id,
+                        )
                     if user_role:
                         from_id = user_role.id
                         from_collection = CollectionNames.ROLES.value
@@ -1034,6 +1040,15 @@ class DataSourceEntitiesProcessor:
 
         # Create a edge between the base record and the specific record if it doesn't exist - isOfType - File, Mail, Message
 
+        # ``on_new_records`` is also used for full-sync upserts. Reconcile direct
+        # ACLs before writing the new set so a connector cannot leave stale,
+        # broader access behind after changing its permission policy.
+        if existing_record is not None and permissions:
+            await tx_store.delete_edges_to(
+                to_id=record.id,
+                to_collection=CollectionNames.RECORDS.value,
+                collection=CollectionNames.PERMISSION.value,
+            )
         await self._handle_record_permissions(record, permissions, tx_store)
         #Todo: Check if record is updated, permissions are updated or content is updated
         #if existing_record:
