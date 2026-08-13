@@ -292,6 +292,10 @@ export class Application {
     if (isStrictMode) {
       // Security middleware - configure helmet once with all options
       const envConnectSrcs = process.env.CSP_CONNECT_SRCS?.split(',').filter(Boolean) ?? [];
+      const frameAncestors = process.env.CSP_FRAME_ANCESTORS
+        ?.split(',')
+        .map((origin) => origin.trim())
+        .filter(Boolean) ?? [];
       const connectSrc = [
         ...new Set([
           "'self'",
@@ -308,10 +312,14 @@ export class Application {
       ].filter(Boolean);
 
       this.app.use(helmet({
+        // X-Frame-Options cannot express an origin allow-list. CSP frame-ancestors
+        // is used when trusted embedding origins are explicitly configured.
+        frameguard: frameAncestors.length > 0 ? false : { action: 'sameorigin' },
         crossOriginOpenerPolicy: { policy: "unsafe-none" }, // Required for MSAL popup
         contentSecurityPolicy: {
           directives: {
             defaultSrc: ["'self'"],
+            frameAncestors: ["'self'", ...frameAncestors],
             scriptSrc: [
               "'self'",
               ...(process.env.CSP_SCRIPT_SRCS?.split(',') ?? [

@@ -778,6 +778,7 @@ COMPOSE_PROFILES=${COMPOSE_PROFILES}
 NODE_ENV=production
 LOG_LEVEL=info
 SECRET_KEY=${SECRET_KEY}
+CSP_FRAME_ANCESTORS=${CSP_FRAME_ANCESTORS:-}
 
 # Public URL — HTTPS domain for cloud/external deployments (leave blank for localhost)
 # Required for OAuth callbacks, webhook integrations, and browser security.
