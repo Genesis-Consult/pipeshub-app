@@ -1,0 +1,1 @@
+"""Bullhorn connector shared definitions."""

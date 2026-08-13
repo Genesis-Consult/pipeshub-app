@@ -40,6 +40,7 @@ from app.connectors.sources.atlassian.jira_data_center_personal.connector import
 from app.connectors.sources.azure_blob.connector import AzureBlobConnector
 from app.connectors.sources.azure_files.connector import AzureFilesConnector
 from app.connectors.sources.bookstack.connector import BookStackConnector
+from app.connectors.sources.bullhorn.connector import BullhornConnector
 from app.connectors.sources.box.connector import BoxConnector
 from app.connectors.sources.dropbox.connector import DropboxConnector
 from app.connectors.sources.dropbox_individual.connector import (
@@ -116,6 +117,7 @@ class ConnectorFactory:
         "rss": RSSConnector,
         "localfs": LocalFsConnector,
         "bookstack": BookStackConnector,
+        "bullhorn": BullhornConnector,
         "github": GithubConnector,
         "s3": S3Connector,
         "minio": MinIOConnector,

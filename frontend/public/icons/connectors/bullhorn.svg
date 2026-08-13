@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title">
+  <title id="title">Bullhorn</title>
+  <rect width="64" height="64" rx="14" fill="#f97316"/>
+  <path fill="#fff" d="M13 27h8l23-10v30L21 37h-8V27Zm8 13 8 3v8H18l3-11Zm27-17h3a7 7 0 0 1 0 14h-3V23Z"/>
+</svg>
