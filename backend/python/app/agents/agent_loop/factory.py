@@ -93,9 +93,6 @@ from app.agents.agent_loop.hooks import (
     citation_tracking,
     completion_gate,
     conversation_enrichment,
-    full_record_fetch_tracking,
-    full_record_gate,
-    looks_like_file_generation_request,
     resolve_attachments_for_goal,
     resolve_history_attachments,
     result_accumulation,
@@ -206,6 +203,7 @@ class PipesHubAgentFactory:
         query: str,
         model_name: str = "",
         session_id: str | None = None,
+        model_key: str | None = None,
     ) -> tuple[Agent, AgentRuntime, "Goal", list["AskUserQuestionItemInput"]]:
         """Builds a fully-wired `Agent` plus the intent-parsed `Goal` it
         should run with. Async because every request now resolves its
@@ -237,7 +235,9 @@ class PipesHubAgentFactory:
         transport_registry.register(
             "langchain",
             traced_transport_factory(
-                lambda: LangChainTransport(llm, model_name=model_name, opik_project_name=opik_project_name),
+                lambda: LangChainTransport(
+                    llm, model_name=model_name, opik_project_name=opik_project_name, model_key=model_key,
+                ),
                 opik_active=opik_active,
                 project_name=opik_project_name,
             ),
@@ -376,16 +376,6 @@ class PipesHubAgentFactory:
             opik_active=opik_active,
             opik_project_name=opik_project_name,
             transport_registry=transport_registry,
-        )
-
-        # Read by `hooks/completion_gate.py` (already wired onto `hooks`
-        # above) once the agent actually runs — computed from the raw query
-        # and the ORIGINAL goal description (pre-attachment), since attachment
-        # text often contains file-format tokens (e.g. ".pdf" in a filename)
-        # that would false-positive when the user only uploaded a file for
-        # analysis, not requested one to be generated.
-        context.file_generation_requested = looks_like_file_generation_request(
-            query, goal.description,
         )
 
         # Stash model_name on context so ensure_fetch_full_record_available()
@@ -759,6 +749,9 @@ class PipesHubAgentFactory:
                 # `_find_web_record_by_url`'s page-level fallback for why
                 # that's an acceptable, not fully solved, trade-off).
                 "dynamic__web_search", "dynamic__fetch_url",
+                # Same reasoning: fetch_full_record results carry [refN]
+                # markers that AnswerFinalizer needs to build citations.
+                "knowledgegraph__fetch_record",
             }),
         ))
         hooks.on(HookEvent.PRE_MODEL).use(shape_loop_compaction())            # L4
@@ -799,34 +792,13 @@ class PipesHubAgentFactory:
 
         hooks.on(HookEvent.POST_TOOL_USE).use(ask_user_question_sse(context))
 
-        # Track which record IDs were actually fetched, so the gate can exclude
-        # them from its candidate re-computation.
-        hooks.on(HookEvent.POST_TOOL_USE).use(full_record_fetch_tracking(context))
-
         hooks.on(HookEvent.PRE_TURN).use(conversation_enrichment(context))
         hooks.on(HookEvent.PRE_TURN).use(attachment_rehydration(context))
         hooks.on(HookEvent.PRE_TURN).use(artifact_context_reminder(context))
         hooks.on(HookEvent.PRE_TURN).use(seed_visible_tools_from_history(context))
 
-        # Refuses a text-only, no-tool-call turn as "done" when the request
-        # needed a generated file and no artifact has been produced yet —
-        # see `hooks/completion_gate.py`. Registered unconditionally: it is
-        # a no-op for every request `context.file_generation_requested`
-        # ends up False for (set further up in `create()`, after intent
-        # resolves the goal).
+        # Recovers from empty model responses (no text, no tool calls).
         hooks.on(HookEvent.POST_MODEL).use(completion_gate(context))
-
-        # Full-record sufficiency gate: fires when the model answered from
-        # fragments but whole-document content is still needed. The judge
-        # runs at most once per request (guarded inside the middleware).
-        if transport_registry is not None:
-            from app.modules.agents.record_escalation.judge import LLMFetchJudge
-            _judge = LLMFetchJudge(
-                transport_registry,
-                model_name,
-                logging.getLogger("app.agents.agent_loop.full_record_judge"),
-            )
-            hooks.on(HookEvent.POST_MODEL).use(full_record_gate(context, _judge))
 
         # This adapter path builds its own HookRegistry directly (never
         # goes through ControlPlane.start()), so the coding_sandbox_safety

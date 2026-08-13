@@ -10,7 +10,6 @@ import { getMimeTypeExtension } from '@/lib/utils/file-icon-utils';
 import { ICON_SIZES } from '@/lib/constants/icon-sizes';
 import { ChatInputExpansionPanel } from '@/chat/components/chat-panel/expansion-panels/chat-input-expansion-panel';
 import { ChatInputOverlayPanel } from '@/chat/components/chat-panel/expansion-panels/chat-input-overlay-panel';
-import { QueryModePanel } from '@/chat/components/chat-panel/expansion-panels/query-mode-panel';
 import { ConnectorsCollectionsPanel } from '@/chat/components/chat-panel/expansion-panels/connectors-collections/connectors-collections-panel';
 import { AgentScopedResourcesPanel } from '@/chat/components/chat-panel/expansion-panels/agent-scoped-resources-panel';
 import { UniversalAgentResourcesPanel } from '@/chat/components/chat-panel/expansion-panels/universal-agent-resources-panel';
@@ -22,12 +21,12 @@ import {
 import { SelectedCollections } from '@/chat/components/selected-collections';
 import { resolveConnectorType } from '@/app/components/ui/ConnectorIcon';
 import {
-  ModeSwitcher,
   AgentStrategyModeSwitcher,
   AgentStrategyModePanel,
+  PlusMenuButton,
+  PlusMenuSheet,
 } from '@/chat/components/chat-panel';
 import { MobileQueryOptionsSheet } from '@/chat/components/chat-panel/expansion-panels/mobile-query-options-sheet';
-import { MobileQueryModesSheet } from '@/chat/components/chat-panel/expansion-panels/mobile-query-modes-sheet';
 import { getQueryModeConfig } from '@/chat/constants';
 import { useChatStore, ctxKeyFromAgent, isModelReasoningCapable } from '@/chat/store';
 import { useIsMobile } from '@/lib/hooks/use-is-mobile';
@@ -44,6 +43,13 @@ import type {
   AttachmentRef,
 } from '@/chat/types';
 import { CHAT_ATTACHMENT_MAX_BYTES, CHAT_ATTACHMENT_MAX_FILES, DEFAULT_REASONING_EFFORT } from '@/chat/types';
+import {
+  SUPPORTED_FILE_TYPES,
+  ACCEPTED_MIME_TYPES,
+  ACCEPTED_EXTENSIONS,
+  isFileTypeSupported,
+  pasteFallbackExtension,
+} from '../utils/attachment-file-types';
 
 type ChatInputVariant = 'full' | 'widget';
 
@@ -80,30 +86,10 @@ interface ChatInputProps {
   agentId?: string | null;
 }
 
-const SUPPORTED_FILE_TYPES = ['PDF', 'PNG', 'JPEG', 'JPG', 'TXT', 'MD'];
-const ACCEPTED_MIME_TYPES = {
-  'application/pdf': 'PDF',
-  'image/png': 'PNG',
-  'image/jpeg': 'JPEG',
-  'image/jpg': 'JPEG',
-  'text/plain': 'TXT',
-  'text/markdown': 'MD',
-};
-// Extension fallback for files that arrive without a recognisable MIME type
-// (e.g. on some Windows setups the file.type may be empty).
-const ACCEPTED_EXTENSIONS = ['pdf', 'png', 'jpeg', 'jpg', 'txt', 'md'];
-
 function formatFileSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
-function isFileTypeSupported(file: File): boolean {
-  const mimeType = file.type;
-  if (Object.keys(ACCEPTED_MIME_TYPES).includes(mimeType)) return true;
-  const ext = file.name.split('.').pop()?.toLowerCase() ?? '';
-  return ACCEPTED_EXTENSIONS.includes(ext);
 }
 
 interface SpeechInputButtonProps {
@@ -177,7 +163,6 @@ export function ChatInput({
   const [isPanelDragging, setIsPanelDragging] = useState(false);
   const [isExpanded, setIsExpanded] = useState(variant === 'full');
   const [isAnimatingIn, setIsAnimatingIn] = useState(false);
-  const [isModePanelOpen, setIsModePanelOpen] = useState(false);
   const [isAgentStrategyPanelOpen, setIsAgentStrategyPanelOpen] = useState(false);
   const [isCollectionsPanelOpen, setIsCollectionsPanelOpen] = useState(false);
   /** Agent chat: Connectors / Collections / Actions (Figma agent input). */
@@ -186,7 +171,9 @@ export function ChatInput({
   const [isModelButtonHovered, setIsModelButtonHovered] = useState(false);
   const [isAddFileButtonHovered, setIsAddFileButtonHovered] = useState(false);
   const [isMobileOptionsOpen, setIsMobileOptionsOpen] = useState(false);
-  const [isMobileModesOpen, setIsMobileModesOpen] = useState(false);
+  /** "+" menu — Attach files & Internal Search / Web Search capability toggles. */
+  const [isPlusMenuOpen, setIsPlusMenuOpen] = useState(false);
+  const [isMobilePlusMenuOpen, setIsMobilePlusMenuOpen] = useState(false);
   const [isCompactToolbar, setIsCompactToolbar] = useState(false);
   const [isCompactMenuOpen, setIsCompactMenuOpen] = useState(false);
   const [isInputFocused, setIsInputFocused] = useState(false);
@@ -246,7 +233,6 @@ export function ChatInput({
   // Read all chat settings directly from the shared store
   const settings = useChatStore((s) => s.settings);
   const setMode = useChatStore((s) => s.setMode);
-  const setQueryMode = useChatStore((s) => s.setQueryMode);
   const setAgentStrategy = useChatStore((s) => s.setAgentStrategy);
   const setFilters = useChatStore((s) => s.setFilters);
   const setSelectedModelForCtx = useChatStore((s) => s.setSelectedModelForCtx);
@@ -260,7 +246,58 @@ export function ChatInput({
   const agentChatToolGroups = useChatStore((s) => s.agentChatToolGroups);
   const universalAgentStreamTools = useChatStore((s) => s.universalAgentStreamTools);
   const universalAgentToolsLoading = useChatStore((s) => s.universalAgentToolsLoading);
+  // "+" menu capability toggles — universal agent uses settings.agentCapabilities;
+  // scoped custom agents use their own per-agent capabilities map.
+  const setAgentCapabilities = useChatStore((s) => s.setAgentCapabilities);
+  const agentChatConnectors = useChatStore((s) => s.agentChatConnectors);
+  const agentChatKbIds = useChatStore((s) => s.agentChatKbIds);
+  const agentHasWebSearch = useChatStore((s) => s.agentHasWebSearch);
+  const scopedAgentCapabilities = useChatStore((s) =>
+    agentId ? s.scopedAgentCapabilities[agentId] : undefined
+  );
+  const setScopedAgentCapabilities = useChatStore((s) => s.setScopedAgentCapabilities);
+  const agentHasInternalSearch = agentChatConnectors.length > 0 || agentChatKbIds.length > 0;
+  const scopedInternalSearch = scopedAgentCapabilities?.internalSearch ?? true;
+  const scopedWebSearch = scopedAgentCapabilities?.webSearch ?? true;
   const universalAgentToolGroups = useChatStore((s) => s.universalAgentToolGroups);
+
+  // Shared capability wiring for the desktop "+" popover (PlusMenuButton) and
+  // the mobile "+" sheet (PlusMenuSheet) — kept in one place so the two
+  // surfaces can't drift. `isAgentChat` and `agentId` come from the same
+  // `effectiveAgentId` at the only real call site today, but `ChatInput`
+  // still declares them as independent props, so a scoped chat without a
+  // resolved `agentId` disables the toggles instead of silently no-op'ing.
+  const plusMenuCapabilities = useMemo(() => {
+    const canPersistScoped = isAgentChat && Boolean(agentId);
+    return {
+      internalSearch: isAgentChat ? scopedInternalSearch : settings.agentCapabilities.internalSearch,
+      webSearch: isAgentChat ? scopedWebSearch : settings.agentCapabilities.webSearch,
+      onToggleInternalSearch: (enabled: boolean) => {
+        if (canPersistScoped) setScopedAgentCapabilities(agentId as string, { internalSearch: enabled });
+        else if (!isAgentChat) setAgentCapabilities({ internalSearch: enabled });
+      },
+      onToggleWebSearch: (enabled: boolean) => {
+        if (canPersistScoped) setScopedAgentCapabilities(agentId as string, { webSearch: enabled });
+        else if (!isAgentChat) setAgentCapabilities({ webSearch: enabled });
+      },
+      agentHasInternalSearch: isAgentChat
+        ? (agentHasInternalSearch && canPersistScoped ? undefined : false)
+        : undefined,
+      agentHasWebSearch: isAgentChat
+        ? (agentHasWebSearch && canPersistScoped ? undefined : false)
+        : undefined,
+    };
+  }, [
+    isAgentChat,
+    agentId,
+    scopedInternalSearch,
+    scopedWebSearch,
+    settings.agentCapabilities,
+    setScopedAgentCapabilities,
+    setAgentCapabilities,
+    agentHasInternalSearch,
+    agentHasWebSearch,
+  ]);
 
   // Context key for the active (agent-scoped or assistant) chat. All
   // model-related reads/writes below are keyed by this so assistant selections
@@ -349,13 +386,13 @@ export function ChatInput({
   const modeColors = activeQueryConfig.colors;
   const agentQueryToolbarConfig = getQueryModeConfig('agent')!;
   const agentStrategyToolbarColors = agentQueryToolbarConfig.colors;
-  /** Query-mode, agent-strategy, or agent resources panel — chrome + outside click. */
+  /** Agent-strategy or agent resources panel — chrome + outside click (agent chat only; no mode picker anymore). */
   const modeChromeOpen = isAgentChat
     ? isAgentStrategyPanelOpen || isAgentResourcesPanelOpen
-    : isModePanelOpen;
+    : false;
 
   const dismissExpansionPanels = useCallback(() => {
-    setIsModePanelOpen(false);
+    setIsPlusMenuOpen(false);
     setIsAgentStrategyPanelOpen(false);
     setIsCollectionsPanelOpen(false);
     setIsAgentResourcesPanelOpen(false);
@@ -473,7 +510,7 @@ export function ChatInput({
     [isAgentChat, agentKnowledgeScope, agentKnowledgeDefaults, setAgentKnowledgeScope, settings.filters, setFilters]
   );
 
-  // Toolbar icon color follows the active query mode so it stays consistent with ModeSwitcher.
+  // Toolbar icon color follows the active query mode / search-view state.
   const activeIconColor = isSearchMode
     ? 'var(--mode-search-icon)'
     : modeColors.icon;
@@ -976,12 +1013,7 @@ export function ChatInput({
           if (hasRealName) {
             fileItems.push(file);
           } else {
-            const ext =
-              file.type === 'application/pdf'
-                ? 'pdf'
-                : file.type === 'image/png'
-                  ? 'png'
-                  : 'jpg';
+            const ext = pasteFallbackExtension(file);
             const named = new File([file], `pasted-${Date.now()}.${ext}`, {
               type: file.type,
             });
@@ -1035,7 +1067,7 @@ export function ChatInput({
     const next = !showUploadArea;
     if (next) {
       // Close all other panels before opening the upload area
-      setIsModePanelOpen(false);
+      setIsPlusMenuOpen(false);
       setIsAgentStrategyPanelOpen(false);
       setIsCollectionsPanelOpen(false);
       setIsAgentResourcesPanelOpen(false);
@@ -1116,9 +1148,7 @@ export function ChatInput({
   }, [isExpanded, variant]);
 
   useEffect(() => {
-    if (isAgentChat) {
-      setIsModePanelOpen(false);
-    } else {
+    if (!isAgentChat) {
       setIsAgentStrategyPanelOpen(false);
       setIsAgentResourcesPanelOpen(false);
     }
@@ -1149,18 +1179,19 @@ export function ChatInput({
           padding: 'var(--space-1)',
         }}
       >
-        {/* Single row: mode-switcher + input + send */}
+        {/* Single row: plus button + input + send */}
         <Flex align="center" justify="between" gap="3">
           {!isAgentChat && (
-            <ModeSwitcher
-              activeQueryConfig={activeQueryConfig}
-              modeColors={modeColors}
-              isSearchMode={isSearchMode}
-              isModePanelOpen={false}
-              showFullUI={false}
-              onLeftClick={handleExpand}
-              onRightClick={handleExpand}
-            />
+            <IconButton
+              variant="ghost"
+              color="gray"
+              size="2"
+              onClick={handleExpand}
+              aria-label={t('chat.expandComposer', { defaultValue: 'Expand composer' })}
+              style={{ margin: 0, cursor: 'pointer', flexShrink: 0 }}
+            >
+              <MaterialIcon name="add" size={ICON_SIZES.PRIMARY} color={modeColors.icon} />
+            </IconButton>
           )}
 
           {/* Input field */}
@@ -1222,11 +1253,38 @@ export function ChatInput({
     );
   }
 
+  const composerActive =
+    !isStreaming && (isInputFocused || message.trim() || isEditMode || isListening);
+
+  const textareaLayoutStyle: React.CSSProperties = {
+    width: '100%',
+    backgroundColor: 'transparent',
+    outline: 'none',
+    border: 'none',
+    fontSize: 'var(--font-size-2)',
+    lineHeight: 1.5,
+    resize: 'none',
+    minHeight: '24px',
+    maxHeight: '120px',
+    fontFamily: 'Manrope, sans-serif',
+    height: 'auto',
+    overflow: 'auto',
+    padding: 0,
+    margin: 0,
+  };
+
+  const syncTextareaHeight = (e: React.FormEvent<HTMLTextAreaElement>) => {
+    const target = e.currentTarget;
+    target.style.height = 'auto';
+    target.style.height = `${Math.min(target.scrollHeight, 120)}px`;
+  };
+
   return (
     <>
     <Flex
       ref={containerRef}
       direction="column"
+      align="stretch"
       onAnimationEnd={() => setIsAnimatingIn(false)}
       onPaste={handlePaste}
       onDragEnter={handlePanelDragEnter}
@@ -1234,25 +1292,35 @@ export function ChatInput({
       onDragLeave={handlePanelDragLeave}
       onDrop={handlePanelDrop}
       style={{
-        width: isMobile ? '100%' : 'min(50rem, 100%)',
+        width: '100%',
+        minWidth: 0,
+        boxSizing: 'border-box',
+        overflow: 'hidden',
         fontFamily: 'Manrope, sans-serif',
+        backdropFilter: 'blur(25px)',
+        background:
+          composerActive || message.trim() || isListening
+            ? 'var(--olive-2)'
+            : 'var(--effects-translucent)',
+        transition: 'background 0.15s ease, border-color 0.15s ease',
+        border: composerActive ? '1px solid var(--accent-11)' : '1px solid var(--slate-3)',
+        borderRadius: 'var(--radius-2)',
         ...(isAnimatingIn && {
           animation: 'chatWidgetExpandIn 220ms ease-out',
         }),
       }}
     >
-      {/* Selected Collection Cards — shown above the main input, matching Figma spec */}
+      {/* Selected filters — same horizontal padding as the textarea/toolbar */}
       {showSelectedCollectionsRow && (
         <Flex
           align="center"
           style={{
+            width: '100%',
+            minWidth: 0,
+            boxSizing: 'border-box',
             backgroundColor: 'var(--slate-1)',
-            borderTop: '1px solid var(--slate-5)',
-            borderLeft: '1px solid var(--slate-5)',
-            borderRight: '1px solid var(--slate-5)',
-            borderTopLeftRadius: 'var(--radius-1)',
-            borderTopRightRadius: 'var(--radius-1)',
-            padding: 'var(--space-2) var(--space-3)',
+            borderBottom: '1px solid var(--slate-5)',
+            padding: 'var(--space-2) var(--space-4)',
           }}
         >
           <SelectedCollections
@@ -1263,26 +1331,16 @@ export function ChatInput({
         </Flex>
       )}
 
-      {/* Uploaded Files Preview — separate container above the main input, matching Figma spec */}
+      {/* Uploaded Files Preview — inside the same bordered composer */}
       {uploadedFiles.length > 0 && (
         <Flex
           align="center"
           style={{
+            width: '100%',
+            minWidth: 0,
+            boxSizing: 'border-box',
             backgroundColor: 'var(--slate-1)',
-            borderTop:
-              showSelectedCollectionsRow
-                ? 'none'
-                : '1px solid var(--slate-5)',
-            borderLeft: '1px solid var(--slate-5)',
-            borderRight: '1px solid var(--slate-5)',
-            borderTopLeftRadius:
-              showSelectedCollectionsRow
-                ? '0'
-                : 'var(--radius-1)',
-            borderTopRightRadius:
-              showSelectedCollectionsRow
-                ? '0'
-                : 'var(--radius-1)',
+            borderBottom: '1px solid var(--slate-5)',
             padding: 'var(--space-3) var(--space-4)',
             gap: 'var(--space-1)',
           }}
@@ -1492,16 +1550,15 @@ export function ChatInput({
         </Flex>
       )}
 
-      {/* Action pill bar — sits above the main input container when edit or regenerate is active. */}
+      {/* Action pill bar — edit / regenerate chrome inside the composer */}
       {isActionMode && activeMessageAction && (
         <Flex
           style={{
+            width: '100%',
+            minWidth: 0,
+            boxSizing: 'border-box',
             background: 'var(--olive-1)',
-            borderTop: '1px solid var(--olive-5)',
-            borderLeft: '1px solid var(--olive-5)',
-            borderRight: '1px solid var(--olive-5)',
-            borderTopLeftRadius: 'var(--radius-2)',
-            borderTopRightRadius: 'var(--radius-2)',
+            borderBottom: '1px solid var(--olive-5)',
             padding: 'var(--space-3) var(--space-4)',
           }}
         >
@@ -1513,28 +1570,16 @@ export function ChatInput({
         </Flex>
       )}
 
-      {/* Main Chat Input */}
+      {/* Textarea + toolbar */}
       <Flex
       direction="column"
       gap="2"
       style={{
+        width: '100%',
+        minWidth: 0,
+        boxSizing: 'border-box',
         position: 'relative',
-        backdropFilter: 'blur(25px)',
-        background: (isInputFocused || message.trim() || isListening) ? 'var(--olive-2)' : 'var(--effects-translucent)',
-        transition: 'background 0.15s ease',
-        border: (!isStreaming && (isInputFocused || message.trim() || isEditMode || isListening)) ? '1px solid var(--accent-11)' : '1px solid var(--slate-3)',
-        // Flatten top corners whenever there is an element directly above (collections bar,
-        // uploaded files preview, or the action pill bar) to avoid a double-radius gap.
-        borderRadius:
-          (selectedCollections.length > 0 &&
-            !isAgentChat &&
-            !isCollectionsPanelOpen &&
-            !modeChromeOpen) ||
-          uploadedFiles.length > 0 ||
-          isActionMode
-            ? '0 0 var(--radius-2) var(--radius-2)'
-            : 'var(--radius-2)',
-        padding: isMobile ? 'var(--space-3) var(--space-4)' : 'var(--space-2) var(--space-4)',
+        padding: 'var(--space-3) var(--space-4)',
       }}
     >
       {/* Hidden file input - always rendered so add button can access it */}
@@ -1614,24 +1659,6 @@ export function ChatInput({
             }}
           />
         </ChatInputExpansionPanel>
-      ) : isModePanelOpen && !isAgentChat ? (
-        <ChatInputExpansionPanel
-          open={isModePanelOpen}
-          onClose={() => setIsModePanelOpen(false)}
-          minHeight='0'
-          height='fit-content'
-        >
-          <QueryModePanel
-            activeMode={settings.queryMode}
-            onSelect={(queryMode) => {
-              setQueryMode(queryMode);
-              if (isSearchMode) {
-                setMode('chat');
-              }
-              setIsModePanelOpen(false);
-            }}
-          />
-        </ChatInputExpansionPanel>
       ) : isModelPanelOpen ? (
         <ChatInputExpansionPanel
           open={isModelPanelOpen}
@@ -1696,25 +1723,8 @@ export function ChatInput({
           onBlur={() => setIsInputFocused(false)}
           placeholder={resolvedPlaceholder}
           rows={1}
-          style={{
-            width: '100%',
-            backgroundColor: 'transparent',
-            outline: 'none',
-            border: 'none',
-            fontSize: 'var(--font-size-2)',
-            color: 'var(--slate-11)',
-            resize: 'none',
-            minHeight: '24px',
-            maxHeight: '120px',
-            fontFamily: 'Manrope, sans-serif',
-            height: 'auto',
-            overflow: 'auto',
-          }}
-          onInput={(e) => {
-            const target = e.target as HTMLTextAreaElement;
-            target.style.height = 'auto';
-            target.style.height = `${Math.min(target.scrollHeight, 120)}px`;
-          }}
+          style={{ ...textareaLayoutStyle, color: 'var(--slate-11)' }}
+          onInput={syncTextareaHeight}
         />
       ) : !showUploadArea || isActionMode ? (
         // isActionMode keeps the textarea visible even when showUploadArea is true,
@@ -1732,89 +1742,97 @@ export function ChatInput({
           disabled={isRegenerateMode}
           rows={1}
           style={{
-            width: '100%',
-            backgroundColor: 'transparent',
-            outline: 'none',
-            border: 'none',
-            fontSize: 'var(--font-size-2)',
+            ...textareaLayoutStyle,
             color: isRegenerateMode ? 'var(--slate-a8)' : 'var(--slate-12)',
-            resize: 'none',
-            minHeight: isMobile ? '36px' : '44px',
-            maxHeight: '120px',
-            fontFamily: 'Manrope, sans-serif',
-            height: 'auto',
-            overflow: 'auto',
           }}
-          onInput={(e) => {
-            const target = e.target as HTMLTextAreaElement;
-            target.style.height = 'auto';
-            target.style.height = `${Math.min(target.scrollHeight, 120)}px`;
-          }}
+          onInput={syncTextareaHeight}
         />
       ) : null}
 
-      {/* Bottom controls */}
-      <Flex align="center" justify="between">
-        {/* Left side — query ModeSwitcher or agent badge. */}
-        {isAgentChat ? (
-          <Flex
-            align="center"
-            gap="2"
-            style={{
-              height: '32px',
-              borderRadius: 'var(--radius-2)',
-              background: 'var(--accent-3)',
-              paddingLeft: 'var(--space-3)',
-              paddingRight: 'var(--space-3)',
-              flexShrink: 0,
-            }}
-          >
-            <MaterialIcon name="bolt" size={ICON_SIZES.MINIMAL} color="var(--accent-11)" />
-            <Text size="2" weight="medium" style={{ color: 'var(--accent-11)', whiteSpace: 'nowrap' }}>
-              {t('chat.queryModes.agent.toolbarLabel', { defaultValue: 'Agent' })}
-            </Text>
-          </Flex>
-        ) : (
-          <Box style={isRegenerateMode ? { opacity: 0.5, pointerEvents: 'none' } : undefined}>
-            <ModeSwitcher
-              activeQueryConfig={activeQueryConfig}
-              modeColors={modeColors}
-              isSearchMode={isSearchMode}
-              isModePanelOpen={isModePanelOpen}
-              showFullUI={showFullUI}
-              onLeftClick={
-                isSearchMode
-                  ? () => {
-                      setMode('chat');
-                      useChatStore.getState().clearSearchResults();
-                    }
-                  : isMobile
-                    ? () => setIsMobileModesOpen(true)
-                    : () => {
-                        setIsModePanelOpen((prev) => !prev);
-                        setIsAgentStrategyPanelOpen(false);
-                        setIsCollectionsPanelOpen(false);
-                        setIsAgentResourcesPanelOpen(false);
-                        setShowUploadArea(false);
+      {/* Bottom controls — fixed 32px row so left/right share one baseline */}
+      <Flex align="center" justify="between" style={{ width: '100%', minWidth: 0, minHeight: 32 }}>
+        {/* Left side — search-view toggle (hidden for agent-scoped chats, which don't
+            support the keyword-search-results view), plus the "+" attach & capabilities button. */}
+        <Flex align="center" gap="1" style={{ minWidth: 0 }}>
+          {!isAgentChat && (
+            <Tooltip
+              content={isSearchMode ? t('chat.backToChat', { defaultValue: 'Back to chat' }) : t('form.search')}
+              side="top"
+            >
+              <IconButton
+                variant={isSearchMode ? 'soft' : 'ghost'}
+                color="gray"
+                size="2"
+                disabled={isRegenerateMode}
+                aria-label={
+                  isSearchMode
+                    ? t('chat.backToChat', { defaultValue: 'Back to chat' })
+                    : t('chat.searchToggle.ariaLabel', { defaultValue: 'Switch to search view' })
+                }
+                onClick={
+                  isSearchMode
+                    ? () => {
+                        setMode('chat');
+                        useChatStore.getState().clearSearchResults();
                       }
-              }
-              onRightClick={
-                isSearchMode
-                  ? () => {}
-                  : () => {
-                      useCommandStore.getState().dispatch('newChat');
-                      setMode('search');
-                      setIsModePanelOpen(false);
-                    }
-              }
-            />
-          </Box>
-        )}
+                    : () => {
+                        useCommandStore.getState().dispatch('newChat');
+                        setMode('search');
+                      }
+                }
+                style={{ margin: 0, cursor: isRegenerateMode ? 'default' : 'pointer' }}
+              >
+                <MaterialIcon
+                  name={isSearchMode ? 'chat' : 'search'}
+                  size={ICON_SIZES.PRIMARY}
+                  color={isRegenerateMode ? 'var(--slate-5)' : activeIconColor}
+                />
+              </IconButton>
+            </Tooltip>
+          )}
+
+          {/* "+" menu — attach files & Internal Search / Web Search capability toggles.
+              Hidden in the keyword-search-results view (settings.mode === 'search'), which has
+              no attach/capabilities concept, same as the old mode picker never showed there. */}
+          {!isSearchMode && (
+            isMobile ? (
+              <IconButton
+                variant="ghost"
+                color="gray"
+                size="2"
+                disabled={isRegenerateMode}
+                onClick={() => setIsMobilePlusMenuOpen(true)}
+                aria-label={t('chat.plusMenu.ariaLabel', { defaultValue: 'Attach files and capabilities' })}
+                style={{ margin: 0, cursor: isRegenerateMode ? 'default' : 'pointer' }}
+              >
+                <MaterialIcon name="add" size={ICON_SIZES.PRIMARY} color={isRegenerateMode ? 'var(--slate-5)' : activeIconColor} />
+              </IconButton>
+            ) : (
+              <PlusMenuButton
+                open={isPlusMenuOpen}
+                onOpenChange={(open) => {
+                  if (open) {
+                    setIsAgentStrategyPanelOpen(false);
+                    setIsCollectionsPanelOpen(false);
+                    setIsAgentResourcesPanelOpen(false);
+                    setIsModelPanelOpen(false);
+                    setShowUploadArea(false);
+                  }
+                  setIsPlusMenuOpen(open);
+                }}
+                disabled={isRegenerateMode}
+                activeIconColor={activeIconColor}
+                onAttachFiles={toggleUploadArea}
+                {...plusMenuCapabilities}
+              />
+            )
+          )}
+        </Flex>
 
         {/* Right side - Controls */}
-        <Flex align="center" gap="2">
+        <Flex align="center" gap="2" style={{ minWidth: 0, flexShrink: 0 }}>
           {isMobile ? (
-            /* Mobile: meatball opens bottom sheet; attach_file and mic stay inline. */
+            /* Mobile: meatball opens bottom sheet; mic stays inline (attach files lives in the + menu). */
             <Flex align="center" gap="1">
               <IconButton
                 variant="ghost"
@@ -1901,31 +1919,6 @@ export function ChatInput({
                           : settings.queryMode === 'agent'
                             ? t('chat.agentResourcesTooltip', { defaultValue: 'Connectors, collections & actions' })
                             : t('chat.connectorsTooltip', { defaultValue: 'Connectors & collections' })}
-                      </Text>
-                    </Flex>
-                  )}
-
-                  {/* Attach file */}
-                  {!isSearchMode && settings.queryMode !== 'web-search' && (
-                    <Flex
-                      align="center"
-                      gap="2"
-                      onClick={() => {
-                        if (isRegenerateMode) return;
-                        setIsCompactMenuOpen(false);
-                        toggleUploadArea();
-                      }}
-                      style={{
-                        padding: 'var(--space-2) var(--space-2)',
-                        borderRadius: 'var(--radius-2)',
-                        cursor: isRegenerateMode ? 'default' : 'pointer',
-                        opacity: isRegenerateMode ? 0.5 : 1,
-                        backgroundColor: showUploadArea ? 'var(--olive-3)' : 'transparent',
-                      }}
-                    >
-                      <MaterialIcon name="attach_file" size={ICON_SIZES.PRIMARY} color={isRegenerateMode ? 'var(--slate-5)' : activeIconColor} />
-                      <Text size="2" style={{ color: isRegenerateMode ? 'var(--slate-5)' : 'var(--slate-12)' }}>
-                        {t('chat.attachmentTooltip', { defaultValue: 'Attach file' })}
                       </Text>
                     </Flex>
                   )}
@@ -2035,7 +2028,7 @@ export function ChatInput({
                           if (prev) setExpansionViewMode('inline');
                           return !prev;
                         });
-                        setIsModePanelOpen(false);
+                        setIsPlusMenuOpen(false);
                         setIsAgentStrategyPanelOpen(false);
                         setIsModelPanelOpen(false);
                         setShowUploadArea(false);
@@ -2059,7 +2052,7 @@ export function ChatInput({
                           if (prev) setExpansionViewMode('inline');
                           return !prev;
                         });
-                        setIsModePanelOpen(false);
+                        setIsPlusMenuOpen(false);
                         setIsAgentStrategyPanelOpen(false);
                         setIsCollectionsPanelOpen(false);
                         setIsModelPanelOpen(false);
@@ -2071,21 +2064,6 @@ export function ChatInput({
                     </IconButton>
                   </Tooltip>
                 ) : null}
-                {/* Attach file button */}
-                {!isSearchMode && settings.queryMode !== 'web-search' && (
-                  <Tooltip content={t('chat.attachmentTooltip', { defaultValue: 'Attach file' })} side="top">
-                    <IconButton
-                      variant={showUploadArea ? 'soft' : 'ghost'}
-                      color="gray"
-                      size="2"
-                      disabled={isRegenerateMode}
-                      onClick={toggleUploadArea}
-                      style={{ margin: 0, cursor: isRegenerateMode ? 'default' : 'pointer', '--accent-a3': modeColors.bg } as React.CSSProperties}
-                    >
-                      <MaterialIcon name="attach_file" size={ICON_SIZES.PRIMARY} color={isRegenerateMode ? 'var(--slate-5)' : activeIconColor} />
-                    </IconButton>
-                  </Tooltip>
-                )}
                 {/* Model selector button — icon + current model name so the active model is always visible */}
                 <Tooltip content={t('chat.aiModelsTooltip')} side="top">
                   <Flex
@@ -2248,11 +2226,12 @@ export function ChatInput({
       agentId={agentId}
     />
 
-    {/* Mobile query modes sheet — mode switcher → sheet flow */}
-    <MobileQueryModesSheet
-      open={isMobileModesOpen}
-      onOpenChange={setIsMobileModesOpen}
-      agentChat={isAgentChat}
+    {/* Mobile "+" menu sheet — attach files & Internal Search / Web Search toggles */}
+    <PlusMenuSheet
+      open={isMobilePlusMenuOpen}
+      onOpenChange={setIsMobilePlusMenuOpen}
+      onAttachFiles={toggleUploadArea}
+      {...plusMenuCapabilities}
     />
 
     {/* Overlay panel — collections (assistant) or agent resources (overlay mode) */}

@@ -80,12 +80,12 @@ describe('AgentActivityTimeline — narration text', () => {
     expect(screen.getByText('Let me check the test file first.')).toBeTruthy();
   });
 
-  it('shows a not-yet-settled trailing text part LIVE once a reasoning/tool_call part proves this is a multi-step response', () => {
-    // Once there's other activity (a reasoning block here), `AnswerContent`
-    // is suppressed for the whole turn (see `ChatResponse`) — so the still-
-    // unsettled text has nowhere else to render and must appear live, in
-    // the timeline itself, with a typing-cursor treatment (`LiveNarrationText`)
-    // rather than the plain `NarrationText` used for already-settled text.
+  it('hides a not-yet-settled trailing text part even once a reasoning part follows it — it streams into AnswerContent, not the timeline, until settled', () => {
+    // The trailing text hasn't been proven to be narration yet (that only
+    // happens once `settleLastRootText()` runs, marking it `settled`) — it
+    // stays live in `AnswerContent` (see `ChatResponse`) instead of
+    // duplicating here, regardless of other activity already in the
+    // transcript.
     const { container } = renderTimeline(
       [
         { type: 'text', content: 'Still working on this.' },
@@ -94,12 +94,11 @@ describe('AgentActivityTimeline — narration text', () => {
       { isStreaming: true },
     );
 
-    expect(screen.getByText('Still working on this.')).toBeTruthy();
-    expect(container.querySelector('.live-narration-text')).not.toBeNull();
-    expect(container.querySelector('.typing-cursor')).not.toBeNull();
+    expect(container.textContent).not.toContain('Still working on this.');
+    expect(container.querySelector('.live-narration-text')).toBeNull();
   });
 
-  it('shows a not-yet-settled trailing text part LIVE once a tool_call part proves this is a multi-step response', () => {
+  it('hides a not-yet-settled trailing text part after a tool_call too — it streams into AnswerContent, not the timeline, until settled', () => {
     const { container } = renderTimeline(
       [
         { type: 'tool_call', toolCallId: 'call-1', toolName: 'web_search', status: 'completed' },
@@ -108,8 +107,8 @@ describe('AgentActivityTimeline — narration text', () => {
       { isStreaming: true },
     );
 
-    expect(screen.getByText('Found something, let me dig deeper.')).toBeTruthy();
-    expect(container.querySelector('.live-narration-text')).not.toBeNull();
+    expect(container.textContent).not.toContain('Found something, let me dig deeper.');
+    expect(container.querySelector('.live-narration-text')).toBeNull();
   });
 
   it('renders nothing for an empty-content live text part (status indicator handles the signal)', () => {
@@ -123,10 +122,9 @@ describe('AgentActivityTimeline — narration text', () => {
 
     // Empty live text returns null — StatusTimelineEntry signals progress instead.
     expect(container.querySelector('.live-narration-text')).toBeNull();
-    expect(container.querySelector('.typing-cursor')).toBeNull();
   });
 
-  it('renders a settled narration part as plain (non-live) text even in a multi-step stream, while the trailing unsettled one stays live', () => {
+  it('renders a settled narration part as plain (non-live) text even in a multi-step stream, while the trailing unsettled one stays hidden', () => {
     const { container } = renderTimeline(
       [
         { type: 'text', content: 'Already settled narration.', settled: true },
@@ -137,9 +135,9 @@ describe('AgentActivityTimeline — narration text', () => {
     );
 
     expect(screen.getByText('Already settled narration.')).toBeTruthy();
-    expect(screen.getByText('Currently being written.')).toBeTruthy();
-    // Only the trailing, unsettled part gets the live treatment.
-    expect(container.querySelectorAll('.live-narration-text').length).toBe(1);
+    // The trailing, unsettled part streams into AnswerContent instead.
+    expect(container.textContent).not.toContain('Currently being written.');
+    expect(container.querySelectorAll('.live-narration-text').length).toBe(0);
   });
 
   it('renders every text part (including isFinal) when nested inside a sub-agent group', () => {
@@ -311,7 +309,7 @@ describe('AgentActivityTimeline — status indicator as a timeline entry', () =>
     expect(container.querySelector('.rt-Box')).toBeNull();
   });
 
-  it('hides the status entry when there is an active live text part with content', () => {
+  it('does not suppress status for unsettled trailing text — that text streams in AnswerContent, not the timeline', () => {
     const { container } = renderTimeline(
       [
         { type: 'tool_call', toolCallId: 'call-1', toolName: 'web_search', status: 'completed' },
@@ -320,9 +318,9 @@ describe('AgentActivityTimeline — status indicator as a timeline entry', () =>
       { isStreaming: true, currentStatus: STATUS },
     );
 
-    // Live text with content is rendering — status is suppressed.
-    expect(container.querySelector('.live-narration-text')).not.toBeNull();
-    expect(container.textContent).not.toContain('Using Jira Search...');
+    // Unsettled text is filtered out of the root timeline, so it cannot hide status.
+    expect(container.querySelector('.live-narration-text')).toBeNull();
+    expect(container.textContent).toContain('Using Jira Search...');
   });
 
   it('shows the status entry when the trailing text part has empty content', () => {
@@ -334,8 +332,48 @@ describe('AgentActivityTimeline — status indicator as a timeline entry', () =>
       { isStreaming: true, currentStatus: STATUS },
     );
 
-    // Empty live text returns null so status is visible.
+    // Empty unsettled text is filtered out — status remains the progress signal.
     expect(container.querySelector('.live-narration-text')).toBeNull();
+    expect(container.textContent).toContain('Using Jira Search...');
+  });
+
+  it('suppresses the status entry when the last visible item is a reasoning block', () => {
+    const { container } = renderTimeline(
+      [{ type: 'reasoning', content: 'thinking about this...' }],
+      { isStreaming: true, currentStatus: STATUS },
+    );
+
+    expect(screen.getByText('Thinking')).toBeTruthy();
+    expect(container.textContent).not.toContain('Using Jira Search...');
+  });
+
+  it('suppresses the status entry when the last visible item is a running tool call', () => {
+    const { container } = renderTimeline(
+      [{ type: 'tool_call', toolCallId: 'call-1', toolName: 'jira.search_issues', status: 'running' }],
+      { isStreaming: true, currentStatus: STATUS },
+    );
+
+    expect(container.textContent).not.toContain('Using Jira Search...');
+  });
+
+  it('suppresses the status entry when the last visible item is a tool group with a running member', () => {
+    const { container } = renderTimeline(
+      [
+        { type: 'tool_call', toolCallId: 'call-1', toolName: 'web_search', status: 'completed' },
+        { type: 'tool_call', toolCallId: 'call-2', toolName: 'jira.search_issues', status: 'running' },
+      ],
+      { isStreaming: true, currentStatus: STATUS },
+    );
+
+    expect(container.textContent).not.toContain('Using Jira Search...');
+  });
+
+  it('still shows the status entry when the last visible item is a completed tool call', () => {
+    const { container } = renderTimeline(
+      [{ type: 'tool_call', toolCallId: 'call-1', toolName: 'web_search', status: 'completed' }],
+      { isStreaming: true, currentStatus: STATUS },
+    );
+
     expect(container.textContent).toContain('Using Jira Search...');
   });
 });
@@ -369,12 +407,12 @@ describe('getVisibleRootParts', () => {
     expect(getVisibleRootParts(parts, true)).toEqual([]);
   });
 
-  it('shows unsettled trailing text while streaming a multi-step response', () => {
+  it('hides unsettled trailing text while streaming a multi-step response too — it streams into AnswerContent instead', () => {
     const parts: MessagePart[] = [
       { type: 'tool_call', toolCallId: 'c1', toolName: 'search' },
       { type: 'text', content: 'candidate text' },
     ];
-    expect(getVisibleRootParts(parts, true)).toEqual(parts);
+    expect(getVisibleRootParts(parts, true)).toEqual([parts[0]]);
   });
 
   it('shows settled narration regardless of streaming state', () => {
@@ -417,45 +455,102 @@ describe('buildActivitySummary', () => {
 });
 
 describe('CollapsibleActivitySection', () => {
-  function renderCollapsible(parts: MessagePart[]) {
+  function renderCollapsible(parts: MessagePart[], props: { isStreaming?: boolean } = {}) {
     return render(
-      h(Theme, null, h(CollapsibleActivitySection, { parts }, h('div', { 'data-testid': 'child' }, 'child content'))),
+      h(Theme, null, h(CollapsibleActivitySection, { parts, ...props }, h('div', { 'data-testid': 'child' }, 'child content'))),
     );
   }
 
-  it('hides its children (collapsed) by default', () => {
+  /** Children stay mounted for the height animation. "Hidden" means the
+   * content panel is aria-hidden (and inert) so it is not reachable. */
+  function isContentHidden() {
+    const panel = screen.queryByTestId('child')?.parentElement;
+    if (!panel) return true;
+    return panel.getAttribute('aria-hidden') === 'true';
+  }
+
+  it('starts collapsed for historical (non-streaming) messages', () => {
     renderCollapsible([{ type: 'tool_call', toolCallId: 'c1', toolName: 't' }]);
-    expect(screen.queryByTestId('child')).toBeNull();
+    expect(isContentHidden()).toBe(true);
     expect(screen.getByText('Used 1 tool')).toBeTruthy();
   });
 
-  it('shows its children after the summary header is clicked, and hides them again on a second click', () => {
+  it('starts expanded during streaming', () => {
+    renderCollapsible(
+      [{ type: 'tool_call', toolCallId: 'c1', toolName: 't' }],
+      { isStreaming: true },
+    );
+    expect(isContentHidden()).toBe(false);
+    expect(screen.getByText('Used 1 tool')).toBeTruthy();
+  });
+
+  it('toggles collapse on header click during streaming', () => {
+    renderCollapsible(
+      [{ type: 'tool_call', toolCallId: 'c1', toolName: 't' }],
+      { isStreaming: true },
+    );
+
+    fireEvent.click(screen.getByText('Used 1 tool'));
+    expect(isContentHidden()).toBe(true);
+
+    fireEvent.click(screen.getByText('Used 1 tool'));
+    expect(isContentHidden()).toBe(false);
+  });
+
+  it('toggles collapse on header click for historical messages', () => {
     renderCollapsible([{ type: 'tool_call', toolCallId: 'c1', toolName: 't' }]);
 
     fireEvent.click(screen.getByText('Used 1 tool'));
-    expect(screen.getByTestId('child')).toBeTruthy();
+    expect(isContentHidden()).toBe(false);
 
     fireEvent.click(screen.getByText('Used 1 tool'));
-    expect(screen.queryByTestId('child')).toBeNull();
+    expect(isContentHidden()).toBe(true);
   });
 
-  it('closes automatically the moment a live response finishes streaming, even if the user expanded it mid-stream', () => {
-    // Mirrors chat-response.tsx's `isStreaming ? <AgentActivityTimeline /> : <CollapsibleActivitySection>...`
-    // — the timeline renders bare (always "expanded") while streaming, then
-    // gets wrapped in `CollapsibleActivitySection` the instant streaming ends.
+  it('does not auto-collapse when isStreaming transitions from true to false', () => {
     const parts: MessagePart[] = [{ type: 'tool_call', toolCallId: 'c1', toolName: 't' }];
-    function Harness({ isStreaming }: { isStreaming: boolean }) {
-      return isStreaming
-        ? h('div', { 'data-testid': 'live-timeline' }, 'live')
-        : h(CollapsibleActivitySection, { parts }, h('div', { 'data-testid': 'child' }, 'child content'));
-    }
+    const { rerender } = renderCollapsible(parts, { isStreaming: true });
+    expect(isContentHidden()).toBe(false);
 
-    const { rerender } = render(h(Theme, null, h(Harness, { isStreaming: true })));
-    expect(screen.getByTestId('live-timeline')).toBeTruthy();
+    rerender(
+      h(Theme, null, h(CollapsibleActivitySection, { parts, isStreaming: false }, h('div', { 'data-testid': 'child' }, 'child content'))),
+    );
+    // Stays expanded — collapse is user-driven only.
+    expect(isContentHidden()).toBe(false);
+  });
 
-    rerender(h(Theme, null, h(Harness, { isStreaming: false })));
-    // Freshly mounted CollapsibleActivitySection — closed by default, not
-    // carrying over any expanded state from before the stream ended.
-    expect(screen.queryByTestId('child')).toBeNull();
+  it('keeps a user-collapsed section collapsed when streaming ends', () => {
+    const parts: MessagePart[] = [{ type: 'tool_call', toolCallId: 'c1', toolName: 't' }];
+    const { rerender } = renderCollapsible(parts, { isStreaming: true });
+
+    fireEvent.click(screen.getByText('Used 1 tool'));
+    expect(isContentHidden()).toBe(true);
+
+    rerender(
+      h(Theme, null, h(CollapsibleActivitySection, { parts, isStreaming: false }, h('div', { 'data-testid': 'child' }, 'child content'))),
+    );
+    expect(isContentHidden()).toBe(true);
+  });
+
+  it('marks collapsed content aria-hidden and inert so it is not focusable', () => {
+    render(
+      h(
+        Theme,
+        null,
+        h(
+          CollapsibleActivitySection,
+          { parts: [{ type: 'tool_call', toolCallId: 'c1', toolName: 't' }] },
+          h('button', { 'data-testid': 'inner-control', type: 'button' }, 'inner'),
+        ),
+      ),
+    );
+
+    const panel = screen.getByTestId('inner-control').parentElement;
+    expect(panel?.getAttribute('aria-hidden')).toBe('true');
+    expect(panel?.hasAttribute('inert')).toBe(true);
+
+    fireEvent.click(screen.getByText('Used 1 tool'));
+    expect(panel?.hasAttribute('aria-hidden')).toBe(false);
+    expect(panel?.hasAttribute('inert')).toBe(false);
   });
 });

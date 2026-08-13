@@ -1,6 +1,7 @@
 import type { CitationOrigin } from './components/message-area/response-tabs/citations';
 import type { CitationMaps } from './components/message-area/response-tabs/citations/types';
 import type { ThreadMessageLike } from '@assistant-ui/react';
+import { ACCEPTED_MIME_TYPES, SUPPORTED_FILE_TYPES } from './utils/attachment-file-types';
 
 // Chat types following project conventions
 
@@ -14,8 +15,15 @@ export type ResponseTab = 'answer' | 'sources' | 'citation';
  * Platform-normalized reasoning effort levels. `null`/absent means "no
  * explicit user choice" — the backend applies `DEFAULT_REASONING_EFFORT`
  * ("high") for any reasoning-capable model rather than deferring to the
- * provider's own default. `'none'` actively disables reasoning on models
- * that support turning it off.
+ * provider's own default.
+ *
+ * `'none'` is kept in the type for backward compatibility with
+ * already-persisted conversations/agents, but is no longer offered as a
+ * user choice (see `REASONING_EFFORT_OPTIONS` in `model-selector-panel.tsx`):
+ * fully disabling reasoning made some models prone to hallucinating
+ * malformed tool-call names. The backend silently upgrades an incoming
+ * `'none'` to `'low'` instead of honoring it — see `_reasoning_effort_kwargs`
+ * in `app/utils/aimodels.py`.
  */
 export type ReasoningEffort = 'none' | 'low' | 'medium' | 'high' | 'max';
 
@@ -25,6 +33,23 @@ export type ReasoningEffort = 'none' | 'low' | 'medium' | 'high' | 'max';
  * picked one. Kept in sync with `DEFAULT_REASONING_EFFORT` there.
  */
 export const DEFAULT_REASONING_EFFORT: ReasoningEffort = 'high';
+
+/**
+ * What the backend actually floors a legacy `'none'` to
+ * (`REASONING_MANDATORY_FALLBACK_EFFORT` in `app/utils/llm_api_mode_store.py`).
+ */
+const REASONING_MANDATORY_FALLBACK_EFFORT: ReasoningEffort = 'low';
+
+/**
+ * Maps a persisted/legacy `'none'` to the value the backend actually runs
+ * with, so every UI surface (toolbar label, radio selection, regen payload)
+ * agrees with server behavior instead of echoing a choice that's no longer offered.
+ */
+export function normalizeReasoningEffort(
+  value: ReasoningEffort | null
+): ReasoningEffort | null {
+  return value === 'none' ? REASONING_MANDATORY_FALLBACK_EFFORT : value;
+}
 
 // Inline citation for display within answer text
 export interface InlineCitation {
@@ -363,7 +388,9 @@ export interface UploadedFile {
   errorMessage?: string;
 }
 
-export type SupportedFileType = 'TXT' | 'PDF' | 'DOCX' | 'PNG' | 'JPEG' | 'JPG';
+/** Derived from `SUPPORTED_FILE_TYPES`/`ACCEPTED_MIME_TYPES` in `utils/attachment-file-types.ts`
+ * (the single source of truth) so the two allowlists cannot drift apart. */
+export type SupportedFileType = (typeof SUPPORTED_FILE_TYPES)[number];
 
 /** Returned by the attachment upload endpoint; forwarded verbatim in the SSE stream body. */
 export interface AttachmentRef {
@@ -375,14 +402,7 @@ export interface AttachmentRef {
 }
 
 /** MIME types accepted by the chat attachment upload endpoint. */
-export const CHAT_ATTACHMENT_ACCEPTED_MIMETYPES = [
-  'application/pdf',
-  'image/jpeg',
-  'image/jpg',
-  'image/png',
-  'text/plain',
-  'text/markdown',
-] as const;
+export const CHAT_ATTACHMENT_ACCEPTED_MIMETYPES = Object.keys(ACCEPTED_MIME_TYPES);
 
 /** Maximum file size for a single chat attachment (5 MB). */
 export const CHAT_ATTACHMENT_MAX_BYTES = 5 * 1024 * 1024;

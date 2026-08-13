@@ -40,7 +40,6 @@ from typing import TYPE_CHECKING, Any
 
 from app.agent_loop_lib.tools.base import ParameterType, Tool, ToolOutput, ToolParameter
 from app.agents.agent_loop.hooks._tool_naming import INTERNAL_SEARCH_TOOL_NAMES
-from app.agents.agent_loop.tool_adapter import _to_tool_output
 
 if TYPE_CHECKING:
     from app.agent_loop_lib.agent.spec import AgentSpec
@@ -48,89 +47,59 @@ if TYPE_CHECKING:
     from app.agent_loop_lib.hooks.middleware.pipeline import Middleware, Next
     from app.agents.agent_loop.context import AgentContext
 
+from app.agents.actions.knowledge_graph.ops.fetch import DEFAULT_FETCH_REASON as _DEFAULT_FETCH_REASON
 from app.agents.actions.knowledge_graph.ops.fetch import FETCH_RECORD_TOOL_NAME as _FETCH_FULL_RECORD_TOOL_NAME
 
 # ---------------------------------------------------------------------------
 # Shared description — used by _FetchFullRecordTool (agent-loop) and kept in
 # sync with the langchain docstring in utils/fetch_full_record.py.
 #
-# Deliberately states ONE test rather than a list of qualifying scenarios: no
-# enumeration can cover every request shape, and a model matching a request
-# against a checklist fails on anything the checklist missed ("summarize this",
-# "what are the risks here"). The test generalizes because it turns on what the
-# ANSWER depends on, which the model can always evaluate for itself.
+# Leads with the action, not a decision test: without a gate/judge backstop,
+# a balanced "decide whether you need this" framing reads to the model as
+# permission to conclude it already has enough — the cheaper path it is
+# already biased toward. Naming the two fetch cases as directives ("call
+# this before answering") and demoting the skip case to a single
+# parenthetical after them keeps "don't fetch" a narrow, explicitly-marked
+# exception instead of a co-equal third option.
 #
-# The zero-content branch leads because this tool is now reachable from
-# lookup/navigate/list_files (see `citation_tracking`), where the model holds
-# an ID and no blocks — without it the passage-is-enough branch reads as
-# "a status? answer from the blocks you have", which on that path is nothing.
+# Still states illustrations rather than an exhaustive checklist: no
+# enumeration covers every request shape, and a model matching against a
+# checklist fails on anything the checklist missed ("summarize this", "what
+# are the risks here"). The reasoning generalizes because it turns on what
+# the ANSWER depends on, which the model can always evaluate for itself.
+#
+# The zero-content case follows the whole-document case because this tool is
+# reachable from lookup/navigate/list_files (see `citation_tracking`), where
+# the model holds an ID and no blocks.
 # ---------------------------------------------------------------------------
 _FETCH_FULL_RECORD_DESCRIPTION = (
     "Read one or more records end to end. Search gives you a few matching "
     "blocks per record; lookup_record/navigate/list_files give you an ID and "
     "metadata and no content at all; this gives you everything.\n"
-    "Decide with one test: can this be answered by finding the right passage, "
-    "or does answering it correctly require knowing what the document contains "
-    "AS A WHOLE?\n"
-    "- You hold no passage at all — the record came from lookup, navigation or "
-    "listing, so you have its ID and metadata and nothing it says. Answer from "
-    "that metadata if it settles the question outright (a ticket's status, its "
-    "assignee); otherwise call this before answering, and never infer content "
-    "from a title.\n"
-    "- Finding a passage is enough (a date, a name, a number, a status, one "
-    "clause) AND you can see that passage — answer from the blocks you already "
-    "have. Do NOT call this.\n"
-    "- The answer is a property of the whole document — a summary or overview, "
-    "what its risks/gaps/obligations/key points are, a review or assessment, a "
-    "comparison of documents, whether it mentions something anywhere, anything "
-    "asking for all of something — then a handful of blocks CANNOT support the "
-    "answer, however relevant those blocks look, because the parts you were not "
-    "given are exactly what you would be implying are unimportant. Call this "
-    "first, then answer.\n"
-    "Those are illustrations of the test, not a checklist — apply the test to "
+    "Call this BEFORE answering whenever what you currently hold is "
+    "incomplete for what the question needs:\n"
+    "- The answer is a property of the whole document — a summary or "
+    "overview, its risks/gaps/obligations/key points, a review or "
+    "assessment, a comparison of documents, whether it mentions something "
+    "anywhere, anything asking for all of something. A handful of blocks "
+    "CANNOT support that answer, however relevant they look, because the "
+    "parts you were not given are exactly what you would be implying are "
+    "unimportant.\n"
+    "- You hold no passage at all — the record came from lookup, navigation "
+    "or listing, so you have its ID and metadata and nothing it says. Never "
+    "infer content from a title.\n"
+    "(Skip only when the exact fact needed — a date, a name, a number, a "
+    "status, one clause — is already visible in a block you hold, or "
+    "metadata alone settles the question outright, e.g. a ticket's status "
+    "or assignee.)\n"
+    "Those are illustrations, not a checklist — apply the same reasoning to "
     "whatever was actually asked.\n"
     "Pass every record_id you need in ONE call, taken from a candidate list, a "
-    "'Record ID :' field or a record_id= shown by navigation — never invent "
+    "'Record ID' field, or a record_id=/node_id= shown by navigation — use it "
+    "exactly as shown (it may be a short label like 'R3') and never invent "
     "IDs. Large records return a continuation hint giving the start_block for "
     "the next slice."
 )
-
-# Conservative default: enough for most models but safe for small/local ones.
-# Only reduced (never raised) by the known context window.
-# Override with PIPESHUB_FULL_RECORD_MAX_BLOCKS (int > 0) for deployment tuning.
-_DEFAULT_FULL_RECORD_MAX_BLOCKS = 200
-
-
-def _resolve_block_cap(model_name: str, requested_max: int | None) -> int:
-    """
-    Resolve the effective block cap for a fetch.
-
-    The cap is the minimum of the configured default and the caller's explicit
-    request. Never exceeds _DEFAULT_FULL_RECORD_MAX_BLOCKS unless the env var
-    is set higher (which is the operator's choice, not ours).
-
-    `get_context_window()` returns 128k for unknown/local models — too optimistic
-    for a small LLM — so we do NOT blindly raise the cap from the context window.
-    """
-    import os
-
-    env_raw = os.getenv("PIPESHUB_FULL_RECORD_MAX_BLOCKS", "")
-    try:
-        env_cap = int(env_raw) if env_raw.strip() else _DEFAULT_FULL_RECORD_MAX_BLOCKS
-        if env_cap <= 0:
-            env_cap = _DEFAULT_FULL_RECORD_MAX_BLOCKS
-    except ValueError:
-        import logging
-        logging.getLogger(__name__).warning(
-            "Invalid PIPESHUB_FULL_RECORD_MAX_BLOCKS=%r, using %d",
-            env_raw, _DEFAULT_FULL_RECORD_MAX_BLOCKS,
-        )
-        env_cap = _DEFAULT_FULL_RECORD_MAX_BLOCKS
-
-    if requested_max is not None and requested_max > 0:
-        return min(env_cap, requested_max)
-    return env_cap
-
 
 class CitationCollector:
     """Read-only view over the citation-related fields of `AgentContext.tool_state`."""
@@ -185,6 +154,8 @@ class _FetchFullRecordTool(Tool):
     tool instance built once from the first snapshot.
     """
 
+    _ACCEPTED_ARGS = ("record_ids", "reason", "start_block", "max_blocks")
+
     def __init__(self, collector: CitationCollector, context: AgentContext) -> None:
         self._collector = collector
         self._context = context
@@ -216,8 +187,9 @@ class _FetchFullRecordTool(Tool):
                 name="record_ids",
                 type=ParameterType.ARRAY,
                 description=(
-                    "Record IDs to fetch — use the exact 'Record ID :' values from the "
-                    "candidate list or context metadata. Do NOT invent IDs."
+                    "Record IDs to fetch — use the exact Record ID values shown in the "
+                    "candidate list or context metadata (may be short labels like 'R1', "
+                    "'R2'). Do NOT invent IDs."
                 ),
                 required=True,
                 items={"type": "string"},
@@ -227,7 +199,7 @@ class _FetchFullRecordTool(Tool):
                 type=ParameterType.STRING,
                 description="Brief explanation of why the full records are needed",
                 required=False,
-                default="Fetching full record content for comprehensive answer",
+                default=_DEFAULT_FETCH_REASON,
             ),
             ToolParameter(
                 name="start_block",
@@ -253,69 +225,51 @@ class _FetchFullRecordTool(Tool):
     def validate(self, kwargs: dict[str, Any]) -> None:
         return
 
+    def _live_virtual_records(self) -> dict[str, Any]:
+        """The mapping `_fetch_multiple_records_impl` writes downloaded records
+        back into, so it must be the object in `tool_state` and NOT
+        `CitationCollector.virtual_records`, whose `or {}` returns a throwaway
+        dict while the map is empty — losing the write-back and re-downloading
+        on every repeat fetch.
+
+        Records persisting here skip the ACL re-check a fresh id gets; safe
+        because `tool_state` is per HTTP request, hence per user.
+        """
+        state = self._context.tool_state
+        records = state.get("virtual_record_id_to_result")
+        if not isinstance(records, dict):
+            records = {}
+            state["virtual_record_id_to_result"] = records
+        return records
+
     async def execute(self, **kwargs: Any) -> ToolOutput:  # noqa: ANN401
-        from app.utils.chat_helpers import record_to_message_content
-        from app.utils.fetch_full_record import create_fetch_full_record_tool
+        from app.agents.actions.knowledge_graph.ops.fetch import execute_fetch_record
 
-        start_block: int = int(kwargs.pop("start_block", 0) or 0)
-        requested_max: int | None = kwargs.pop("max_blocks", None)
-        block_cap = _resolve_block_cap(self._context.model_name, requested_max)
-
-        structured_tool = create_fetch_full_record_tool(
-            self._collector.virtual_records,
-            org_id=self._context.org_id,
-            graph_provider=self._context.graph_provider,
-            # Required for IDs the model got from navigate/lookup_record
-            # rather than from retrieval — those are not in the map, so the
-            # fetch has to re-check access itself.
-            user_id=self._context.user_id,
-        )
-        try:
-            result = await structured_tool.coroutine(**kwargs)
-        except Exception as exc:
-            return ToolOutput(success=False, error=str(exc))
-
-        # Mirror the chatbot path's formatting (`RecordsHandler` +
-        # `record_to_message_content()` in streaming.py) instead of handing
-        # the LLM a raw JSON dict of block_containers/context_metadata — the
-        # same records, rendered as the `<record>` text blocks the model
-        # already knows how to read from `retrieval_search_internal_knowledge`.
-        if isinstance(result, dict) and result.get("ok") and result.get("records"):
-            ref_mapper = self._collector.citation_ref_mapper
-            parts: list[str] = []
-            for record in result["records"]:
-                # Reads start at block 0 unless the caller asked otherwise.
-                # Starting at the first block retrieval matched instead drops
-                # everything before it — for a match near the end that returns
-                # a short tail as if it were the document. Oversized records are
-                # bounded by `block_cap`, which appends a continuation hint.
-                content_list, ref_mapper = record_to_message_content(
-                    record,
-                    ref_mapper=ref_mapper,
-                    start_block=start_block,
-                    max_blocks=block_cap,
-                )
-                parts.append("".join(
-                    item["text"] for item in content_list if item.get("type") == "text"
-                ))
-            self._context.tool_state["citation_ref_mapper"] = ref_mapper
-            text = "\n".join(parts)
-            text += (
-                "\n\nCite facts from the above using the Citation ID for each block "
-                "as a markdown link, e.g. [source](ref2). Do NOT use external URLs as citations."
+        # Not forwarded as `**kwargs`: a model sending `record_id=` (singular)
+        # must get a correctable error, not a silent empty fetch.
+        unexpected = sorted(set(kwargs) - set(self._ACCEPTED_ARGS))
+        if unexpected:
+            return ToolOutput(
+                success=False,
+                error=(
+                    f"Unexpected argument(s): {', '.join(unexpected)}. "
+                    f"Accepted: {', '.join(self._ACCEPTED_ARGS)}."
+                ),
             )
-            not_available = result.get("not_available_ids", [])
-            if not_available:
-                ids_str = ", ".join(f"'{rid}'" for rid in not_available)
-                text += f"\n\nNote: The following record(s) are not available: {ids_str}"
-            # Track fetched record IDs for the gate.
-            for record in result["records"]:
-                rid = record.get("id")
-                if rid:
-                    self._context.full_records_fetched.add(rid)
-                    self._context.tool_state.setdefault("full_records_fetched", set()).add(rid)
-            return ToolOutput(success=True, data=text)
-        return _to_tool_output(result)
+
+        ref_mapper_in = self._collector.citation_ref_mapper
+        output, ref_mapper = await execute_fetch_record(
+            context=self._context,
+            virtual_records=self._live_virtual_records(),
+            citation_ref_mapper=ref_mapper_in,
+            record_ids=kwargs.get("record_ids") or [],
+            reason=kwargs.get("reason") or _DEFAULT_FETCH_REASON,
+            start_block=int(kwargs.get("start_block") or 0),
+            max_blocks=kwargs.get("max_blocks"),
+        )
+        if ref_mapper is not ref_mapper_in:
+            self._context.tool_state["citation_ref_mapper"] = ref_mapper
+        return output
 
 
 def _grant(spec: "AgentSpec | None", *, require_internal_search_reference: bool) -> None:

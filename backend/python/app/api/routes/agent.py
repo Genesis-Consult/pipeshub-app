@@ -135,6 +135,11 @@ class ChatQuery(BaseModel):
     # expand: an agent without web search configured stays without it even
     # if agentCapabilities.webSearch=True.
     agentCapabilities: dict[str, Any] | None = None
+    # TEMPORARY token-savings experiment — see `RecordIdShortener` in
+    # `utils/chat_helpers.py`. Opt-in and disabled by default: short "R<n>"
+    # labels are only valid for the request that minted them, so callers
+    # that rely on record ids surviving across turns should leave this off.
+    enableRecordIdShortening: bool = False
 
     _validate_reasoning_effort = field_validator("reasoningEffort")(validate_reasoning_effort)
 
@@ -191,14 +196,6 @@ class LLMInitializationError(AgentError):
         super().__init__(
             detail="Failed to initialize LLM service. LLM configuration is missing.",
             status_code=500
-        )
-
-class ReasoningModelRequiredError(AgentError):
-    """Reasoning model required"""
-    def __init__(self) -> None:
-        super().__init__(
-            detail="Reasoning model is required in agent mode. Please use a reasoning model.",
-            status_code=400
         )
 
 # ============================================================================
@@ -2949,8 +2946,6 @@ async def chat_stream(request: Request, agent_id: str) -> StreamingResponse:
         llm_config = llm_result[1]
         ai_models_config = llm_result[2] if len(llm_result) > 2 else {}
         is_multimodal_llm = llm_config.get("isMultimodal", False)
-        if not llm_config.get("isReasoning", False):
-            raise ReasoningModelRequiredError()
 
         # Get and filter toolsets
         agent_toolsets = agent.get("toolsets", [])
@@ -3214,6 +3209,7 @@ async def chat_stream(request: Request, agent_id: str) -> StreamingResponse:
             "webSearch": web_search_provider,
             "webSearchConfig": web_search_tool_config,
             "attachments": chat_query.attachments,
+            "enableRecordIdShortening": chat_query.enableRecordIdShortening,
         }
 
         client_name = request.headers.get("client-name")

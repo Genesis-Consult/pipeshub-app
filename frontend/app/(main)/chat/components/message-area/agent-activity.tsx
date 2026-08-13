@@ -10,7 +10,7 @@
  * never visually changes when the live stream hands off to the persisted
  * transcript.
  */
-import React, { useState, useRef, useMemo } from 'react';
+import React, { useState, useRef, useMemo, useCallback } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Box, Flex, Text } from '@radix-ui/themes';
@@ -50,10 +50,10 @@ interface AgentActivityTimelineProps {
 
 /** True when the transcript contains any tool call, reasoning block, or
  * sub-agent delegation — i.e. this is a multi-step ReAct response, not a
- * simple single-shot answer. Drives two decisions: whether unsettled root
- * text streams into the timeline (see `filterRootParts`) instead of
- * `AnswerContent`, and whether the completed activity gets a collapsible
- * summary wrapper (`CollapsibleActivitySection`). */
+ * simple single-shot answer. Drives whether the completed activity gets a
+ * collapsible summary wrapper (`CollapsibleActivitySection`) and whether the
+ * live status entry renders inside the timeline vs. below the answer (see
+ * `ChatResponse`). */
 export function hasMultiStepActivity(parts: MessagePart[] | undefined): boolean {
   if (!parts) return false;
   return parts.some((part) => part.type === 'tool_call' || part.type === 'reasoning' || part.type === 'sub_agent');
@@ -68,21 +68,20 @@ export function hasMultiStepActivity(parts: MessagePart[] | undefined): boolean 
  *   (`agui-event-handler.ts`'s `LivePartsBuilder.settleLastRootText()`,
  *   called the moment a tool call, reasoning block, or new text turn
  *   proves the text wasn't the final answer).
- * - **Multi-step responses** (tool calls / reasoning already happened, or
- *   are happening): the still-unsettled trailing text is ALSO shown here,
- *   live, via `LiveNarrationText` — once a message has multi-step activity,
- *   `AnswerContent` is suppressed entirely for the duration of the stream
- *   (see `ChatResponse`), so there's no duplicate render and no "yank" of
- *   text jumping from the answer area into the timeline when it settles.
- * - **Simple responses** (no activity at all yet): unsettled text stays
- *   hidden here and is mirrored live in `streamingContent` /
- *   `AnswerContent` instead — showing it here too would duplicate it.
+ * - The still-unsettled trailing text — whether or not the response has
+ *   had multi-step activity — stays hidden here and streams live into
+ *   `AnswerContent` instead (`ChatResponse` no longer suppresses the
+ *   answer for multi-step runs). This is what makes the common case (the
+ *   trailing text IS the final answer) render seamlessly in the answer
+ *   area as it streams, with no jump when `RUN_FINISHED` lands. If it
+ *   later turns out to be narration (a tool call/reasoning block follows),
+ *   `settleLastRootText()` moves it here and clears the answer buffer in
+ *   the same update.
  */
-function filterRootParts(parts: MessagePart[], isStreaming: boolean, multiStep: boolean): MessagePart[] {
+function filterRootParts(parts: MessagePart[], isStreaming: boolean): MessagePart[] {
   return parts.filter((part) => {
     if (part.type !== 'text') return true;
     if (part.isFinal) return false;
-    if (isStreaming && multiStep) return true;
     if (isStreaming && !part.settled) return false;
     return true;
   });
@@ -94,7 +93,7 @@ function filterRootParts(parts: MessagePart[], isStreaming: boolean, multiStep: 
  * render a separator / collapsible wrapper around the timeline without
  * duplicating (and risking drift from) the filtering rules above. */
 export function getVisibleRootParts(parts: MessagePart[], isStreaming: boolean): MessagePart[] {
-  return filterRootParts(parts, isStreaming, hasMultiStepActivity(parts));
+  return filterRootParts(parts, isStreaming);
 }
 
 type RenderItem =
@@ -269,13 +268,21 @@ export function AgentActivityTimeline({ parts, isNested = false, isStreaming = f
     () => (isNested ? parts : getVisibleRootParts(parts, isStreaming)),
     [parts, isNested, isStreaming],
   );
-  // Don't show status alongside live text with content — the typing cursor
-  // already signals progress; showing both is redundant and visually broken.
+  // Don't show status alongside live text with content (the text itself
+  // signals progress), or when the last visible entry already covers the
+  // status visually (a reasoning block = "Thinking", a running tool call
+  // = the same activity the status describes).
   const hasLiveTextWithContent = isStreaming && visible.some(
     (p) => p.type === 'text' && !p.settled && !p.isFinal && !!p.content?.trim(),
   );
-  const showStatus = !isNested && isStreaming && !!currentStatus && !hasLiveTextWithContent;
   const items = groupConsecutiveToolCalls(visible).filter(hasRenderableContent);
+  const lastItem = items.length > 0 ? items[items.length - 1] : null;
+  const lastItemCoversStatus = lastItem !== null && (
+    (lastItem.kind === 'part' && lastItem.part.type === 'reasoning') ||
+    (lastItem.kind === 'part' && lastItem.part.type === 'tool_call' && (lastItem.part.status ?? 'running') === 'running') ||
+    (lastItem.kind === 'toolGroup' && lastItem.parts.some((p) => (p.status ?? 'running') === 'running'))
+  );
+  const showStatus = !isNested && isStreaming && !!currentStatus && !hasLiveTextWithContent && !lastItemCoversStatus;
   if (items.length === 0 && !showStatus) return null;
   const rowCount = items.length + (showStatus ? 1 : 0);
 
@@ -373,11 +380,9 @@ function NarrationText({ content, citationMaps, citationCallbacks }: { content: 
 
 /** The still-unsettled trailing text of a multi-step response, rendered
  * live in the timeline (instead of `AnswerContent`) while its fate —
- * narration vs. the final answer — is still undetermined. A trailing
- * blinking cursor marks it as "in progress" so it doesn't read as a
- * completed narration entry (`NarrationText`) or the finished answer;
- * the rail's waypoint dot (see `TimelineRow`) is what visually threads it
- * into the flow, so no in-text accent bar is needed here anymore. */
+ * narration vs. the final answer — is still undetermined. The Lottie rail
+ * animation (see `TimelineRow`) signals "in progress" instead of an
+ * in-text cursor, so this doesn't need its own accent bar. */
 function LiveNarrationText({ content, citationMaps, citationCallbacks }: { content: string; citationMaps?: CitationMaps; citationCallbacks?: CitationCallbacks }) {
   const cleanContent = processMarkdownContent(content);
 
@@ -407,7 +412,6 @@ function LiveNarrationText({ content, citationMaps, citationCallbacks }: { conte
       <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
         {cleanContent}
       </ReactMarkdown>
-      <span className="typing-cursor" />
     </Box>
   );
 }
@@ -828,15 +832,17 @@ export function buildActivitySummary(parts: MessagePart[]): string {
 }
 
 /**
- * Wraps a completed (non-streaming) activity timeline in a collapsible
- * summary — mirrors Claude's collapsed "Thought for Ns" / tool-use history
- * once a response finishes, so the reader's eye lands on the answer instead
- * of re-reading the whole ReAct trace on every reload. Collapsed by default;
- * the user can expand it to inspect the full trace.
+ * Wraps an activity timeline in a collapsible summary. Expanded while
+ * streaming so the live trace stays visible; collapsed by default for
+ * historical messages. Never auto-collapses — the user toggles it.
  */
-export function CollapsibleActivitySection({ parts, children }: { parts: MessagePart[]; children: React.ReactNode }) {
-  const [collapsed, setCollapsed] = useState(true);
+export function CollapsibleActivitySection({ parts, isStreaming = false, children }: { parts: MessagePart[]; isStreaming?: boolean; children: React.ReactNode }) {
+  const [collapsed, setCollapsed] = useState(!isStreaming);
   const summary = useMemo(() => buildActivitySummary(parts), [parts]);
+
+  const handleToggle = useCallback(() => {
+    setCollapsed((prev) => !prev);
+  }, []);
 
   return (
     <Box style={{ marginBottom: 'var(--space-3)' }}>
@@ -846,12 +852,13 @@ export function CollapsibleActivitySection({ parts, children }: { parts: Message
         role="button"
         tabIndex={0}
         aria-expanded={!collapsed}
-        onClick={() => setCollapsed((prev) => !prev)}
-        onKeyDown={(e) => handleToggleKeyDown(e, () => setCollapsed((prev) => !prev))}
+        onClick={handleToggle}
+        onKeyDown={(e) => handleToggleKeyDown(e, handleToggle)}
         style={{
           cursor: 'pointer',
           userSelect: 'none',
           marginBottom: collapsed ? 0 : 'var(--space-2)',
+          transition: 'margin-bottom 200ms ease-out',
           width: 'fit-content',
         }}
       >
@@ -864,7 +871,24 @@ export function CollapsibleActivitySection({ parts, children }: { parts: Message
           {summary}
         </Text>
       </Flex>
-      {!collapsed && children}
+      {/* 0fr/1fr grid animates to the content's intrinsic height — no fixed
+          maxHeight cap that would clip long transcripts. */}
+      <div
+        style={{
+          display: 'grid',
+          gridTemplateRows: collapsed ? '0fr' : '1fr',
+          transition: 'grid-template-rows 300ms ease-out, opacity 200ms ease-out',
+          opacity: collapsed ? 0 : 1,
+        }}
+      >
+        <div
+          style={{ overflow: 'hidden', minHeight: 0 }}
+          aria-hidden={collapsed || undefined}
+          inert={collapsed || undefined}
+        >
+          {children}
+        </div>
+      </div>
     </Box>
   );
 }

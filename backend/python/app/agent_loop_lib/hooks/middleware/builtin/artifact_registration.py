@@ -155,12 +155,16 @@ def shape_artifact_registration(
     """
     _store = store or InMemoryArtifactStore()
 
-    _EXEMPT_SUFFIXES = frozenset({"/retrieve_artifact_content"})
+    _EXEMPT_SUFFIXES = frozenset({"/retrieve_artifact_content", "/fetch_full_record"})
+    _EXEMPT_SEGMENTS = frozenset({"/knowledgegraph/"})
 
     async def _middleware(ctx: ToolResultContext, next_fn) -> None:
         await next_fn()
 
-        if ctx.tool_path and any(ctx.tool_path.endswith(s) for s in _EXEMPT_SUFFIXES):
+        if ctx.tool_path and (
+            any(ctx.tool_path.endswith(s) for s in _EXEMPT_SUFFIXES)
+            or any(seg in ctx.tool_path for seg in _EXEMPT_SEGMENTS)
+        ):
             return
 
         response = ctx.tool_response
@@ -208,7 +212,9 @@ def shape_artifact_registration(
 
         turn_index = 0
         if ctx.scope is not None:
-            turn_index = getattr(ctx.scope, "turn_index", 0) or 0
+            turn = getattr(ctx.scope, "turn", None)
+            if turn is not None:
+                turn_index = getattr(turn, "turn_index", 0) or 0
 
         tool_args = ctx.metadata.get("_result_accum_args")
 

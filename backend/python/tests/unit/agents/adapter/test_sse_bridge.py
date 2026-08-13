@@ -134,27 +134,25 @@ class TestQueueEventSinkCoalescing:
     async def test_text_message_content_deltas_key_on_message_id(self) -> None:
         """Two different messages' deltas (e.g. main answer vs. a spawned
         sub-agent's) must never merge into each other even though both use
-        the same event name."""
+        the same event name, and each keeps its own pending slot rather than
+        evicting the other."""
         queue: asyncio.Queue = asyncio.Queue(maxsize=1)
         sink = QueueEventSink(queue)
         await self._fill_queue(queue)
 
         await sink.write({"event": "TEXT_MESSAGE_CONTENT", "data": {"messageId": "m1", "delta": "A"}})
-        # Pending now holds m1's delta (queue full, so it wasn't flushed yet).
+        await sink.write({"event": "TEXT_MESSAGE_CONTENT", "data": {"messageId": "m2", "delta": "B"}})
+        # Both held (queue full); neither write blocked on the other's flush.
+        assert queue.qsize() == 1
 
-        write_task = asyncio.ensure_future(
-            sink.write({"event": "TEXT_MESSAGE_CONTENT", "data": {"messageId": "m2", "delta": "B"}})
-        )
-        await asyncio.sleep(0)
-        assert not write_task.done()  # blocked: flushing m1 (different key) needs a freed slot
+        await queue.get()  # drain filler
+        # maxsize=1, so flush() blocks after m1 until the consumer drains it.
+        flush_task = asyncio.ensure_future(sink.flush())
 
-        await queue.get()  # drain filler -> unblocks flushing m1; m2 becomes the new pending
-        await asyncio.wait_for(write_task, timeout=1)
-
+        # Flushed in arrival order, unmerged.
         assert await queue.get() == {"event": "TEXT_MESSAGE_CONTENT", "data": {"messageId": "m1", "delta": "A"}}
-        # m2 never merged into m1 -- different messageId keys them apart.
-        await sink.flush()
         assert await queue.get() == {"event": "TEXT_MESSAGE_CONTENT", "data": {"messageId": "m2", "delta": "B"}}
+        await asyncio.wait_for(flush_task, timeout=1)
 
     async def test_non_coalescable_event_flushes_pending_delta_first_then_blocks(self) -> None:
         """A tool/lifecycle event must never be silently dropped or
@@ -549,7 +547,7 @@ class TestRunAgentLoopStream:
         assert "boom" not in payload["message"]
 
     async def test_successful_run_streams_events_then_completes(self) -> None:
-        async def _fake_create(self, context, llm, chat_mode, *, query, model_name="", session_id=None):
+        async def _fake_create(self, context, llm, chat_mode, *, query, model_name="", session_id=None, model_key=None):
             await context.event_sink.write({"event": "status", "data": {"status": "planning", "message": "..."}})
             agent = _stream_agent(MagicMock(success=True, error=None))
             return agent, MagicMock(), MagicMock(), []
@@ -600,7 +598,7 @@ class TestRunAgentLoopStream:
 
         captured_streamed_answer: dict[str, str] = {}
 
-        async def _fake_create(self, context, llm, chat_mode, *, query, model_name="", session_id=None):
+        async def _fake_create(self, context, llm, chat_mode, *, query, model_name="", session_id=None, model_key=None):
             agent = _stream_agent(
                 MagicMock(success=True, error=None, output="The answer is 42."),
                 events=events_to_yield,
@@ -659,7 +657,7 @@ class TestRunAgentLoopStream:
         ]
         captured_streamed_answer: dict[str, str] = {}
 
-        async def _fake_create(self, context, llm, chat_mode, *, query, model_name="", session_id=None):
+        async def _fake_create(self, context, llm, chat_mode, *, query, model_name="", session_id=None, model_key=None):
             agent = _stream_agent(
                 MagicMock(success=True, error=None, output=f"{answer}\n\n---\nConfidence: High"),
                 events=events_to_yield,
@@ -721,7 +719,7 @@ class TestRunAgentLoopStream:
         agent_stream = MagicMock(side_effect=AssertionError("agent.stream() must not be called"))
         finalizer_run = AsyncMock(side_effect=AssertionError("AnswerFinalizer.run() must not be called"))
 
-        async def _fake_create(self, context, llm, chat_mode, *, query, model_name="", session_id=None):
+        async def _fake_create(self, context, llm, chat_mode, *, query, model_name="", session_id=None, model_key=None):
             agent = MagicMock()
             agent.stream = agent_stream
             return agent, MagicMock(), goal, [question]
@@ -761,7 +759,7 @@ class TestRunAgentLoopStream:
         assert complete_payload["answerMatchType"] == "Clarification Needed"
 
     async def test_agent_run_failure_emits_error_event(self) -> None:
-        async def _fake_create(self, context, llm, chat_mode, *, query, model_name="", session_id=None):
+        async def _fake_create(self, context, llm, chat_mode, *, query, model_name="", session_id=None, model_key=None):
             raise RuntimeError("transport exploded")
 
         with (
@@ -794,7 +792,7 @@ class TestRunAgentLoopStream:
         """A 429 raised anywhere in `_produce()` must surface with
         `type: "rate_limit"` and a friendly message — see
         `error_classification.py`."""
-        async def _fake_create(self, context, llm, chat_mode, *, query, model_name="", session_id=None):
+        async def _fake_create(self, context, llm, chat_mode, *, query, model_name="", session_id=None, model_key=None):
             raise RuntimeError("Error code: 429 - rate limit exceeded")
 
         with (
@@ -830,7 +828,7 @@ class TestRunAgentLoopStream:
         sandbox_manager = MagicMock()
         sandbox_manager.destroy_all = AsyncMock()
 
-        async def _fake_create(self, context, llm, chat_mode, *, query, model_name="", session_id=None):
+        async def _fake_create(self, context, llm, chat_mode, *, query, model_name="", session_id=None, model_key=None):
             context.sandbox_manager = sandbox_manager
             agent = _stream_agent(MagicMock(success=True, error=None))
             return agent, MagicMock(), MagicMock(), []
@@ -870,7 +868,7 @@ class TestRunAgentLoopStream:
         sandbox_manager = MagicMock()
         sandbox_manager.destroy_all = AsyncMock()
 
-        async def _fake_create(self, context, llm, chat_mode, *, query, model_name="", session_id=None):
+        async def _fake_create(self, context, llm, chat_mode, *, query, model_name="", session_id=None, model_key=None):
             context.sandbox_manager = sandbox_manager
             raise RuntimeError("boom")
 
@@ -904,7 +902,7 @@ class TestRunAgentLoopStream:
         sandbox_manager = MagicMock()
         sandbox_manager.destroy_all = AsyncMock(side_effect=RuntimeError("teardown exploded"))
 
-        async def _fake_create(self, context, llm, chat_mode, *, query, model_name="", session_id=None):
+        async def _fake_create(self, context, llm, chat_mode, *, query, model_name="", session_id=None, model_key=None):
             context.sandbox_manager = sandbox_manager
             agent = _stream_agent(MagicMock(success=True, error=None))
             return agent, MagicMock(), MagicMock(), []
@@ -973,7 +971,7 @@ class TestRunAgentLoopStream:
 
         sandbox_manager.destroy_all = AsyncMock(side_effect=_destroy_all)
 
-        async def _fake_create(self, context, llm, chat_mode, *, query, model_name="", session_id=None):
+        async def _fake_create(self, context, llm, chat_mode, *, query, model_name="", session_id=None, model_key=None):
             context.sandbox_manager = sandbox_manager
             agent = _stream_agent(MagicMock(success=True, error=None))
             agent._detached_tasks = {asyncio.create_task(_slow_detached())}
@@ -1035,7 +1033,7 @@ class TestRunAgentLoopStream:
         """When code execution isn't enabled for the request,
         `context.sandbox_manager` stays `None` — the cleanup block must
         skip cleanly rather than erroring on a missing manager."""
-        async def _fake_create(self, context, llm, chat_mode, *, query, model_name="", session_id=None):
+        async def _fake_create(self, context, llm, chat_mode, *, query, model_name="", session_id=None, model_key=None):
             assert context.sandbox_manager is None
             agent = _stream_agent(MagicMock(success=True, error=None))
             return agent, MagicMock(), MagicMock(), []
@@ -1093,7 +1091,7 @@ class TestHeartbeat:
     async def test_no_heartbeat_events_for_legacy_protocol(self) -> None:
         """Default `protocol="legacy"` must not start the heartbeat task at
         all — only AG-UI clients understand a `HEARTBEAT` frame."""
-        async def _fake_create(self, context, llm, chat_mode, *, query, model_name="", session_id=None):
+        async def _fake_create(self, context, llm, chat_mode, *, query, model_name="", session_id=None, model_key=None):
             agent = _stream_agent(MagicMock(success=True, error=None))
             return agent, MagicMock(), MagicMock(), []
 
@@ -1140,7 +1138,7 @@ class TestHeartbeat:
             # need to wait out the real 15s interval.
             await _heartbeat(queue, interval=0.01)
 
-        async def _fake_create(self, context, llm, chat_mode, *, query, model_name="", session_id=None):
+        async def _fake_create(self, context, llm, chat_mode, *, query, model_name="", session_id=None, model_key=None):
             agent = _slow_stream_agent(MagicMock(success=True, error=None, output="done"), delay=0.05)
             return agent, MagicMock(), MagicMock(), []
 
@@ -1188,7 +1186,7 @@ class TestHeartbeat:
         """Once the stream ends, the heartbeat task must be cancelled and
         awaited (not leaked) — `run_agent_loop_stream`'s `finally` block
         gathers `[producer, heartbeat]` before the generator returns."""
-        async def _fake_create(self, context, llm, chat_mode, *, query, model_name="", session_id=None):
+        async def _fake_create(self, context, llm, chat_mode, *, query, model_name="", session_id=None, model_key=None):
             agent = _stream_agent(MagicMock(success=True, error=None))
             return agent, MagicMock(), MagicMock(), []
 

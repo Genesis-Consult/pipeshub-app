@@ -1,5 +1,6 @@
 import { useChatStore, ASSISTANT_CTX } from '@/chat/store';
 import { fetchModelsForContext } from './fetch-models-for-context';
+import { normalizeReasoningEffort } from '@/chat/types';
 import type {
   AgentStrategy,
   AvailableLlmModel,
@@ -247,10 +248,14 @@ export function applyConversationModelInfoToStore(
     store.setSelectedModelForCtx(ctxKey, null);
   }
 
-  // Restore the effort the conversation was actually run with, so the
-  // selector reflects saved state rather than the (possibly stale) choice
-  // left over from whatever context the user was in before switching threads.
-  store.setReasoningEffortForCtx(ctxKey, modelInfo.reasoningEffort ?? null);
+  // Only overwrite the reasoning effort when the conversation actually has
+  // one persisted — older conversations (created before the feature) have
+  // `reasoningEffort: undefined`, and blindly writing `null` would clear a
+  // valid user/localStorage override, causing the toolbar to snap to the
+  // default ("High") instead of honouring the user's prior explicit choice.
+  if (modelInfo.reasoningEffort != null) {
+    store.setReasoningEffortForCtx(ctxKey, normalizeReasoningEffort(modelInfo.reasoningEffort));
+  }
 
   void refreshSelectedModelFromCatalog(modelInfo, ctxKey);
 }

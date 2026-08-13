@@ -12,16 +12,30 @@ import { fetchModelsForContext } from '@/chat/utils/fetch-models-for-context';
 import {
   PROVIDER_FRIENDLY_NAMES,
   MODEL_DESCRIPTIONS,
+  humanizeProviderKey,
 } from '@/chat/constants';
 import { ThemeableAssetIcon } from '@/app/components/ui/themeable-asset-icon';
 import { resolveLlmProviderIconPath, AGENT_LLM_FALLBACK_ICON } from '@/lib/utils/llm-provider-icons';
-import { DEFAULT_REASONING_EFFORT, type AvailableLlmModel, type ModelOverride, type ReasoningEffort } from '@/chat/types';
+import {
+  DEFAULT_REASONING_EFFORT,
+  normalizeReasoningEffort,
+  type AvailableLlmModel,
+  type ModelOverride,
+  type ReasoningEffort,
+} from '@/chat/types';
 import { useUserStore, selectIsAdmin } from '@/lib/store/user-store';
 
 // Exported so other chat surfaces (e.g. the chat-input toolbar trigger) can
 // render a matching "· High" style indicator without redefining labels.
+//
+// "none" is intentionally NOT offered here: some reasoning-capable models
+// (e.g. ChatOpenAI with reasoning_effort="none") are prone to hallucinating
+// malformed/oversized tool-call names once reasoning is fully disabled,
+// which can crash the whole turn. The backend still accepts "none" on the
+// wire (old persisted conversations/agents may carry it) and silently
+// upgrades it to "low" rather than rejecting it — see
+// `_reasoning_effort_kwargs` in `app/utils/aimodels.py`.
 export const REASONING_EFFORT_OPTIONS: { value: ReasoningEffort; labelKey: string; defaultLabel: string }[] = [
-  { value: 'none', labelKey: 'chat.reasoningEffort.none', defaultLabel: 'None' },
   { value: 'low', labelKey: 'chat.reasoningEffort.low', defaultLabel: 'Low' },
   { value: 'medium', labelKey: 'chat.reasoningEffort.medium', defaultLabel: 'Medium' },
   { value: 'high', labelKey: 'chat.reasoningEffort.high', defaultLabel: 'High' },
@@ -29,8 +43,9 @@ export const REASONING_EFFORT_OPTIONS: { value: ReasoningEffort; labelKey: strin
 ];
 
 export function getReasoningEffortLabel(t: TFunction, value: ReasoningEffort): string {
-  const option = REASONING_EFFORT_OPTIONS.find((o) => o.value === value);
-  return option ? t(option.labelKey, option.defaultLabel) : value;
+  const normalized = normalizeReasoningEffort(value) ?? value;
+  const option = REASONING_EFFORT_OPTIONS.find((o) => o.value === normalized);
+  return option ? t(option.labelKey, option.defaultLabel) : normalized;
 }
 
 interface ModelSelectorPanelProps {
@@ -72,7 +87,7 @@ export function ModelSelectorPanel({
   const cached = useChatStore((s) => s.settings.availableModels[ctxKey]);
   const models: AvailableLlmModel[] = cached?.models ?? [];
 
-  const reasoningEffort = useChatStore((s) => s.settings.reasoningEffort[ctxKey] ?? null);
+  const reasoningEffort = normalizeReasoningEffort(useChatStore((s) => s.settings.reasoningEffort[ctxKey] ?? null));
   const setReasoningEffortForCtx = useChatStore((s) => s.setReasoningEffortForCtx);
   const hydrateReasoningEffortForCtx = useChatStore((s) => s.hydrateReasoningEffortForCtx);
 
@@ -349,14 +364,14 @@ interface ModelItemProps {
 function ModelItem({ model, isSelected, onSelect }: ModelItemProps) {
   const [isHovered, setIsHovered] = useState(false);
   // Provider always comes through from the API. If we don't have a curated
-  // friendly name for it in PROVIDER_FRIENDLY_NAMES, fall back to the raw
-  // provider string (case-insensitive lookup first) rather than a placeholder.
+  // friendly name for it in PROVIDER_FRIENDLY_NAMES, fall back to splitting
+  // the raw camelCase provider key into words rather than a placeholder.
   const providerKey = Object.keys(PROVIDER_FRIENDLY_NAMES).find(
     (k) => k.toLowerCase() === model.provider?.toLowerCase(),
   );
   const providerName = providerKey
     ? PROVIDER_FRIENDLY_NAMES[providerKey]
-    : (model.provider?.trim() || '');
+    : humanizeProviderKey(model.provider?.trim() || '');
   // Description is optional — only render when we actually have one so we
   // don't show placeholder text for models that aren't in the curated map.
   const description = MODEL_DESCRIPTIONS[model.modelName];
