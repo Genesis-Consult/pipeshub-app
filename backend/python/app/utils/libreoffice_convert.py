@@ -12,16 +12,32 @@ instead of ``subprocess.run`` — for use inside the parsing service, where
 LibreOffice's ~seconds-long runtime must not block the event loop nor
 occupy a slot in the bounded parsing thread pool.
 """
+
 from __future__ import annotations
 
 import asyncio
 import os
+import signal
 import tempfile
+from contextlib import suppress
 from pathlib import Path
 
 from app.exceptions.indexing_exceptions import DocumentProcessingError
 
-LIBREOFFICE_CONVERT_TIMEOUT_SECONDS = 60
+LIBREOFFICE_CONVERT_TIMEOUT_SECONDS = int(
+    os.environ.get("LIBREOFFICE_CONVERT_TIMEOUT_SECONDS", "180")
+)
+
+
+async def _kill_process_tree(proc: asyncio.subprocess.Process) -> None:
+    """Kill LibreOffice and any helper processes started in its session."""
+    pid = getattr(proc, "pid", None)
+    if os.name != "nt" and isinstance(pid, int):
+        with suppress(ProcessLookupError):
+            os.killpg(pid, signal.SIGKILL)
+    else:
+        proc.kill()
+    await proc.wait()
 
 
 async def _run_subprocess(*args: str) -> tuple[int, bytes]:
@@ -34,7 +50,9 @@ async def _run_subprocess(*args: str) -> tuple[int, bytes]:
     return proc.returncode or 0, stderr
 
 
-async def convert_with_libreoffice(binary: bytes, input_ext: str, output_ext: str) -> bytes:
+async def convert_with_libreoffice(
+    binary: bytes, input_ext: str, output_ext: str
+) -> bytes:
     """Convert *binary* from *input_ext* to *output_ext* via headless LibreOffice.
 
     Runs the LibreOffice subprocess without blocking the calling event loop.
@@ -55,12 +73,18 @@ async def convert_with_libreoffice(binary: bytes, input_ext: str, output_ext: st
     with tempfile.TemporaryDirectory() as temp_dir:
         input_path = os.path.join(temp_dir, f"input.{input_ext}")
         output_path = os.path.join(temp_dir, f"input.{output_ext}")
+        profile_path = Path(temp_dir, "libreoffice-profile")
+        profile_path.mkdir()
 
         await asyncio.to_thread(Path(input_path).write_bytes, binary)
 
         convert_proc = await asyncio.create_subprocess_exec(
             "libreoffice",
             "--headless",
+            "--nologo",
+            "--nodefault",
+            "--nofirststartwizard",
+            f"-env:UserInstallation={profile_path.as_uri()}",
             "--convert-to",
             output_ext,
             "--outdir",
@@ -68,14 +92,14 @@ async def convert_with_libreoffice(binary: bytes, input_ext: str, output_ext: st
             input_path,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            start_new_session=os.name != "nt",
         )
         try:
             _, convert_stderr = await asyncio.wait_for(
                 convert_proc.communicate(), timeout=LIBREOFFICE_CONVERT_TIMEOUT_SECONDS
             )
         except asyncio.TimeoutError as e:
-            convert_proc.kill()
-            await convert_proc.wait()
+            await _kill_process_tree(convert_proc)
             raise DocumentProcessingError(
                 f"LibreOffice conversion timed out after {LIBREOFFICE_CONVERT_TIMEOUT_SECONDS} seconds",
                 details={"timeout": f"{LIBREOFFICE_CONVERT_TIMEOUT_SECONDS}s"},

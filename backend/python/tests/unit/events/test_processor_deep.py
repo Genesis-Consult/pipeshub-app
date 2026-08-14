@@ -383,6 +383,46 @@ class TestProcessPptxDocument:
 
 class TestProcessDocxDocument:
     @pytest.mark.asyncio
+    async def test_vml_document_is_converted_once_and_uses_pdf_pipeline(self):
+        """Problematic DOCX content takes the bounded PDF fallback route."""
+        proc = _make_processor()
+
+        async def _pdf_events(*_args, **_kwargs):
+            yield PipelineEvent(
+                event=IndexingEvent.PARSING_COMPLETE,
+                data=PipelineEventData(record_id="r1"),
+            )
+            yield PipelineEvent(
+                event=IndexingEvent.INDEXING_COMPLETE,
+                data=PipelineEventData(record_id="r1"),
+            )
+
+        proc.process_pdf_with_docling = MagicMock(side_effect=_pdf_events)
+
+        with patch(
+            "app.events.processor.docx_requires_pdf_fallback", return_value=True
+        ), patch(
+            "app.events.processor.convert_with_libreoffice",
+            new_callable=AsyncMock,
+            return_value=b"pdf data",
+        ) as mock_convert, patch("app.events.processor.DoclingProcessor") as mock_docling:
+            events = await _collect_events(
+                proc.process_docx_document(
+                    "test.docx", "r1", "1", "src", "o1", b"docxdata", "vr1"
+                )
+            )
+
+        mock_convert.assert_awaited_once_with(b"docxdata", "docx", "pdf")
+        proc.process_pdf_with_docling.assert_called_once_with(
+            "test.docx", "r1", b"pdf data", "vr1", None, None
+        )
+        mock_docling.assert_not_called()
+        assert [event.event for event in events] == [
+            IndexingEvent.PARSING_COMPLETE,
+            IndexingEvent.INDEXING_COMPLETE,
+        ]
+
+    @pytest.mark.asyncio
     async def test_success(self):
         """DOCX is parsed via DoclingProcessor and indexed."""
         proc = _make_processor()

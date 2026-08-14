@@ -18,7 +18,6 @@ from app.exceptions.indexing_exceptions import (
     IndexingError,
     RecordStatusUpdateError,
 )
-from app.services.messaging.config import IndexingEvent, PipelineEvent, PipelineEventData
 from app.models.blocks import (
     Block,
     BlockContainerIndex,
@@ -35,18 +34,26 @@ from app.models.entities import Record, RecordType
 from app.modules.parsers.markdown.markdown_parser import MarkdownParser
 from app.modules.parsers.pdf.docling_processor import DoclingProcessor
 from app.modules.parsers.pdf.ocr_handler import OCRHandler
-from app.modules.parsers.pdf.pdfplumber_opencv_processor import PDFPlumberOpenCVProcessor
+from app.modules.parsers.pdf.pdfplumber_opencv_processor import (
+    PDFPlumberOpenCVProcessor,
+)
 from app.modules.transformers.pipeline import IndexingPipeline
 from app.modules.transformers.transformer import TransformContext
 from app.services.docling.client import DoclingClient
 from app.services.graph_db.interface.graph_db_provider import IGraphDBProvider
+from app.services.messaging.config import (
+    IndexingEvent,
+    PipelineEvent,
+    PipelineEventData,
+)
 from app.utils.aimodels import is_multimodal_llm
-from app.utils.llm import get_embedding_model_config, get_llm, get_llm_for_role
-from app.utils.image_utils import get_extension_from_mimetype
 from app.utils.concurrency import MAX_CONCURRENT_PAGE_BUILDS
+from app.utils.docx_preflight import docx_requires_pdf_fallback
+from app.utils.image_utils import get_extension_from_mimetype
+from app.utils.libreoffice_convert import convert_with_libreoffice
+from app.utils.llm import get_embedding_model_config, get_llm, get_llm_for_role
 from app.utils.table_enrichment import enhance_tables_with_llm
 from app.utils.time_conversion import get_epoch_timestamp_in_ms
-
 
 SCANNED_PDF_NO_OCR_MESSAGE = "Scanned document, add Multimodal"
 
@@ -668,6 +675,24 @@ class Processor:
             # Convert binary to string if necessary
             # Initialize DocxParser and parse content
             self.logger.debug("📄 Processing DOCX content")
+
+            if docx_requires_pdf_fallback(docx_binary):
+                self.logger.info(
+                    "🛡️ VML/WMF/EMF content detected in %s; converting the complete "
+                    "DOCX to PDF once before parsing",
+                    recordName,
+                )
+                pdf_binary = await convert_with_libreoffice(docx_binary, "docx", "pdf")
+                async for event in self.process_pdf_with_docling(
+                    recordName,
+                    recordId,
+                    pdf_binary,
+                    virtual_record_id,
+                    event_type,
+                    prev_virtual_record_id,
+                ):
+                    yield event
+                return
 
             processor = DoclingProcessor(logger=self.logger, config=self.config_service)
 
