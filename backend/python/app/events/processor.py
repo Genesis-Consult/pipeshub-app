@@ -676,6 +676,12 @@ class Processor:
             # Initialize DocxParser and parse content
             self.logger.debug("📄 Processing DOCX content")
 
+            # Connector streaming can return an in-memory file object while
+            # signed URLs return raw bytes. Normalize before the ZIP preflight
+            # and keep the downstream parsers on their documented bytes input.
+            if isinstance(docx_binary, io.BytesIO):
+                docx_binary = docx_binary.getvalue()
+
             if docx_requires_pdf_fallback(docx_binary):
                 self.logger.info(
                     "🛡️ VML/WMF/EMF content detected in %s; converting the complete "

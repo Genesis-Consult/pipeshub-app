@@ -5,6 +5,7 @@ process_excel_document, process_pptx_document, process_docx_document,
 process_image, process_delimited_document.
 """
 
+import io
 import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -408,7 +409,7 @@ class TestProcessDocxDocument:
         ) as mock_convert, patch("app.events.processor.DoclingProcessor") as mock_docling:
             events = await _collect_events(
                 proc.process_docx_document(
-                    "test.docx", "r1", "1", "src", "o1", b"docxdata", "vr1"
+                    "test.docx", "r1", "1", "src", "o1", io.BytesIO(b"docxdata"), "vr1"
                 )
             )
 
