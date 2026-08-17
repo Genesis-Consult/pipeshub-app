@@ -14184,6 +14184,7 @@ class Neo4jProvider(IGraphDBProvider):
           - Root-level = no incoming PARENT_CHILD edge (from recordRelations)
         For other (external connector) apps:
           - Children are RecordGroups linked via BELONGS_TO
+          - Root records without a RecordGroup are returned directly
         """
         record_permission_role_cypher = self._get_permission_role_cypher("record", "record", "u")
         rg_permission_role_cypher = self._get_permission_role_cypher("recordGroup", "rg", "u")
@@ -14278,10 +14279,64 @@ class Neo4jProvider(IGraphDBProvider):
                 userRole: permission_role,
                 sharingStatus: null,
                 isInternal: coalesce(rg.isInternal, false)
-            }}) AS connector_children
+            }}) AS connector_group_children
         }}
 
-        WITH coalesce(kb_children, []) + coalesce(connector_children, []) AS raw_children
+        // ---- Non-KB app: also return records stored directly under the app ----
+        // Some flat connectors (for example Bullhorn) do not create RecordGroups.
+        CALL {{
+            WITH app, u, parent_id, is_kb_app
+            WITH app, u, parent_id, is_kb_app WHERE NOT is_kb_app
+
+            MATCH (record:Record {{connectorId: parent_id}})
+            WHERE coalesce(record.isDeleted, false) = false
+              AND NOT EXISTS {{
+                  MATCH (record)-[:BELONGS_TO]->(:RecordGroup)
+              }}
+              AND NOT EXISTS {{
+                  MATCH ()-[:RECORD_RELATION {{relationshipType: 'PARENT_CHILD'}}]->(record)
+              }}
+
+            {record_permission_role_cypher}
+
+            WITH app, u, parent_id, record, permission_role
+            WHERE permission_role IS NOT NULL AND permission_role <> ''
+
+            OPTIONAL MATCH (record)-[:IS_OF_TYPE]->(file_info:File)
+            OPTIONAL MATCH (record)-[child_rel:RECORD_RELATION {{relationshipType: 'PARENT_CHILD'}}]->(child:Record)
+            WITH record, permission_role, parent_id, file_info,
+                 count(DISTINCT child) > 0 AS has_children
+
+            RETURN collect({{
+                id: record.id,
+                name: record.recordName,
+                nodeType: CASE WHEN record.mimeType = 'application/vnd.folder' THEN 'folder' ELSE 'record' END,
+                parentId: 'apps/' + parent_id,
+                origin: 'CONNECTOR',
+                connector: record.connectorName,
+                connectorId: record.connectorId,
+                recordType: record.recordType,
+                recordGroupType: null,
+                indexingStatus: record.indexingStatus,
+                reason: record.reason,
+                createdAt: coalesce(record.sourceCreatedAtTimestamp, record.createdAtTimestamp, 0),
+                updatedAt: coalesce(record.sourceLastModifiedTimestamp, record.updatedAtTimestamp, 0),
+                sizeInBytes: coalesce(record.sizeInBytes, file_info.fileSizeInBytes),
+                mimeType: record.mimeType,
+                extension: file_info.extension,
+                webUrl: record.webUrl,
+                hasChildren: has_children,
+                previewRenderable: coalesce(record.previewRenderable, true),
+                userRole: permission_role,
+                sharingStatus: null,
+                isInternal: coalesce(record.isInternal, false),
+                isPlaceholder: coalesce(record.isPlaceholder, false)
+            }}) AS connector_record_children
+        }}
+
+        WITH coalesce(kb_children, [])
+             + coalesce(connector_group_children, [])
+             + coalesce(connector_record_children, []) AS raw_children
         RETURN raw_children
         """
 

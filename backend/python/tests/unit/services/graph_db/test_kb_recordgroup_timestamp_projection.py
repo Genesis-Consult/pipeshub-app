@@ -339,6 +339,14 @@ class TestNeo4jAppChildrenCypher:
         cypher = neo4j_provider._get_app_children_cypher()
         assert "reason: record.reason" in cypher
 
+    def test_flat_connector_records_are_returned_directly(self, neo4j_provider):
+        cypher = _normalize(neo4j_provider._get_app_children_cypher())
+        assert "MATCH (record:Record {connectorId: parent_id})" in cypher
+        assert "MATCH (record)-[:BELONGS_TO]->(:RecordGroup)" in cypher
+        assert "connector_record_children" in cypher
+        assert "_get_record_permission_role_cypher" not in cypher
+        assert "OPTIONAL MATCH (u)-[ur:PERMISSION {type: 'USER'}]->(role:Role)-[p5:PERMISSION]->(target)" in cypher
+
 
 class TestNeo4jRecordGroupChildrenCypher:
     """_get_record_group_children_cypher emits node.* projection with the KB
@@ -382,3 +390,13 @@ class TestKBBranchUsesInSystemTimestamp:
         assert "is_kb_app" in flat, "Should check app type using is_kb_app variable"
         assert "record.createdAtTimestamp" in flat, "KB branch should use record.createdAtTimestamp"
         assert "rg.sourceCreatedAtTimestamp" in flat, "Non-KB branch should use rg.sourceCreatedAtTimestamp"
+
+    def test_arango_flat_connector_records_are_returned_directly(self, arango_provider):
+        aql, _ = arango_provider._get_app_children_subquery(
+            app_id="app1", org_id="org1", user_key="user1"
+        )
+        flat = _normalize(aql)
+        assert "FOR record IN records" in flat
+        assert "record.connectorId == app._key" in flat
+        assert 'STARTS_WITH(parent_edge._to, "recordGroups/")' in flat
+        assert "direct_records" in flat

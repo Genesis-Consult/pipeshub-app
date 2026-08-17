@@ -16380,8 +16380,10 @@ class ArangoHTTPProvider(IGraphDBProvider):
 
         For external connector apps:
         - Returns recordGroups connected to app via belongsTo edges
+        - Returns root records directly when the connector has no recordGroups
         """
         permission_role_aql = self._get_permission_role_aql("recordGroup", "node", "u")
+        record_permission_role_aql = self._get_permission_role_aql("record", "record", "u")
         app_permission_role_aql = self._get_permission_role_aql("app", "app", "u")
 
         sub_query = f"""
@@ -16466,49 +16468,121 @@ class ArangoHTTPProvider(IGraphDBProvider):
                     FILTER rg != null AND rg.isDeleted != true
                     RETURN rg
             )
-            FOR node IN all_rgs
-                {permission_role_aql}
-                LET normalized_role = IS_ARRAY(permission_role)
-                    ? (LENGTH(permission_role) > 0 ? permission_role[0] : null)
-                    : permission_role
-                FILTER normalized_role != null AND normalized_role != ""
-                LET has_child_rgs = (LENGTH(
-                    FOR c_edge IN belongsTo
-                        FILTER c_edge._to == node._id
-                        AND STARTS_WITH(c_edge._from, "recordGroups/")
-                        AND c_edge.isDeleted != true
-                        LIMIT 1
-                        RETURN 1
-                ) > 0)
-                LET has_records = (LENGTH(
-                    FOR r_edge IN belongsTo
-                        FILTER r_edge._to == node._id
-                        AND STARTS_WITH(r_edge._from, "records/")
-                        AND r_edge.isDeleted != true
-                        LIMIT 1
-                        RETURN 1
-                ) > 0)
-                RETURN MERGE(node, {{
-                    id: node._key,
-                    name: node.groupName,
-                    nodeType: "recordGroup",
-                    parentId: CONCAT("apps/", @app_id),
-                    origin: "CONNECTOR",
-                    connector: node.connectorName,
-                    recordType: null,
-                    recordGroupType: node.groupType,
-                    indexingStatus: null,
-                    createdAt: node.sourceCreatedAtTimestamp != null ? node.sourceCreatedAtTimestamp : (node.createdAtTimestamp != null ? node.createdAtTimestamp : 0),
-                    updatedAt: node.sourceLastModifiedTimestamp != null ? node.sourceLastModifiedTimestamp : (node.updatedAtTimestamp != null ? node.updatedAtTimestamp : 0),
-                    sizeInBytes: null,
-                    mimeType: null,
-                    extension: null,
-                    webUrl: node.webUrl,
-                    hasChildren: has_child_rgs OR has_records,
-                    userRole: normalized_role,
-                    sharingStatus: null,
-                    isInternal: node.isInternal ? true : false
-                }})
+            LET group_children = (
+                FOR node IN all_rgs
+                    {permission_role_aql}
+                    LET normalized_role = IS_ARRAY(permission_role)
+                        ? (LENGTH(permission_role) > 0 ? permission_role[0] : null)
+                        : permission_role
+                    FILTER normalized_role != null AND normalized_role != ""
+                    LET has_child_rgs = (LENGTH(
+                        FOR c_edge IN belongsTo
+                            FILTER c_edge._to == node._id
+                            AND STARTS_WITH(c_edge._from, "recordGroups/")
+                            AND c_edge.isDeleted != true
+                            LIMIT 1
+                            RETURN 1
+                    ) > 0)
+                    LET has_records = (LENGTH(
+                        FOR r_edge IN belongsTo
+                            FILTER r_edge._to == node._id
+                            AND STARTS_WITH(r_edge._from, "records/")
+                            AND r_edge.isDeleted != true
+                            LIMIT 1
+                            RETURN 1
+                    ) > 0)
+                    RETURN MERGE(node, {{
+                        id: node._key,
+                        name: node.groupName,
+                        nodeType: "recordGroup",
+                        parentId: CONCAT("apps/", @app_id),
+                        origin: "CONNECTOR",
+                        connector: node.connectorName,
+                        recordType: null,
+                        recordGroupType: node.groupType,
+                        indexingStatus: null,
+                        createdAt: node.sourceCreatedAtTimestamp != null ? node.sourceCreatedAtTimestamp : (node.createdAtTimestamp != null ? node.createdAtTimestamp : 0),
+                        updatedAt: node.sourceLastModifiedTimestamp != null ? node.sourceLastModifiedTimestamp : (node.updatedAtTimestamp != null ? node.updatedAtTimestamp : 0),
+                        sizeInBytes: null,
+                        mimeType: null,
+                        extension: null,
+                        webUrl: node.webUrl,
+                        hasChildren: has_child_rgs OR has_records,
+                        userRole: normalized_role,
+                        sharingStatus: null,
+                        isInternal: node.isInternal ? true : false
+                    }})
+            )
+
+            LET direct_records = (
+                FOR record IN records
+                    FILTER record.connectorId == app._key
+                    AND record.isDeleted != true
+                    LET has_group_parent = LENGTH(
+                        FOR parent_edge IN belongsTo
+                            FILTER parent_edge._from == record._id
+                            AND STARTS_WITH(parent_edge._to, "recordGroups/")
+                            LIMIT 1
+                            RETURN 1
+                    ) > 0
+                    LET has_record_parent = LENGTH(
+                        FOR parent_rel IN recordRelations
+                            FILTER parent_rel._to == record._id
+                            AND parent_rel.relationshipType == "PARENT_CHILD"
+                            LIMIT 1
+                            RETURN 1
+                    ) > 0
+                    FILTER has_group_parent == false AND has_record_parent == false
+
+                    {record_permission_role_aql}
+                    LET normalized_role = IS_ARRAY(permission_role)
+                        ? (LENGTH(permission_role) > 0 ? permission_role[0] : null)
+                        : permission_role
+                    FILTER normalized_role != null AND normalized_role != ""
+
+                    LET file_info = FIRST(
+                        FOR fe IN isOfType
+                            FILTER fe._from == record._id
+                            LET f = DOCUMENT(fe._to)
+                            RETURN f
+                    )
+                    LET is_folder = record.mimeType == "application/vnd.folder"
+                    LET has_children = LENGTH(
+                        FOR child_rel IN recordRelations
+                            FILTER child_rel._from == record._id
+                            AND child_rel.relationshipType == "PARENT_CHILD"
+                            LIMIT 1
+                            RETURN 1
+                    ) > 0
+                    RETURN {{
+                        id: record._key,
+                        name: record.recordName,
+                        nodeType: is_folder ? "folder" : "record",
+                        parentId: CONCAT("apps/", @app_id),
+                        origin: "CONNECTOR",
+                        connector: record.connectorName,
+                        connectorId: record.connectorId,
+                        recordType: record.recordType,
+                        recordGroupType: null,
+                        indexingStatus: record.indexingStatus,
+                        reason: record.reason,
+                        createdAt: record.sourceCreatedAtTimestamp != null ? record.sourceCreatedAtTimestamp : (record.createdAtTimestamp != null ? record.createdAtTimestamp : 0),
+                        updatedAt: record.sourceLastModifiedTimestamp != null ? record.sourceLastModifiedTimestamp : (record.updatedAtTimestamp != null ? record.updatedAtTimestamp : 0),
+                        sizeInBytes: record.sizeInBytes != null ? record.sizeInBytes : file_info.fileSizeInBytes,
+                        mimeType: record.mimeType,
+                        extension: file_info.extension,
+                        webUrl: record.webUrl,
+                        hasChildren: has_children,
+                        previewRenderable: record.previewRenderable != null ? record.previewRenderable : true,
+                        userRole: normalized_role,
+                        sharingStatus: null,
+                        isInternal: record.isInternal ? true : false,
+                        isPlaceholder: record.isPlaceholder ? true : false
+                    }}
+            )
+
+            FOR child IN APPEND(group_children, direct_records)
+                RETURN child
         )
         """
         return sub_query, {"app_id": app_id, "user_key": user_key}
