@@ -1,8 +1,10 @@
+import base64
 from unittest.mock import AsyncMock
 
 import pytest
 
 from app.sources.client.bullhorn.bullhorn import (
+    BullhornApiError,
     BullhornCandidate,
     BullhornClient,
     BullhornCredentials,
@@ -147,6 +149,39 @@ async def test_incremental_candidate_scan_uses_supported_search_api(
             "sort": "dateLastModified,id",
         },
     )
+
+
+@pytest.mark.asyncio
+async def test_download_resume_accepts_line_wrapped_base64(
+    client: BullhornClient,
+) -> None:
+    content = b"%PDF-1.7\n" + (b"resume content" * 100)
+    encoded = base64.b64encode(content).decode("ascii")
+    line_wrapped = "\n".join(
+        encoded[index : index + 76] for index in range(0, len(encoded), 76)
+    )
+    client._authorized_json = AsyncMock(  # type: ignore[method-assign]
+        return_value={"File": {"fileContent": line_wrapped}}
+    )
+
+    result = await client.download_resume(42, 99)
+
+    assert result == content
+    client._authorized_json.assert_awaited_once_with(
+        "GET", "file/Candidate/42/99"
+    )
+
+
+@pytest.mark.asyncio
+async def test_download_resume_still_rejects_invalid_base64(
+    client: BullhornClient,
+) -> None:
+    client._authorized_json = AsyncMock(  # type: ignore[method-assign]
+        return_value={"File": {"fileContent": "not valid base64!"}}
+    )
+
+    with pytest.raises(BullhornApiError, match="invalid base64 file content"):
+        await client.download_resume(42, 99)
 
 
 def test_map_candidate_keeps_stable_source_identifiers() -> None:

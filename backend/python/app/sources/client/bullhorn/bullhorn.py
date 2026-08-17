@@ -311,7 +311,12 @@ class BullhornClient:
         if not isinstance(encoded, str):
             raise BullhornApiError("Bullhorn file response omitted fileContent")
         try:
-            return base64.b64decode(encoded, validate=True)
+            # Bullhorn line-wraps large file payloads with LF characters.  Strict
+            # validation is still useful for detecting corrupt responses, but it
+            # rejects otherwise valid MIME-style Base64 unless the transport
+            # whitespace is removed first.
+            normalized = "".join(encoded.split())
+            return base64.b64decode(normalized, validate=True)
         except (binascii.Error, ValueError) as exc:
             raise BullhornApiError(
                 "Bullhorn returned invalid base64 file content"
