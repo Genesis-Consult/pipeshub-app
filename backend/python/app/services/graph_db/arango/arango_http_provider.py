@@ -6742,6 +6742,103 @@ class ArangoHTTPProvider(IGraphDBProvider):
             self.logger.error(f"ensure_team_app_edge failed: {e}", exc_info=True)
             raise
 
+    async def reconcile_app_access_from_role(
+        self,
+        connector_id: str,
+        role_connector_id: str,
+        external_role_id: str,
+        transaction: Optional[str] = None,
+    ) -> None:
+        role_query = f"""
+        FOR role IN {CollectionNames.ROLES.value}
+            FILTER role.connectorId == @role_connector_id
+            FILTER role.externalRoleId == @external_role_id
+            LIMIT 1
+            RETURN role._id
+        """
+        roles = await self.execute_query(
+            role_query,
+            bind_vars={
+                "role_connector_id": role_connector_id,
+                "external_role_id": external_role_id,
+            },
+            transaction=transaction,
+        ) or []
+        if not roles:
+            raise ValueError("Source role not found while reconciling app access")
+
+        members_query = f"""
+        FOR membership IN {CollectionNames.PERMISSION.value}
+            FILTER membership._to == @role_id
+            FILTER membership.type == "USER"
+            FOR user IN {CollectionNames.USERS.value}
+                FILTER user._id == membership._from
+                FILTER user.isActive != false
+                RETURN {{ id: user._key, userId: user.userId }}
+        """
+        members = await self.execute_query(
+            members_query,
+            bind_vars={"role_id": roles[0]},
+            transaction=transaction,
+        ) or []
+
+        member_ids = [member["id"] for member in members]
+        app_id = f"{CollectionNames.APPS.value}/{connector_id}"
+        cleanup_query = f"""
+        FOR relation IN {CollectionNames.USER_APP_RELATION.value}
+            FILTER relation._to == @app_id
+            LET source = PARSE_IDENTIFIER(relation._from)
+            FILTER source.collection == @teams_collection
+                OR (source.collection == @users_collection AND source.key NOT IN @member_ids)
+            REMOVE relation IN {CollectionNames.USER_APP_RELATION.value}
+        """
+        await self.execute_query(
+            cleanup_query,
+            bind_vars={
+                "app_id": app_id,
+                "teams_collection": CollectionNames.TEAMS.value,
+                "users_collection": CollectionNames.USERS.value,
+                "member_ids": member_ids,
+            },
+            transaction=transaction,
+        )
+
+        ts = get_epoch_timestamp_in_ms()
+        upsert_query = f"""
+        FOR member IN @members
+            LET user_id = CONCAT(@users_collection, "/", member.id)
+            UPSERT {{ _from: user_id, _to: @app_id }}
+            INSERT {{
+                _from: user_id,
+                _to: @app_id,
+                sourceUserId: CONCAT(
+                    "staffgc:", NOT_NULL(member.userId, member.id)
+                ),
+                syncState: "NOT_STARTED",
+                lastSyncUpdate: @ts,
+                createdAtTimestamp: @ts,
+                updatedAtTimestamp: @ts
+            }}
+            UPDATE {{
+                sourceUserId: CONCAT(
+                    "staffgc:", NOT_NULL(member.userId, member.id)
+                ),
+                syncState: "NOT_STARTED",
+                lastSyncUpdate: @ts,
+                updatedAtTimestamp: @ts
+            }} IN {CollectionNames.USER_APP_RELATION.value}
+        """
+        await self.execute_query(
+            upsert_query,
+            bind_vars={
+                "members": members,
+                "users_collection": CollectionNames.USERS.value,
+                "app_id": app_id,
+                "ts": ts,
+            },
+            transaction=transaction,
+        )
+
     async def batch_upsert_user_groups(
         self,
         user_groups: list[AppUserGroup],

@@ -5847,6 +5847,47 @@ class Neo4jProvider(IGraphDBProvider):
             self.logger.error(f"ensure_team_app_edge failed: {e}", exc_info=True)
             raise
 
+    async def reconcile_app_access_from_role(
+        self,
+        connector_id: str,
+        role_connector_id: str,
+        external_role_id: str,
+        transaction: Optional[str] = None,
+    ) -> None:
+        ts = get_epoch_timestamp_in_ms()
+        query = """
+        MATCH (role:Role {
+            connectorId: $role_connector_id,
+            externalRoleId: $external_role_id
+        })
+        MATCH (app:App {id: $connector_id})
+        OPTIONAL MATCH (member:User)-[:PERMISSION {type: 'USER'}]->(role)
+        WHERE coalesce(member.isActive, true) = true
+        WITH app, [user IN collect(DISTINCT member) WHERE user IS NOT NULL] AS members
+        OPTIONAL MATCH (principal)-[stale:USER_APP_RELATION]->(app)
+        WHERE principal:Teams OR (principal:User AND NOT principal IN members)
+        WITH app, members, collect(stale) AS stale_edges
+        FOREACH (edge IN stale_edges | DELETE edge)
+        WITH app, members
+        UNWIND members AS member
+        MERGE (member)-[relation:USER_APP_RELATION]->(app)
+        ON CREATE SET relation.createdAtTimestamp = $ts
+        SET relation.sourceUserId = 'staffgc:' + coalesce(member.userId, member.id),
+            relation.syncState = 'NOT_STARTED',
+            relation.lastSyncUpdate = $ts,
+            relation.updatedAtTimestamp = $ts
+        """
+        await self.client.execute_query(
+            query,
+            parameters={
+                "connector_id": connector_id,
+                "role_connector_id": role_connector_id,
+                "external_role_id": external_role_id,
+                "ts": ts,
+            },
+            txn_id=transaction,
+        )
+
     async def batch_upsert_user_groups(
         self,
         user_groups: list[AppUserGroup],

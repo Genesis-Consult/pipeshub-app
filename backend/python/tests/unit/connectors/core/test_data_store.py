@@ -194,6 +194,11 @@ class ConcreteTransactionStore(TransactionStore):
     async def ensure_team_app_edge(self, connector_id: str, org_id: str) -> None:
         pass
 
+    async def reconcile_app_access_from_role(
+        self, connector_id: str, role_connector_id: str, external_role_id: str
+    ) -> None:
+        pass
+
     async def find_slack_burst_record_by_ts(self, connector_id, channel_id, ts):
         return None
 

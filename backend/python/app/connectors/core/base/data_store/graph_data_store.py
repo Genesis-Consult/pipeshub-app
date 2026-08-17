@@ -494,6 +494,19 @@ class GraphTransactionStore(TransactionStore):
         """
         return await self.graph_provider.ensure_team_app_edge(connector_id, org_id, transaction=self.txn)
 
+    async def reconcile_app_access_from_role(
+        self,
+        connector_id: str,
+        role_connector_id: str,
+        external_role_id: str,
+    ) -> None:
+        return await self.graph_provider.reconcile_app_access_from_role(
+            connector_id,
+            role_connector_id,
+            external_role_id,
+            transaction=self.txn,
+        )
+
     async def batch_upsert_orgs(self, orgs: list[Org]) -> None:
         return await self.graph_provider.batch_upsert_orgs(orgs, transaction=self.txn)
 

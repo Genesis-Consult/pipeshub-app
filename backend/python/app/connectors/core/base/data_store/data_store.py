@@ -348,6 +348,16 @@ class BaseDataStore(ABC):
         """
         pass
 
+    @abstractmethod
+    async def reconcile_app_access_from_role(
+        self,
+        connector_id: str,
+        role_connector_id: str,
+        external_role_id: str,
+    ) -> None:
+        """Restrict app visibility to the active members of a source role."""
+        pass
+
 
 class TransactionStore(BaseDataStore):
     """Abstract transaction-aware data store that operates within a transaction context"""

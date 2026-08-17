@@ -253,9 +253,14 @@ class BullhornConnector(BaseConnector):
                 connector_id=self.staff_role_connector_id,
                 external_id=self.staff_role_external_id,
             )
-        if staff_role is None:
-            raise ConnectorInitError(
-                "The StaffGC access role is not synchronized in PipesHub"
+            if staff_role is None:
+                raise ConnectorInitError(
+                    "The StaffGC access role is not synchronized in PipesHub"
+                )
+            await tx_store.reconcile_app_access_from_role(
+                self.connector_id,
+                self.staff_role_connector_id,
+                self.staff_role_external_id,
             )
         self.client = BullhornClient(
             BullhornCredentials(
