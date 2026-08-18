@@ -2801,6 +2801,17 @@ class IGraphDBProvider(ABC):
         pass
 
     @abstractmethod
+    async def reconcile_app_access_from_group(
+        self,
+        connector_id: str,
+        group_connector_id: str,
+        external_group_id: str,
+        transaction: Optional[str] = None,
+    ) -> None:
+        """Make an app visible only to active users assigned to a source group."""
+        pass
+
+    @abstractmethod
     async def ensure_all_team_with_users(self, org_id: str) -> None:
         """
         Ensure the org's 'All' team exists and every active org user has a PERMISSION edge.

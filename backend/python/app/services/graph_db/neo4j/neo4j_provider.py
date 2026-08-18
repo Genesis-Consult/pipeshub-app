@@ -5890,6 +5890,47 @@ class Neo4jProvider(IGraphDBProvider):
             txn_id=transaction,
         )
 
+    async def reconcile_app_access_from_group(
+        self,
+        connector_id: str,
+        group_connector_id: str,
+        external_group_id: str,
+        transaction: Optional[str] = None,
+    ) -> None:
+        ts = get_epoch_timestamp_in_ms()
+        query = """
+        MATCH (group:Group {
+            connectorId: $group_connector_id,
+            externalGroupId: $external_group_id
+        })
+        MATCH (app:App {id: $connector_id})
+        OPTIONAL MATCH (member:User)-[:PERMISSION {type: 'USER'}]->(group)
+        WHERE coalesce(member.isActive, true) = true
+        WITH app, [user IN collect(DISTINCT member) WHERE user IS NOT NULL] AS members
+        OPTIONAL MATCH (principal)-[stale:USER_APP_RELATION]->(app)
+        WHERE principal:Teams OR (principal:User AND NOT principal IN members)
+        WITH app, members, collect(stale) AS stale_edges
+        FOREACH (edge IN stale_edges | DELETE edge)
+        WITH app, members
+        UNWIND members AS member
+        MERGE (member)-[relation:USER_APP_RELATION]->(app)
+        ON CREATE SET relation.createdAtTimestamp = $ts
+        SET relation.sourceUserId = 'staffgc:' + coalesce(member.userId, member.id),
+            relation.syncState = 'NOT_STARTED',
+            relation.lastSyncUpdate = $ts,
+            relation.updatedAtTimestamp = $ts
+        """
+        await self.client.execute_query(
+            query,
+            parameters={
+                "connector_id": connector_id,
+                "group_connector_id": group_connector_id,
+                "external_group_id": external_group_id,
+                "ts": ts,
+            },
+            txn_id=transaction,
+        )
+
     async def batch_upsert_user_groups(
         self,
         user_groups: list[AppUserGroup],

@@ -507,6 +507,19 @@ class GraphTransactionStore(TransactionStore):
             transaction=self.txn,
         )
 
+    async def reconcile_app_access_from_group(
+        self,
+        connector_id: str,
+        group_connector_id: str,
+        external_group_id: str,
+    ) -> None:
+        return await self.graph_provider.reconcile_app_access_from_group(
+            connector_id,
+            group_connector_id,
+            external_group_id,
+            transaction=self.txn,
+        )
+
     async def batch_upsert_orgs(self, orgs: list[Org]) -> None:
         return await self.graph_provider.batch_upsert_orgs(orgs, transaction=self.txn)
 

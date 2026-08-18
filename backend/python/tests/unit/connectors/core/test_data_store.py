@@ -199,6 +199,11 @@ class ConcreteTransactionStore(TransactionStore):
     ) -> None:
         pass
 
+    async def reconcile_app_access_from_group(
+        self, connector_id: str, group_connector_id: str, external_group_id: str
+    ) -> None:
+        pass
+
     async def find_slack_burst_record_by_ts(self, connector_id, channel_id, ts):
         return None
 

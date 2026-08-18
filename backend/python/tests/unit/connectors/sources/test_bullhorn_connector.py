@@ -1,6 +1,6 @@
 import sys
 import types
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -42,13 +42,13 @@ else:
 
 
 def build_connector(
-    staff_role: object | None = object(),
+    staff_group: object | None = object(),
 ) -> tuple[BullhornConnector, MagicMock]:
     logger = MagicMock()
     data_entities_processor = MagicMock(org_id="org-1")
     tx_store = MagicMock()
-    tx_store.get_app_role_by_external_id = AsyncMock(return_value=staff_role)
-    tx_store.reconcile_app_access_from_role = AsyncMock()
+    tx_store.get_user_group_by_external_id = AsyncMock(return_value=staff_group)
+    tx_store.reconcile_app_access_from_group = AsyncMock()
 
     transaction = MagicMock()
     transaction.__aenter__ = AsyncMock(return_value=tx_store)
@@ -80,7 +80,7 @@ def build_connector(
 
 
 @pytest.mark.asyncio
-async def test_init_reconciles_visibility_from_staff_role() -> None:
+async def test_init_reconciles_visibility_from_staff_group() -> None:
     connector, tx_store = build_connector()
 
     with patch(
@@ -89,18 +89,60 @@ async def test_init_reconciles_visibility_from_staff_role() -> None:
         client_class.return_value.test_connection = AsyncMock(return_value=True)
         assert await connector.init() is True
 
-    tx_store.reconcile_app_access_from_role.assert_awaited_once_with(
+    tx_store.reconcile_app_access_from_group.assert_awaited_once_with(
         "bullhorn-app",
-        BullhornConnector.DEFAULT_STAFF_ROLE_CONNECTOR_ID,
-        BullhornConnector.DEFAULT_STAFF_ROLE_EXTERNAL_ID,
+        BullhornConnector.DEFAULT_STAFF_GROUP_CONNECTOR_ID,
+        BullhornConnector.DEFAULT_STAFF_GROUP_EXTERNAL_ID,
     )
 
 
 @pytest.mark.asyncio
-async def test_init_fails_closed_when_staff_role_is_missing() -> None:
-    connector, tx_store = build_connector(staff_role=None)
+async def test_init_fails_closed_when_staff_group_is_missing() -> None:
+    connector, tx_store = build_connector(staff_group=None)
 
-    with pytest.raises(ConnectorInitError, match="StaffGC access role"):
+    with pytest.raises(ConnectorInitError, match="StaffGC access group"):
         await connector.init()
 
-    tx_store.reconcile_app_access_from_role.assert_not_awaited()
+    tx_store.reconcile_app_access_from_group.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_each_sync_reconciles_visibility_from_staff_group() -> None:
+    connector, tx_store = build_connector()
+
+    async def no_candidates(
+        _modified_since_ms: int | None,
+    ) -> AsyncIterator[None]:
+        if False:
+            yield None
+
+    connector.client = MagicMock(
+        iter_candidates=no_candidates,
+        last_quota_remaining=None,
+        last_quota_reset_seconds=None,
+    )
+    connector.record_sync_point.read_sync_point = AsyncMock(return_value={})
+    connector.record_sync_point.update_sync_point = AsyncMock()
+
+    await connector._sync(modified_since_ms=None, mode="incremental")
+
+    tx_store.reconcile_app_access_from_group.assert_awaited_once_with(
+        "bullhorn-app",
+        BullhornConnector.DEFAULT_STAFF_GROUP_CONNECTOR_ID,
+        BullhornConnector.DEFAULT_STAFF_GROUP_EXTERNAL_ID,
+    )
+
+
+def test_record_permissions_use_staff_group() -> None:
+    connector, _ = build_connector()
+
+    permission = connector._permissions()[0]
+
+    assert permission.entity_type.value == "GROUP"
+    assert (
+        permission.external_id == BullhornConnector.DEFAULT_STAFF_GROUP_EXTERNAL_ID
+    )
+    assert (
+        permission.source_connector_id
+        == BullhornConnector.DEFAULT_STAFF_GROUP_CONNECTOR_ID
+    )

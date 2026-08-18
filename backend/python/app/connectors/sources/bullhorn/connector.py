@@ -146,27 +146,26 @@ if TYPE_CHECKING:
             )
             .add_sync_custom_field(
                 CustomField(
-                    name="staff_role_connector_id",
-                    display_name="Staff role connector ID",
+                    name="staff_group_connector_id",
+                    display_name="Staff group connector ID",
                     field_type="TEXT",
                     required=False,
-                    default_value="780b54f2-71ec-452c-b32c-fbc7f397c7f3",
+                    default_value="0c7c0373-18a1-4b95-96b6-c519dbc6935f",
                     description=(
-                        "PipesHub connector ID that synchronizes the Entra StaffGC "
-                        "membership (the Genesis BookStack connector)"
+                        "PipesHub connector ID that directly synchronizes the Entra "
+                        "StaffGC membership (the Genesis SharePoint connector)"
                     ),
                 )
             )
             .add_sync_custom_field(
                 CustomField(
-                    name="staff_role_external_id",
-                    display_name="Staff role external ID",
+                    name="staff_group_external_id",
+                    display_name="Staff group external ID",
                     field_type="TEXT",
                     required=False,
-                    default_value="5",
+                    default_value="feb62e75-2b5c-49d7-ba81-9f8c1455f764",
                     description=(
-                        "External role ID mapped to Entra StaffGC "
-                        "(feb62e75-2b5c-49d7-ba81-9f8c1455f764)"
+                        "Microsoft Entra object ID of the StaffGC group"
                     ),
                 )
             )
@@ -177,13 +176,13 @@ if TYPE_CHECKING:
     .build_decorator()
 )
 class BullhornConnector(BaseConnector):
-    """Team connector whose CVs are restricted to the Entra-backed staff role."""
+    """Team connector whose CVs are restricted to the Entra StaffGC group."""
 
     SYNC_POINT_KEY = generate_record_sync_point_key("bullhorn", "candidates", "global")
     INCREMENTAL_OVERLAP_MS = 5 * 60 * 1000
     FULL_RECONCILIATION_INTERVAL_MS = 24 * 60 * 60 * 1000
-    DEFAULT_STAFF_ROLE_CONNECTOR_ID = "780b54f2-71ec-452c-b32c-fbc7f397c7f3"
-    DEFAULT_STAFF_ROLE_EXTERNAL_ID = "5"
+    DEFAULT_STAFF_GROUP_CONNECTOR_ID = "0c7c0373-18a1-4b95-96b6-c519dbc6935f"
+    DEFAULT_STAFF_GROUP_EXTERNAL_ID = "feb62e75-2b5c-49d7-ba81-9f8c1455f764"
 
     def __init__(
         self,
@@ -209,8 +208,8 @@ class BullhornConnector(BaseConnector):
         self.client: BullhornClient | None = None
         self.candidate_ui_base_url = ""
         self.candidate_concurrency = 8
-        self.staff_role_connector_id = self.DEFAULT_STAFF_ROLE_CONNECTOR_ID
-        self.staff_role_external_id = self.DEFAULT_STAFF_ROLE_EXTERNAL_ID
+        self.staff_group_connector_id = self.DEFAULT_STAFF_GROUP_CONNECTOR_ID
+        self.staff_group_external_id = self.DEFAULT_STAFF_GROUP_EXTERNAL_ID
         self.record_sync_point = SyncPoint(
             connector_id=connector_id,
             org_id=data_entities_processor.org_id,
@@ -240,28 +239,15 @@ class BullhornConnector(BaseConnector):
             )
         except (TypeError, ValueError):
             self.candidate_concurrency = 8
-        self.staff_role_connector_id = str(
-            sync_config.get("staff_role_connector_id")
-            or self.DEFAULT_STAFF_ROLE_CONNECTOR_ID
+        self.staff_group_connector_id = str(
+            sync_config.get("staff_group_connector_id")
+            or self.DEFAULT_STAFF_GROUP_CONNECTOR_ID
         ).strip()
-        self.staff_role_external_id = str(
-            sync_config.get("staff_role_external_id")
-            or self.DEFAULT_STAFF_ROLE_EXTERNAL_ID
+        self.staff_group_external_id = str(
+            sync_config.get("staff_group_external_id")
+            or self.DEFAULT_STAFF_GROUP_EXTERNAL_ID
         ).strip()
-        async with self.data_store_provider.transaction() as tx_store:
-            staff_role = await tx_store.get_app_role_by_external_id(
-                connector_id=self.staff_role_connector_id,
-                external_id=self.staff_role_external_id,
-            )
-            if staff_role is None:
-                raise ConnectorInitError(
-                    "The StaffGC access role is not synchronized in PipesHub"
-                )
-            await tx_store.reconcile_app_access_from_role(
-                self.connector_id,
-                self.staff_role_connector_id,
-                self.staff_role_external_id,
-            )
+        await self._reconcile_staff_access()
         self.client = BullhornClient(
             BullhornCredentials(
                 client_id=auth["client_id"],
@@ -278,6 +264,22 @@ class BullhornConnector(BaseConnector):
             await self.client.close()
             self.client = None
             raise ConnectorInitError(f"Bullhorn connection failed: {exc}") from exc
+
+    async def _reconcile_staff_access(self) -> None:
+        async with self.data_store_provider.transaction() as tx_store:
+            staff_group = await tx_store.get_user_group_by_external_id(
+                connector_id=self.staff_group_connector_id,
+                external_id=self.staff_group_external_id,
+            )
+            if staff_group is None:
+                raise ConnectorInitError(
+                    "The StaffGC access group is not synchronized in PipesHub"
+                )
+            await tx_store.reconcile_app_access_from_group(
+                self.connector_id,
+                self.staff_group_connector_id,
+                self.staff_group_external_id,
+            )
 
     async def test_connection_and_access(self) -> bool:
         return bool(self.client and await self.client.test_connection())
@@ -305,6 +307,8 @@ class BullhornConnector(BaseConnector):
     async def _sync(self, modified_since_ms: int | None, mode: str) -> None:
         if not self.client:
             raise RuntimeError("Bullhorn connector is not initialized")
+
+        await self._reconcile_staff_access()
 
         job_id = str(uuid.uuid4())
         started_ms = int(time.time() * 1000)
@@ -505,10 +509,10 @@ class BullhornConnector(BaseConnector):
     def _permissions(self) -> list[Permission]:
         return [
             Permission(
-                entity_type=EntityType.ROLE,
+                entity_type=EntityType.GROUP,
                 type=PermissionType.READ,
-                external_id=self.staff_role_external_id,
-                source_connector_id=self.staff_role_connector_id,
+                external_id=self.staff_group_external_id,
+                source_connector_id=self.staff_group_connector_id,
             )
         ]
 
