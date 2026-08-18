@@ -365,7 +365,7 @@ class BaseDataStore(ABC):
         group_connector_id: str,
         external_group_id: str,
     ) -> None:
-        """Restrict app visibility to the active members of a source group."""
+        """Restrict app visibility to members of a source group."""
         pass
 
 

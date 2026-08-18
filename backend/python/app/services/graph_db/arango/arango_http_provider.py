@@ -6773,7 +6773,6 @@ class ArangoHTTPProvider(IGraphDBProvider):
             FILTER membership.type == "USER"
             FOR user IN {CollectionNames.USERS.value}
                 FILTER user._id == membership._from
-                FILTER user.isActive != false
                 RETURN {{ id: user._key, userId: user.userId }}
         """
         members = await self.execute_query(

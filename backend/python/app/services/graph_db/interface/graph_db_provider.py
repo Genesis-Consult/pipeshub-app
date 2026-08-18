@@ -2808,7 +2808,7 @@ class IGraphDBProvider(ABC):
         external_group_id: str,
         transaction: Optional[str] = None,
     ) -> None:
-        """Make an app visible only to active users assigned to a source group."""
+        """Make an app visible only to users assigned to a source group."""
         pass
 
     @abstractmethod

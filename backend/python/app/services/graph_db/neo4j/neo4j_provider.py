@@ -5905,7 +5905,6 @@ class Neo4jProvider(IGraphDBProvider):
         })
         MATCH (app:App {id: $connector_id})
         OPTIONAL MATCH (member:User)-[:PERMISSION {type: 'USER'}]->(group)
-        WHERE coalesce(member.isActive, true) = true
         WITH app, [user IN collect(DISTINCT member) WHERE user IS NOT NULL] AS members
         OPTIONAL MATCH (principal)-[stale:USER_APP_RELATION]->(app)
         WHERE principal:Teams OR (principal:User AND NOT principal IN members)
