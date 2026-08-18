@@ -4337,9 +4337,11 @@ class Neo4jProvider(IGraphDBProvider):
 
             CALL {{
                 WITH userDoc
-                // Path 3: User -> Group (PERMISSION) -> Records
-                OPTIONAL MATCH (userDoc)-[:PERMISSION]->(g:Group)-[:PERMISSION]->(r:Record)
-                WHERE r.connectorId = $connectorId
+                // Path 3: User -> Group/Role (PERMISSION) -> Records
+                // Flat connectors such as Bullhorn grant a Role direct access to records.
+                OPTIONAL MATCH (userDoc)-[:PERMISSION]->(principal)-[:PERMISSION]->(r:Record)
+                WHERE (principal:Group OR principal:Role)
+                  AND r.connectorId = $connectorId
                   AND r.indexingStatus = $completedStatus
                   {metadata_filter_clause}{time_range_filter_clause}
                 RETURN collect(DISTINCT {{virtualId: r.virtualRecordId, recordId: r.id}}) AS records3
