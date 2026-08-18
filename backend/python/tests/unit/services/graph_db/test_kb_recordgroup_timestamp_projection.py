@@ -339,13 +339,31 @@ class TestNeo4jAppChildrenCypher:
         cypher = neo4j_provider._get_app_children_cypher()
         assert "reason: record.reason" in cypher
 
-    def test_flat_connector_records_are_returned_directly(self, neo4j_provider):
-        cypher = _normalize(neo4j_provider._get_app_children_cypher())
-        assert "MATCH (record:Record {connectorId: parent_id})" in cypher
+    @pytest.mark.asyncio
+    async def test_flat_connector_records_use_bounded_role_query(self, neo4j_provider):
+        neo4j_provider.client = AsyncMock()
+        neo4j_provider.client.execute_query.return_value = [
+            {"result": {"nodes": [], "total": 0}}
+        ]
+
+        await neo4j_provider._get_flat_app_record_children(
+            parent_id="app1",
+            user_key="user1",
+            skip=10,
+            limit=25,
+            sort_field="updatedAt",
+            sort_dir="DESC",
+        )
+
+        cypher = _normalize(neo4j_provider.client.execute_query.call_args.args[0])
+        assert (
+            "MATCH (u)-[:PERMISSION {type: 'USER'}]->(:Role)-[access:PERMISSION]"
+            "->(record:Record {connectorId: $parent_id})"
+        ) in cypher
         assert "MATCH (record)-[:BELONGS_TO]->(:RecordGroup)" in cypher
-        assert "connector_record_children" in cypher
-        assert "_get_record_permission_role_cypher" not in cypher
-        assert "OPTIONAL MATCH (u)-[ur:PERMISSION {type: 'USER'}]->(role:Role)-[p5:PERMISSION]->(target)" in cypher
+        assert "INHERIT_PERMISSIONS" not in cypher
+        assert "SKIP $skip LIMIT $limit" in cypher
+        assert "count(DISTINCT record) AS total" in cypher
 
 
 class TestNeo4jRecordGroupChildrenCypher:

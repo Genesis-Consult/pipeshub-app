@@ -12917,6 +12917,29 @@ class Neo4jProvider(IGraphDBProvider):
 
         # Generate query based on parent type
         if parent_type == "app":
+            app_shape = await self.client.execute_query(
+                """
+                MATCH (app:App {id: $parent_id})
+                OPTIONAL MATCH (rg:RecordGroup {connectorId: $parent_id})
+                RETURN app.type AS app_type, count(rg) > 0 AS has_record_groups
+                """,
+                parameters={"parent_id": parent_id},
+                txn_id=transaction,
+            )
+            if (
+                app_shape
+                and app_shape[0].get("app_type") == "Bullhorn"
+                and not app_shape[0].get("has_record_groups", False)
+            ):
+                return await self._get_flat_app_record_children(
+                    parent_id=parent_id,
+                    user_key=user_key,
+                    skip=skip,
+                    limit=limit,
+                    sort_field=sort_field,
+                    sort_dir=sort_dir,
+                    transaction=transaction,
+                )
             sub_query = self._get_app_children_cypher()
             params = {
                 "parent_id": parent_id,
@@ -13008,6 +13031,105 @@ class Neo4jProvider(IGraphDBProvider):
         self.logger.debug(f"get_knowledge_hub_children finished in {elapsed * 1000} ms")
         if result and result[0].get("result"):
             return result[0]["result"]
+        return {"nodes": [], "total": 0}
+
+    async def _get_flat_app_record_children(
+        self,
+        parent_id: str,
+        user_key: str,
+        skip: int,
+        limit: int,
+        sort_field: str,
+        sort_dir: str,
+        transaction: str | None = None,
+    ) -> dict[str, Any]:
+        """Return paginated root records for a connector without RecordGroups."""
+        root_filter = """
+            coalesce(record.isDeleted, false) = false
+            AND NOT EXISTS { MATCH (record)-[:BELONGS_TO]->(:RecordGroup) }
+            AND NOT EXISTS {
+                MATCH ()-[:RECORD_RELATION {relationshipType: 'PARENT_CHILD'}]->(record)
+            }
+        """
+        query = f"""
+        MATCH (u:User {{id: $user_key}})
+        CALL {{
+            WITH u
+            MATCH (u)-[:PERMISSION {{type: 'USER'}}]->(:Role)-[access:PERMISSION]->(record:Record {{connectorId: $parent_id}})
+            WHERE {root_filter}
+              AND access.role IS NOT NULL AND access.role <> ''
+
+            OPTIONAL MATCH (record)-[:IS_OF_TYPE]->(file_info:File)
+            OPTIONAL MATCH (record)-[:RECORD_RELATION {{relationshipType: 'PARENT_CHILD'}}]->(child:Record)
+            WITH record, access.role AS permission_role, file_info,
+                 count(DISTINCT child) > 0 AS has_children
+            WITH {{
+                id: record.id,
+                name: record.recordName,
+                nodeType: CASE WHEN record.mimeType = 'application/vnd.folder' THEN 'folder' ELSE 'record' END,
+                parentId: 'apps/' + $parent_id,
+                origin: 'CONNECTOR',
+                connector: record.connectorName,
+                connectorId: record.connectorId,
+                recordType: record.recordType,
+                recordGroupType: null,
+                indexingStatus: record.indexingStatus,
+                reason: record.reason,
+                createdAt: coalesce(record.sourceCreatedAtTimestamp, record.createdAtTimestamp, 0),
+                updatedAt: coalesce(record.sourceLastModifiedTimestamp, record.updatedAtTimestamp, 0),
+                sizeInBytes: coalesce(record.sizeInBytes, file_info.fileSizeInBytes),
+                mimeType: record.mimeType,
+                extension: file_info.extension,
+                webUrl: record.webUrl,
+                hasChildren: has_children,
+                previewRenderable: coalesce(record.previewRenderable, true),
+                userRole: permission_role,
+                sharingStatus: null,
+                isInternal: coalesce(record.isInternal, false),
+                isPlaceholder: coalesce(record.isPlaceholder, false)
+            }} AS node
+            WITH node,
+                 CASE $sort_field
+                     WHEN 'name' THEN node.name
+                     WHEN 'createdAt' THEN node.createdAt
+                     WHEN 'updatedAt' THEN node.updatedAt
+                     WHEN 'nodeType' THEN node.nodeType
+                     WHEN 'source' THEN node.source
+                     WHEN 'connector' THEN node.connector
+                     WHEN 'recordType' THEN node.recordType
+                     WHEN 'sizeInBytes' THEN node.sizeInBytes
+                     WHEN 'indexingStatus' THEN node.indexingStatus
+                     ELSE node.name
+                 END AS sort_value
+            ORDER BY
+                CASE WHEN $sort_dir = 'ASC' THEN sort_value END ASC,
+                CASE WHEN $sort_dir = 'DESC' THEN sort_value END DESC
+            SKIP $skip LIMIT $limit
+            RETURN collect(node) AS nodes
+        }}
+        CALL {{
+            WITH u
+            MATCH (u)-[:PERMISSION {{type: 'USER'}}]->(:Role)-[access:PERMISSION]->(record:Record {{connectorId: $parent_id}})
+            WHERE {root_filter}
+              AND access.role IS NOT NULL AND access.role <> ''
+            RETURN count(DISTINCT record) AS total
+        }}
+        RETURN {{nodes: nodes, total: total}} AS result
+        """
+        rows = await self.client.execute_query(
+            query,
+            parameters={
+                "parent_id": parent_id,
+                "user_key": user_key,
+                "skip": skip,
+                "limit": limit,
+                "sort_field": sort_field,
+                "sort_dir": sort_dir.upper(),
+            },
+            txn_id=transaction,
+        )
+        if rows and rows[0].get("result"):
+            return rows[0]["result"]
         return {"nodes": [], "total": 0}
 
     async def get_knowledge_hub_search(
@@ -14282,61 +14404,8 @@ class Neo4jProvider(IGraphDBProvider):
             }}) AS connector_group_children
         }}
 
-        // ---- Non-KB app: also return records stored directly under the app ----
-        // Some flat connectors (for example Bullhorn) do not create RecordGroups.
-        CALL {{
-            WITH app, u, parent_id, is_kb_app
-            WITH app, u, parent_id, is_kb_app WHERE NOT is_kb_app
-
-            MATCH (record:Record {{connectorId: parent_id}})
-            WHERE coalesce(record.isDeleted, false) = false
-              AND NOT EXISTS {{
-                  MATCH (record)-[:BELONGS_TO]->(:RecordGroup)
-              }}
-              AND NOT EXISTS {{
-                  MATCH ()-[:RECORD_RELATION {{relationshipType: 'PARENT_CHILD'}}]->(record)
-              }}
-
-            {record_permission_role_cypher}
-
-            WITH app, u, parent_id, record, permission_role
-            WHERE permission_role IS NOT NULL AND permission_role <> ''
-
-            OPTIONAL MATCH (record)-[:IS_OF_TYPE]->(file_info:File)
-            OPTIONAL MATCH (record)-[child_rel:RECORD_RELATION {{relationshipType: 'PARENT_CHILD'}}]->(child:Record)
-            WITH record, permission_role, parent_id, file_info,
-                 count(DISTINCT child) > 0 AS has_children
-
-            RETURN collect({{
-                id: record.id,
-                name: record.recordName,
-                nodeType: CASE WHEN record.mimeType = 'application/vnd.folder' THEN 'folder' ELSE 'record' END,
-                parentId: 'apps/' + parent_id,
-                origin: 'CONNECTOR',
-                connector: record.connectorName,
-                connectorId: record.connectorId,
-                recordType: record.recordType,
-                recordGroupType: null,
-                indexingStatus: record.indexingStatus,
-                reason: record.reason,
-                createdAt: coalesce(record.sourceCreatedAtTimestamp, record.createdAtTimestamp, 0),
-                updatedAt: coalesce(record.sourceLastModifiedTimestamp, record.updatedAtTimestamp, 0),
-                sizeInBytes: coalesce(record.sizeInBytes, file_info.fileSizeInBytes),
-                mimeType: record.mimeType,
-                extension: file_info.extension,
-                webUrl: record.webUrl,
-                hasChildren: has_children,
-                previewRenderable: coalesce(record.previewRenderable, true),
-                userRole: permission_role,
-                sharingStatus: null,
-                isInternal: coalesce(record.isInternal, false),
-                isPlaceholder: coalesce(record.isPlaceholder, false)
-            }}) AS connector_record_children
-        }}
-
         WITH coalesce(kb_children, [])
-             + coalesce(connector_group_children, [])
-             + coalesce(connector_record_children, []) AS raw_children
+             + coalesce(connector_group_children, []) AS raw_children
         RETURN raw_children
         """
 
