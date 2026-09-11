@@ -128,21 +128,32 @@ async def test_resolve_resume_returns_none_without_pdf_or_word(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('modified_since_ms', 'expected_query'),
+    [
+        (None, 'isDeleted:0'),
+        (1234, 'dateLastModified:[19700101000001 TO *]'),
+        (1789134900217, 'dateLastModified:[20260911135500 TO *]'),
+        (1709251199999, 'dateLastModified:[20240229235959 TO *]'),
+    ],
+)
 async def test_incremental_candidate_scan_uses_supported_search_api(
     client: BullhornClient,
+    modified_since_ms: int | None,
+    expected_query: str,
 ) -> None:
     client._authorized_json = AsyncMock(  # type: ignore[method-assign]
         return_value={"data": []}
     )
 
-    candidates = [item async for item in client.iter_candidates(1234)]
+    candidates = [item async for item in client.iter_candidates(modified_since_ms)]
 
     assert candidates == []
     client._authorized_json.assert_awaited_once_with(
         "GET",
         "search/Candidate",
         params={
-            "query": "dateLastModified:[1234 TO *]",
+            "query": expected_query,
             "fields": client.CANDIDATE_FIELDS,
             "count": client.page_size,
             "start": 0,
