@@ -103,6 +103,38 @@ tags:
       - Regenerate secrets if compromised
       - Suspend/activate apps to control access
       - Revoke all tokens for emergency access removal
+  - name: Personal Access Tokens
+    description: |
+      Self-service, long-lived, scoped, revocable credentials that act as their
+      creator — unlike an OAuth app's `client_credentials` flow, which acts as
+      the app.
+
+      **Who can create one**
+      - **Any authenticated org member** — unlike OAuth apps, this is
+        deliberately not admin-gated.
+
+      **How it's issued**
+      - Minted through the same OAuth access-token machinery as `/oauth2/token`,
+        against one lazily-created, per-org synthetic OAuth app
+        (`clientId: pat-system:<orgId>`) that every PAT in that org shares.
+        That app is hidden from `/oauth-clients/*` — it never appears in your
+        own OAuth app list and can't be managed through those routes.
+      - The raw token is prefixed `phpat_` ahead of the underlying JWT (see the
+        `bearerAuth` security scheme) so it's recognizable to secret scanners.
+        It's shown exactly once, at creation.
+
+      **Expiry and scopes**
+      - `expiryDays`: `30` (default), `90`, `365`, or `never`.
+      - Scopes default to the org's full configured `MCP_SCOPES` set if none
+        are requested; `GET /personal-access-tokens/scopes` lists what's
+        available.
+
+      **Admin visibility**
+      - Regular members only ever see and revoke their own tokens.
+      - Org admins can list and revoke *any* member's token via
+        `/personal-access-tokens/admin*` — for incident response (a departed
+        employee, a compromised laptop) — without needing the OAuth app CRUD
+        access described above.
   - name: OpenID Connect
     description: |
       OpenID Connect 1.0 endpoints for identity federation and discovery.
@@ -286,7 +318,14 @@ components:
       type: http
       scheme: bearer
       bearerFormat: JWT
-      description: JWT Bearer token for authenticated requests
+      description: |
+        JWT Bearer token for authenticated requests.
+
+        A personal access token (see the **Personal Access Tokens** tag) is a
+        `phpat_`-prefixed variant of this same JWT — e.g. `phpat_eyJhbGci...`.
+        The prefix is display-only, added for secret-scanner detectability; the
+        gateway strips it before verifying the token, so send it exactly as
+        issued, prefix included.
     scopedToken:
       type: http
       scheme: bearer
@@ -891,6 +930,10 @@ components:
           type: string
         designation:
           type: string
+        role:
+          type: string
+          enum: [admin, member]
+          description: Organization role stored on the user document (`admin` or `member`)
         hasLoggedIn:
           type: boolean
         isDeleted:
@@ -2032,6 +2075,230 @@ components:
             $ref: '#/components/schemas/OAuthTokenListItem'
           description: Active access and refresh tokens for the app
 
+    # ==================== PERSONAL ACCESS TOKEN SCHEMAS ====================
+    CreatePatRequest:
+      type: object
+      description: |
+        Request to create a personal access token (`createPatTokenSchema` in `pat.validators.ts`).
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          description: Label to help you recognize the token later
+          minLength: 1
+          maxLength: 100
+          example: "Claude Desktop"
+        scopes:
+          type: array
+          items:
+            type: string
+          minItems: 1
+          description: |
+            Scopes to grant, validated against the org's configured `MCP_SCOPES`
+            (not the full role-aware OAuth-app scope set). Defaults to every
+            scope in `MCP_SCOPES` if omitted.
+          example: ["kb:read", "semantic:write"]
+        expiryDays:
+          oneOf:
+            - type: integer
+              enum: [30, 90, 365]
+            - type: string
+              enum: ["never"]
+          description: |
+            Token lifetime. Defaults to `30` if omitted — a token minted
+            without an explicit choice shouldn't default to the longest
+            lifetime. `"never"` is stored as a ~100-year expiry (the
+            underlying schema field is required and TTL-indexed, so there's
+            no literal null option).
+          default: 30
+          example: 30
+
+    PatListItem:
+      type: object
+      description: |
+        A personal access token as seen by its own creator (one element of
+        `GET /personal-access-tokens`'s `tokens` array, or the `token` object
+        returned by `POST /personal-access-tokens` before `accessToken` is added).
+      required:
+        - id
+        - name
+        - scopes
+        - createdAt
+        - expiresAt
+      properties:
+        id:
+          type: string
+          description: Token ID
+        name:
+          type: string
+          description: Token name
+        scopes:
+          type: array
+          items:
+            type: string
+          description: Granted scopes
+        createdAt:
+          type: string
+          format: date-time
+        expiresAt:
+          type: string
+          format: date-time
+          description: |
+            Expiry timestamp. A `"never"`-expiry token is stored as a
+            ~100-year-out date, not a literal null — treat anything decades
+            out as "never" rather than a real deadline.
+        lastUsedAt:
+          type: string
+          format: date-time
+          description: |
+            Last time this token successfully authenticated a request.
+            Throttled server-side to update at most once per 5 minutes per
+            token; absent if the token has never been used.
+
+    PatWithSecret:
+      allOf:
+        - $ref: '#/components/schemas/PatListItem'
+        - type: object
+          required:
+            - accessToken
+          properties:
+            accessToken:
+              type: string
+              description: |
+                The raw token, `phpat_`-prefixed. Returned **only** in this
+                creation response — only its hash is stored server-side, so
+                it cannot be retrieved again later.
+              example: "phpat_eyJhbGciOiJIUzI1NiIs..."
+
+    CreatePatResponse:
+      type: object
+      description: Response body for `POST /personal-access-tokens` (`pat.controller.ts` `createToken`).
+      required:
+        - message
+        - token
+      properties:
+        message:
+          type: string
+          example: Personal access token created successfully
+        token:
+          $ref: '#/components/schemas/PatWithSecret'
+
+    ListPatResponse:
+      type: object
+      description: |
+        Response body for `GET /personal-access-tokens` (`listTokens`) — the
+        caller's own active tokens, capped at 100 most-recent server-side.
+        Unlike the admin list, this is a flat array with no pagination
+        envelope and no owner fields (it's implicitly scoped to the caller).
+      required:
+        - tokens
+      properties:
+        tokens:
+          type: array
+          items:
+            $ref: '#/components/schemas/PatListItem'
+
+    RevokePatRequest:
+      type: object
+      description: |
+        Optional request body for `DELETE /personal-access-tokens/{tokenId}`
+        and `DELETE /personal-access-tokens/admin/{tokenId}`. The body itself
+        is optional; `reason`, if present, is stored on the revocation for
+        auditing.
+      properties:
+        reason:
+          type: string
+          example: "rotated"
+
+    RevokePatResponse:
+      type: object
+      required:
+        - message
+      properties:
+        message:
+          type: string
+          example: Personal access token revoked successfully
+
+    PatScopesListResponse:
+      type: object
+      description: |
+        Response body for `GET /personal-access-tokens/scopes` (`listScopes`).
+        Unlike `GET /oauth-clients/scopes`, this is a **flat array**, not
+        grouped by category, and reflects the org's configured `MCP_SCOPES`
+        rather than the full role-aware OAuth-app scope catalog.
+      required:
+        - scopes
+      properties:
+        scopes:
+          type: array
+          items:
+            $ref: '#/components/schemas/OAuthScopeInfo'
+
+    AdminPatListItem:
+      description: |
+        A personal access token as seen by an org admin — extends
+        `PatListItem` with who it belongs to, since an admin is looking
+        across every member's tokens rather than just their own.
+      allOf:
+        - $ref: '#/components/schemas/PatListItem'
+        - type: object
+          required:
+            - userId
+            - ownerDeleted
+          properties:
+            userId:
+              type: string
+              description: ID of the user who created this token
+            ownerEmail:
+              type: string
+              format: email
+              description: |
+                Owner's email. Populated even when `ownerDeleted` is true
+                (last-known value), for auditing.
+            ownerFullName:
+              type: string
+              description: Owner's full name (same last-known-value behavior as `ownerEmail`)
+            ownerDeleted:
+              type: boolean
+              description: |
+                True if the owning user has been removed from the org (or no
+                longer resolves at all). The token still appears — a deleted
+                user's tokens stop authenticating automatically, but stay
+                visible here so an admin can audit/clean them up.
+
+    AdminPatListResponse:
+      type: object
+      description: |
+        Response body for `GET /personal-access-tokens/admin` (`adminListTokens`).
+        Paginated — unlike the self-service `ListPatResponse` — since an org
+        can have far more active tokens than a fixed-window cap's worth.
+      required:
+        - data
+        - pagination
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdminPatListItem'
+        pagination:
+          type: object
+          required:
+            - page
+            - limit
+            - total
+            - totalPages
+          properties:
+            page:
+              type: integer
+            limit:
+              type: integer
+              description: Items per page (max 100)
+            total:
+              type: integer
+            totalPages:
+              type: integer
+
     # ==================== USER MANAGEMENT SCHEMAS ====================
     User:
       type: object
@@ -2077,6 +2344,10 @@ components:
         designation:
           type: string
           description: Job title/designation
+        role:
+          type: string
+          enum: [admin, member]
+          description: Organization role stored on the user document (`admin` or `member`)
         address:
           $ref: '#/components/schemas/Address'
         dataCollectionConsent:
@@ -2156,6 +2427,10 @@ components:
         designation:
           type: string
           description: Job title/designation
+        role:
+          type: string
+          enum: [admin, member]
+          description: Organization role stored on the user document (`admin` or `member`)
         address:
           $ref: '#/components/schemas/Address'
         dataCollectionConsent:
@@ -3431,6 +3706,7 @@ components:
         - "OUTLOOK CALENDAR"
         - "MICROSOFT TEAMS"
         - "NOTION"
+        - "NOTION PERSONAL"
         - "SLACK"
         - "SLACK WORKSPACE"
         - "KB"
@@ -3448,6 +3724,7 @@ components:
         - "WEB"
         - "BOOKSTACK"
         - "GITHUB"
+        - "GITHUB TEAMS"
         - "SERVICENOW"
         - "SALESFORCE"
         - "S3"
@@ -5379,18 +5656,21 @@ components:
       additionalProperties: false
       description: |
         Per-request agent capability toggles. Only meaningful when `chatMode`
-        selects an agent mode; ignored otherwise. Omitting the object, or
-        omitting any individual field, keeps that capability enabled — the
-        backend treats a missing flag as `true`.
+        selects an agent mode; ignored otherwise. Each field falls back to its
+        own `default` below when omitted — a missing flag is not uniformly
+        `true`. Omitting the whole object applies every default.
       properties:
         internalSearch:
           type: boolean
+          default: true
           description: Whether the agent may search internal knowledge bases for this turn.
         webSearch:
           type: boolean
+          default: true
           description: Whether the agent may perform web search for this turn.
         deepSearch:
           type: boolean
+          default: false
           description: Whether the agent may use deeper, higher-latency retrieval for this turn.
 
     Filters:
@@ -5603,15 +5883,15 @@ components:
           description: |
             Identifier for the AI model configuration to use.
             Available models depend on organization settings.
-          example: "gpt-4-turbo"
+          example: "gpt-5.6-luna"
         modelName:
           type: string
           description: Display name of the AI model
-          example: "GPT-4 Turbo"
+          example: "gpt-5.6-luna"
         modelFriendlyName:
           type: string
           description: Friendly display name of the selected model
-          example: "GPT-4 Turbo"
+          example: "gpt-5.6-Luna"
         chatMode:
           type: string
           enum:
@@ -5808,7 +6088,7 @@ components:
       example:
         query: what are some latest tech news?
         modelKey: 5c1832f4-fa19-4167-b913-307fad3a6551
-        modelName: gpt-5.4-mini
+        modelName: gpt-5.6-luna
         modelFriendlyName: GPT 5.4 mini
         chatMode: quick
         timezone: Asia/Kolkata
@@ -5876,7 +6156,7 @@ components:
           type: string
           minLength: 1
           description: Provider model name (e.g. the underlying LLM identifier).
-          example: "gpt-5.4-mini"
+          example: "gpt-5.6-luna"
         modelFriendlyName:
           type: string
           minLength: 1
@@ -6170,7 +6450,7 @@ components:
       example:
         query: can you elaborate on the latest headlines?
         modelKey: 5c1832f4-fa19-4167-b913-307fad3a6551
-        modelName: gpt-5.4-mini
+        modelName: gpt-5.6-luna
         modelFriendlyName: GPT 5.4 mini
         chatMode: quick
         timezone: Asia/Kolkata
@@ -6482,7 +6762,7 @@ components:
           description: Stable identifier of the configured model record
         modelName:
           type: string
-          description: Provider-facing model name (e.g. `gpt-4o-mini`)
+          description: Provider-facing model name (e.g. `gpt-5.6-luna`)
         modelProvider:
           type: string
           description: Provider key (e.g. `openai`, `anthropic`)
@@ -8567,6 +8847,46 @@ components:
                   (its `@tool` was removed). Read-only; ignored on create/update
                   bodies. Not stamped on the `GET /agents` list projection.
 
+    McpServer:
+      type: object
+      additionalProperties: false
+      description: |
+        MCP server instance linked to an agent, as projected by the graph
+        store on `GET /agents/{agentKey}` and `GET /agents` — same shape as
+        `Toolset`. MCP server nodes carry no secrets, only the attach-time
+        snapshot of `instanceId`/`typeId`/`name`.
+      properties:
+        _key:
+          type: string
+          description: MCP server instance node key in the backing graph store.
+        name:
+          type: string
+          description: MCP server attachment name (attach-time snapshot).
+        displayName:
+          type: string
+          description: Human-readable MCP server product label (for example `Jira MCP`).
+        typeId:
+          type: string
+          description: Catalog server type id, when this instance came from a registered template.
+        instanceId:
+          type: string
+          description: Admin-created MCP server instance id.
+        tools:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            properties:
+              _key:
+                type: string
+                description: Tool node key in the backing graph store.
+              name:
+                type: string
+              fullName:
+                type: string
+              description:
+                type: string
+
     AgentFilters:
       description: |
         Knowledge scope filter as stored on the graph edge. The Node `getAgent`
@@ -8685,7 +9005,7 @@ components:
           example:
             - modelType: llm
               provider: azureOpenAI
-              modelName: gpt-5.4-mini
+              modelName: gpt-5.6-luna
               modelKey: f3a4b5b6-5b6c-4e85-9097-3202cfe696fc
               isMultimodal: true
               isReasoning: true
@@ -8717,6 +9037,13 @@ components:
                     example: llm
                   modelFriendlyName:
                     type: string
+        usesOrgDefault:
+          type: boolean
+          description: |
+            True when this agent has no models configured and will use the
+            organization's default LLM (marked `isDefault: true` in the AI
+            models configuration) at chat time. Derived from `models` being
+            empty — not persisted separately.
         toolsets:
           type: array
           description: |
@@ -8725,6 +9052,13 @@ components:
             and optional `instanceName`.
           items:
             $ref: '#/components/schemas/Toolset'
+        mcpServers:
+          type: array
+          description: |
+            MCP server instances linked to the agent (GET /agents/{agentKey} graph
+            projection). Same shape/semantics as `toolsets`, keyed by `instanceId`.
+          items:
+            $ref: '#/components/schemas/McpServer'
         knowledge:
           type: array
           description: Knowledge connectors and indexed scopes linked to the agent
@@ -8821,6 +9155,7 @@ components:
         - shareWithOrg
         - knowledge
         - toolsets
+        - mcpServers
         - skills
         - can_view
         - can_share
@@ -8908,6 +9243,13 @@ components:
           type: string
           nullable: true
           description: User id of the last updater, if present.
+        usesOrgDefault:
+          type: boolean
+          description: |
+            True when this agent has no models configured and will use the
+            organization's default LLM (marked `isDefault: true` in the AI
+            models configuration) at chat time. Derived from `models` being
+            empty — not persisted separately.
         webSearch:
           type: object
           additionalProperties: false
@@ -8942,6 +9284,14 @@ components:
             for each agent on the returned page.
           items:
             $ref: '#/components/schemas/Toolset'
+        mcpServers:
+          type: array
+          description: |
+            MCP server instances linked to the agent. Same projection as
+            `GET /agents/{agentKey}`; the backend builds it from the graph
+            edges for each agent on the returned page.
+          items:
+            $ref: '#/components/schemas/McpServer'
         knowledge:
           type: array
           description: |
@@ -8984,6 +9334,7 @@ components:
         - updatedAtTimestamp
         - shareWithOrg
         - toolsets
+        - mcpServers
         - knowledge
         - can_view
         - can_share
@@ -9083,8 +9434,11 @@ components:
         The gateway accepts either a non-empty string model entry or an object entry
         with a required `modelKey`.
 
-        The `models` array must include at least one object entry with `isReasoning: true`.
-        String-only entries are schema-valid but are rejected at the gateway with HTTP 400.
+        The `models` array itself is optional and may be empty (the agent then uses
+        the organization's default LLM). When the array is non-empty, it must include
+        at least one object entry with `isReasoning: true`. String-only entries are
+        schema-valid but, if present without any reasoning-flagged object entry, are
+        rejected at the gateway with HTTP 400.
       oneOf:
         - type: string
           minLength: 1
@@ -9183,9 +9537,8 @@ components:
 
     AgentCreateWebSearch:
       description: |
-        Accepted web-search attachment for `POST /agents/create`.
-        The gateway accepts either a provider string or an object with at least
-        a `provider` field.
+        Web-search attachment for an agent. Accepts either a provider string
+        or an object with at least a `provider` field.
       anyOf:
         - type: string
         - type: object
@@ -9225,7 +9578,6 @@ components:
       additionalProperties: false
       required:
         - name
-        - models
       properties:
         name:
           type: string
@@ -9251,11 +9603,15 @@ components:
           description: Additional agent execution instructions
         models:
           type: array
-          minItems: 1
+          minItems: 0
+          default: []
           description: |
-            Agent model configuration entries. The gateway requires at least one
-            object entry with `isReasoning: true`. String-only arrays are schema-valid
-            but rejected at runtime with HTTP 400.
+            Agent model configuration entries. Optional — an agent created without
+            any models (an empty array or an omitted field) uses the organization's
+            default LLM at chat time. When at least one model entry IS provided, the
+            gateway requires at least one object entry with `isReasoning: true`.
+            String-only arrays are schema-valid but rejected at runtime with HTTP 400
+            unless the array is empty.
           items:
             $ref: '#/components/schemas/AgentCreateModelEntry'
         tags:
@@ -9343,6 +9699,42 @@ components:
           items:
             $ref: '#/components/schemas/AgentCreateResponseTool'
 
+    AgentCreateResponseMcpServerTool:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - fullName
+        - key
+      properties:
+        name:
+          type: string
+        fullName:
+          type: string
+        key:
+          type: string
+
+    AgentCreateResponseMcpServer:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - displayName
+        - key
+        - tools
+      properties:
+        name:
+          type: string
+        displayName:
+          type: string
+          description: Human-readable MCP server product label (for example `Jira MCP`).
+        key:
+          type: string
+        tools:
+          type: array
+          items:
+            $ref: '#/components/schemas/AgentCreateResponseMcpServerTool'
+
     AgentCreateResponseKnowledge:
       type: object
       additionalProperties: false
@@ -9397,6 +9789,7 @@ components:
         - updatedAtTimestamp
         - isDeleted
         - toolsets
+        - mcpServers
         - knowledge
         - skills
       properties:
@@ -9457,6 +9850,10 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/AgentCreateResponseToolset'
+        mcpServers:
+          type: array
+          items:
+            $ref: '#/components/schemas/AgentCreateResponseMcpServer'
         knowledge:
           type: array
           items:
@@ -9497,9 +9894,11 @@ components:
         Partial update payload for `PUT /agents/{agentKey}`.
 
         Every field is optional — only the fields present in the request body
-        are updated. When `models` is included, the gateway Zod middleware
-        (mirroring the Python backend) requires at least one model entry and
-        at least one object entry with `isReasoning: true`.
+        are updated. `models` may be omitted, set to an empty array to clear
+        the agent's models (reverting it to the organization's default LLM at
+        chat time), or set to a non-empty array. When a non-empty array is
+        provided, the gateway Zod middleware (mirroring the Python backend)
+        requires at least one object entry with `isReasoning: true`.
       properties:
         name:
           type: string
@@ -9525,11 +9924,13 @@ components:
           description: Additional agent execution instructions
         models:
           type: array
-          minItems: 1
+          minItems: 0
           description: |
-            Agent model configuration entries. When present, the Zod middleware
-            requires at least one object entry with `isReasoning: true`.
-            String-only arrays are schema-valid but rejected at runtime with HTTP 400.
+            Agent model configuration entries. Optional. An empty array clears the
+            agent's models so it falls back to the organization's default LLM.
+            When a non-empty array is present, the Zod middleware requires at
+            least one object entry with `isReasoning: true`. String-only arrays
+            are schema-valid but rejected at runtime with HTTP 400 unless empty.
           items:
             $ref: '#/components/schemas/AgentCreateModelEntry'
         tags:
@@ -12448,8 +12849,8 @@ components:
           type: string
           description: |
             Model name/identifier. May be comma-separated for multiple models
-            (e.g. `gpt-4o, gpt-4o-mini`).
-          example: "gpt-4"
+            (e.g. `gpt-5.6-luna, gpt-5.6-terra`).
+          example: "gpt-5.6-luna"
         modelFriendlyName:
           type: string
           description: |
@@ -12865,7 +13266,7 @@ components:
         message: "LLM health check failed: Incorrect API key provided"
         details:
           provider: openai
-          model: gpt-4o-mini
+          model: gpt-5.6-luna
           error_type: AuthenticationError
 
     AIModelProviderHealthCheckErrorEnvelope:
@@ -15361,6 +15762,318 @@ paths:
               schema:
                 $ref: '#/components/schemas/OAuthClientManagementRateLimitError'
 
+  # ==================== PERSONAL ACCESS TOKEN ENDPOINTS ====================
+  /personal-access-tokens:
+    get:
+      tags:
+        - Personal Access Tokens
+      summary: List your own personal access tokens
+      description: |
+        Lists the caller's own active (non-revoked, unexpired) personal
+        access tokens, newest first, capped at 100 rows server-side. Never
+        returns another user's tokens — see `GET /personal-access-tokens/admin`
+        for the org-admin, cross-user view.
+
+        Shares the same per-user rate limiter as `/oauth-clients/*`
+        (default 1000 req/min, `MAX_OAUTH_CLIENT_REQUESTS_PER_MINUTE`).
+      operationId: listPersonalAccessTokens
+      x-pipeshub-sdk: true
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: The caller's active personal access tokens
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListPatResponse'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApplicationJsonErrorResponse'
+        '429':
+          description: Rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OAuthClientManagementRateLimitError'
+
+    post:
+      tags:
+        - Personal Access Tokens
+      summary: Create a personal access token
+      description: |
+        Mints a new personal access token for the caller. Deliberately not
+        admin-gated — any authenticated org member may create their own,
+        unlike OAuth app registration.
+
+        The token is minted against a lazily-created, per-org synthetic
+        OAuth app (`clientId: pat-system:<orgId>`) shared by every PAT in
+        that org — the same signing, hashing, and revocation machinery as
+        `/oauth2/token`, reused rather than duplicated.
+
+        `scopes` is validated against the org's configured `MCP_SCOPES`
+        env var, not the full role-aware OAuth-app scope catalog — a
+        non-admin can request any scope in that set.
+
+        The response's `accessToken` is shown **once**; only its SHA-256
+        hash is stored. It's prefixed `phpat_` (see the `bearerAuth`
+        security scheme).
+      operationId: createPersonalAccessToken
+      x-pipeshub-sdk: true
+      security:
+        - bearerAuth: []
+      requestBody:
+        description: "Request body for Create personal access token"
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreatePatRequest'
+        required: true
+      responses:
+        '201':
+          description: Personal access token created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreatePatResponse'
+        '400':
+          description: Invalid request (validation error, or a requested scope isn't in the org's configured `MCP_SCOPES`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApplicationJsonErrorResponse'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApplicationJsonErrorResponse'
+        '429':
+          description: Rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OAuthClientManagementRateLimitError'
+
+  /personal-access-tokens/scopes:
+    get:
+      tags:
+        - Personal Access Tokens
+      summary: List scopes available for a new personal access token
+      description: |
+        Returns the org's configured `MCP_SCOPES` as a flat array of scope
+        definitions, for populating the create-token scope picker. Unlike
+        `GET /oauth-clients/scopes`, this is **not** grouped by category and
+        **not** role-aware — every org member sees the same set, since PAT
+        scope selection isn't gated by admin status.
+      operationId: listPersonalAccessTokenScopes
+      x-pipeshub-sdk: true
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Scopes available to grant
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PatScopesListResponse'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApplicationJsonErrorResponse'
+        '429':
+          description: Rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OAuthClientManagementRateLimitError'
+
+  /personal-access-tokens/{tokenId}:
+    delete:
+      tags:
+        - Personal Access Tokens
+      summary: Revoke one of your own personal access tokens
+      description: |
+        Revokes a token by id, scoped to `{tokenId, clientId, callerUserId}`
+        — a caller can never revoke another user's token through this route,
+        even though everyone in the org shares the same underlying
+        `pat-system:<orgId>` client. Revocation takes effect immediately: the
+        token's next verification attempt fails, including one already in
+        flight.
+      operationId: revokePersonalAccessToken
+      x-pipeshub-sdk: true
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: tokenId
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^[a-fA-F0-9]{24}$'
+          description: Personal access token ID
+      requestBody:
+        description: "Optional request body for Revoke personal access token"
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RevokePatRequest'
+      responses:
+        '200':
+          description: Personal access token revoked successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RevokePatResponse'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApplicationJsonErrorResponse'
+        '404':
+          description: Token not found, already revoked, not owned by the caller, or the org has no PAT app yet
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApplicationJsonErrorResponse'
+        '429':
+          description: Rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OAuthClientManagementRateLimitError'
+
+  /personal-access-tokens/admin:
+    get:
+      tags:
+        - Personal Access Tokens
+      summary: 'Admin: list every active personal access token in the org'
+      description: |
+        Lists every active personal access token across every member of the
+        org, paginated, with each token's owner attached (including owners
+        who've since been deleted from the org — see `ownerDeleted` on
+        `AdminPatListItem`). For incident response: a departed employee or a
+        compromised laptop, where only the token's own creator could
+        otherwise see or revoke it.
+
+        Requires org-admin privileges (`userAdminCheck`) — note this returns
+        **`400`**, not `403`, for a non-admin caller (shared middleware
+        behavior across the codebase, not specific to this route).
+      operationId: adminListPersonalAccessTokens
+      x-pipeshub-sdk: true
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+          description: Page number (defaults to `1` when omitted or empty)
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 100
+          description: Items per page (defaults to `100` when omitted or empty; max 100)
+      responses:
+        '200':
+          description: Every active personal access token in the org
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminPatListResponse'
+        '400':
+          description: Invalid query parameters, or the caller is not an org admin
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApplicationJsonErrorResponse'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApplicationJsonErrorResponse'
+        '429':
+          description: Rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OAuthClientManagementRateLimitError'
+
+  /personal-access-tokens/admin/{tokenId}:
+    delete:
+      tags:
+        - Personal Access Tokens
+      summary: 'Admin: revoke any user''s personal access token by id'
+      description: |
+        Revokes a token by id, scoped to the org's PAT client but **not** to
+        a specific owning user — the admin counterpart to
+        `DELETE /personal-access-tokens/{tokenId}`. Requires org-admin
+        privileges (`userAdminCheck`); returns `400` (not `403`) for a
+        non-admin caller, same as `GET /personal-access-tokens/admin`.
+      operationId: adminRevokePersonalAccessToken
+      x-pipeshub-sdk: true
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: tokenId
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^[a-fA-F0-9]{24}$'
+          description: Personal access token ID
+      requestBody:
+        description: "Optional request body for Admin revoke personal access token"
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RevokePatRequest'
+      responses:
+        '200':
+          description: Personal access token revoked successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RevokePatResponse'
+        '400':
+          description: Invalid token ID, or the caller is not an org admin
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApplicationJsonErrorResponse'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApplicationJsonErrorResponse'
+        '404':
+          description: Token not found in this org, already revoked, or the org has no PAT app yet
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApplicationJsonErrorResponse'
+        '429':
+          description: Rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OAuthClientManagementRateLimitError'
+
   # ==================== AUTHENTICATION ENDPOINTS ====================
   /userAccount/initAuth:
     post:
@@ -16640,6 +17353,7 @@ paths:
 
         - `fullName`: Required, non-empty string
         - `email`: Required, valid email format
+        - `role`: Optional, `admin` or `member` (defaults to `member` when omitted)
         - `mobile`: Optional, must match `^\+?[0-9]{10,15}$`
         - `designation`: Optional string
 
@@ -16675,6 +17389,11 @@ paths:
                   format: email
                   description: User's email address
                   example: "john.smith@company.com"
+                role:
+                  type: string
+                  enum: [admin, member]
+                  description: Organization role to assign on create
+                  example: "member"
                 mobile:
                   type: string
                   pattern: '^$|^\+?[0-9]{10,15}$'
@@ -16697,6 +17416,7 @@ paths:
 
             - Missing required fields (`fullName`, `email`)
             - Invalid email format
+            - Invalid role (must be `admin` or `member` when provided)
             - Invalid mobile number format
             - Requester does not have admin privileges (`userAdminCheck`)
           content:
@@ -16854,6 +17574,11 @@ paths:
                   type: string
                   description: Job title or role
                   example: "Senior Software Engineer"
+                role:
+                  type: string
+                  enum: [admin, member]
+                  description: Organization role (`admin` or `member`). Only admins can change roles.
+                  example: "member"
                 address:
                   $ref: '#/components/schemas/Address'
                 dataCollectionConsent:
@@ -28024,7 +28749,7 @@ paths:
                         isDeleted: false
                         isServiceAccount: false
                         models:
-                          - "99999999-8888-7777-6666-555555555555_gpt-5.4-mini"
+                          - "99999999-8888-7777-6666-555555555555_gpt-5.6-luna"
                         name: "Customer Support Agent"
                         startMessage: "Hello! How can I help you today?"
                         systemPrompt: "You are a helpful assistant."
@@ -28194,9 +28919,12 @@ paths:
 
         **Update semantics**
 
-        Only fields present in the request body are updated. When `models` is
-        included, the gateway Zod middleware requires at least one model entry
-        and at least one object entry with `isReasoning: true`.
+        Only fields present in the request body are updated. `models` may be
+        omitted (the agent's existing models are kept), set to an empty array
+        (clears the agent's models so it falls back to the organization's
+        default LLM at chat time), or set to a non-empty array. When a
+        non-empty array is provided, the gateway Zod middleware requires at
+        least one object entry with `isReasoning: true`.
 
         **Permissions**
 
@@ -30111,7 +30839,6 @@ paths:
       x-pipeshub-sdk: true
       security:
         - bearerAuth: []
-        - oauth2: [kb:read]
         - oauth2: [connector:read]
       parameters:
         - name: nodeId
@@ -30311,7 +31038,6 @@ paths:
       x-pipeshub-sdk: true
       security:
         - bearerAuth: []
-        - oauth2: [kb:read]
         - oauth2: [connector:read]
       parameters:
         - name: identifiers
@@ -33857,7 +34583,7 @@ paths:
                           description: >-
                             Specific model name/identifier forwarded to the
                             provider API when making inference calls.
-                          example: gpt-5.4-mini
+                          example: gpt-5.6-luna
                         modelKey:
                           type: string
                           format: uuid
@@ -33905,14 +34631,14 @@ paths:
                     models:
                       - modelType: llm
                         provider: azureOpenAI
-                        modelName: gpt-5.4-mini
+                        modelName: gpt-5.6-luna
                         modelKey: f3a4b5b6-5b6c-4e85-9097-3202cfe696fc
                         isMultimodal: true
                         isReasoning: true
                         isDefault: true
                       - modelType: llm
                         provider: azureOpenAI
-                        modelName: gpt-5.4
+                        modelName: gpt-5.6-terra
                         modelKey: 7af8d3a7-ad2e-43a1-8716-ae95e4fbc888
                         isMultimodal: true
                         isReasoning: true
@@ -34259,7 +34985,7 @@ paths:
                   modelKey: f3a4b5b6-5b6c-4e85-9097-3202cfe696fc
                   modelType: llm
                   provider: openAI
-                  model: gpt-4o-mini
+                  model: gpt-5.6-luna
                   wasDefault: false
                   contextLength: 128000
         '400':

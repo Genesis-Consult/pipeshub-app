@@ -601,14 +601,12 @@ class BullhornConnector(BaseConnector):
         connector_id: str,
         scope: str,
         created_by: str,
+        data_entities_processor: DataSourceEntitiesProcessor,
+        **kwargs: object,
     ) -> BaseConnector:
-        processor = DataSourceEntitiesProcessor(
-            logger, data_store_provider, config_service
-        )
-        await processor.initialize()
         return cls(
             logger,
-            processor,
+            data_entities_processor,
             data_store_provider,
             config_service,
             connector_id,

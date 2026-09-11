@@ -76,9 +76,15 @@ def _make_event_processor(
         graph_provider.update_node = AsyncMock(return_value=True)
         graph_provider.find_duplicate_records = AsyncMock(return_value=[])
 
+    processor = processor or MagicMock()
+    # sync_vector_membership awaits the pipeline; a bare MagicMock raises
+    # TypeError, which is now propagated rather than swallowed.
+    if not isinstance(getattr(processor, "indexing_pipeline", None), AsyncMock):
+        processor.indexing_pipeline = AsyncMock()
+
     return EventProcessor(
         logger=logging.getLogger("test"),
-        processor=processor or MagicMock(),
+        processor=processor,
         graph_provider=graph_provider,
         config_service=MagicMock(),
         parsing_client=parsing_client,
@@ -113,6 +119,8 @@ def _make_event_data(record_id: str = "rec-1", org_id: str = "org-1") -> dict[st
 async def test_legacy_path_used_when_service_pipeline_disabled() -> None:
     """When USE_PARSING_SERVICE is not set, legacy processor is used."""
     mock_processor = MagicMock()
+    # Awaited by the membership sync on the duplicate-attach path.
+    mock_processor.indexing_pipeline = AsyncMock()
     mock_processor.process_pdf_with_docling = AsyncMock(return_value=_noop_gen())
 
     ep = _make_event_processor(processor=mock_processor)
@@ -339,6 +347,47 @@ async def test_statuses_track_active_parse_and_index_phases() -> None:
 
     with pytest.raises(StopAsyncIteration):
         await gen.__anext__()
+
+
+@pytest.mark.asyncio
+@patch.dict(os.environ, {"USE_PARSING_SERVICE": "true"})
+async def test_start_parsing_size_bytes_uses_utf8_length_for_str_content() -> None:
+    """size_bytes on START_PARSING must be the actual byte length used for
+    parsing admission cost, not a character count. For str content with
+    multi-byte UTF-8 characters those two counts diverge, and undercounting
+    would underprice XL-heavy admission cost (tiers.py XL_HEAVY_BYTES)."""
+    parsing_client = MagicMock()
+    parsing_client.circuit_open = False
+    parsing_client.parse = AsyncMock(return_value=_make_parse_result())
+
+    extraction_client = MagicMock()
+    extraction_client.classify = AsyncMock(return_value=None)
+
+    sink_orchestrator = MagicMock()
+    sink_orchestrator.index = AsyncMock()
+    sink_orchestrator.enrich = AsyncMock()
+
+    ep = _make_event_processor(
+        parsing_client=parsing_client,
+        extraction_client=extraction_client,
+        sink_orchestrator=sink_orchestrator,
+    )
+
+    non_ascii_text = "日本語テキスト " * 100  # each char is 3 bytes in UTF-8
+    event_data = _make_event_data()
+    event_data["payload"]["extension"] = "svg"
+    event_data["payload"]["mimeType"] = "image/svg+xml"
+    event_data["payload"]["buffer"] = non_ascii_text
+
+    gen = ep.on_event(event_data)
+    first = await gen.__anext__()
+
+    assert first.event == IndexingEvent.START_PARSING
+    # file_content is stripped before this point (matching what's actually
+    # encoded downstream for parsing), so compare against the stripped text.
+    stripped = non_ascii_text.strip()
+    assert first.data.size_bytes == len(stripped.encode("utf-8"))
+    assert first.data.size_bytes != len(stripped)
 
 
 @pytest.mark.asyncio

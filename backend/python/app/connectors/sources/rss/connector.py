@@ -65,6 +65,12 @@ class RSSApp(App):
     .with_description("Subscribe to and sync content from RSS and Atom feeds")
     .with_categories(["Web", "Content"])
     .with_scopes([ConnectorScope.PERSONAL.value, ConnectorScope.TEAM.value])
+    # RECORD_LEVEL (the default) rather than APP_LEVEL: reviewers disagreed on
+    # whether a non-creator can hold a USER_APP_RELATION to a personal instance,
+    # and APP_LEVEL answers with one connector-wide scan that never checks the
+    # per-user ACL. The only cost of being wrong the safe way is losing the cache
+    # shortcut for this connector; the cost of being wrong the other way is one
+    # user reading another's records.
     .configure(
         lambda builder: builder.with_icon(IconPaths.connector_icon(Connectors.RSS.value))
         .with_realtime_support(False)
@@ -365,11 +371,9 @@ class RSSConnector(BaseConnector):
             self.logger.info(f"🚀 Starting RSS sync for {len(self.feed_urls)} feed(s)")
 
             if self.scope == ConnectorScope.TEAM.value:
-                async with self.data_store_provider.transaction() as tx_store:
-                    await tx_store.ensure_team_app_edge(
-                        self.connector_id,
-                        self.data_entities_processor.org_id,
-                    )
+                await self.data_entities_processor.ensure_team_app_edge(
+                    self.connector_id
+                )
                 app_users = []
             else:
                 # Personal: create user-app edge only for the creator
@@ -564,7 +568,7 @@ class RSSConnector(BaseConnector):
             path=urlparse(article_url).path or "/",
             mime_type=MimeTypes.PLAIN_TEXT.value,
             md5_hash=content_md5_hash,
-            preview_renderable=False,
+            preview_renderable=True,
         )
 
         permissions = self._create_rss_permissions()
@@ -781,12 +785,10 @@ class RSSConnector(BaseConnector):
         connector_id: str,
         scope: str,
         created_by: str,
+        data_entities_processor,
+        **kwargs,
     ) -> BaseConnector:
         """Factory method to create an RSSConnector instance."""
-        data_entities_processor = DataSourceEntitiesProcessor(
-            logger, data_store_provider, config_service
-        )
-        await data_entities_processor.initialize()
         return RSSConnector(
             logger,
             data_entities_processor,

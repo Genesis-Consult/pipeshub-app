@@ -8,6 +8,7 @@ import os
 from collections.abc import AsyncGenerator
 from concurrent.futures import ProcessPoolExecutor
 from functools import lru_cache
+from pathlib import Path
 from typing import Any
 import json
 from uuid import uuid4
@@ -33,9 +34,12 @@ from app.config.constants.arangodb import (
 )
 from app.events.processor import Processor
 from app.modules.parsers.pdf.ocr_handler import OCRStrategy
+from app.exceptions.indexing_exceptions import IndexingError
 from app.services.base_client import ServiceUnavailableError
 from app.services.messaging.config import IndexingEvent, PipelineEvent, PipelineEventData
 from app.services.graph_db.interface.graph_db_provider import IGraphDBProvider
+from app.utils.libreoffice_convert import convert_with_libreoffice
+from app.services.resource_governor import classify
 from app.utils.time_conversion import get_epoch_timestamp_in_ms
 
 
@@ -128,6 +132,62 @@ class EventProcessor:
         self.extraction_client = extraction_client
         self.sink_orchestrator = sink_orchestrator
 
+    def _indexing_pipeline(self):
+        """The single owner of vector-membership writes.
+
+        Returns None only if the processor was built without an indexing
+        pipeline; callers log rather than silently skipping, because a quiet
+        no-op here leaves vector membership permanently stale.
+        """
+        return getattr(self.processor, "indexing_pipeline", None)
+
+    async def sync_vector_membership(self, virtual_record_id: str) -> None:
+        """Recompute a VRID's connector/group arrays from graph. Never deletes."""
+        if not virtual_record_id or not isinstance(virtual_record_id, str):
+            return
+        pipeline = self._indexing_pipeline()
+        if pipeline is None:
+            # Raise rather than return: the handler yields INDEXING_COMPLETE
+            # straight after this call, so returning would acknowledge a
+            # syncVectorMembership event whose work never happened, and nothing
+            # would revisit it. IndexingError classifies as transient, which is
+            # what this needs — an event arriving before the pipeline is wired
+            # succeeds on retry, while a genuine misconfiguration dead-letters
+            # visibly instead of being silently dropped.
+            raise IndexingError(
+                "Indexing pipeline unavailable; cannot apply vector membership",
+                details={"virtual_record_id": virtual_record_id},
+            )
+        try:
+            await pipeline.sync_vector_membership(virtual_record_id)
+        except Exception as e:
+            # Propagate so the consumer redelivers. Swallowing here leaves the
+            # record attached to the VRID with its connectorId missing from the
+            # points and nothing to repair it; both callers are event handlers,
+            # and re-running a duplicate attach is idempotent.
+            self.logger.error(
+                "Failed to sync vector membership for %s: %s", virtual_record_id, e
+            )
+            raise
+
+    async def _rewrite_or_delete_vrid_vectors(self, virtual_record_id: str) -> None:
+        if not virtual_record_id or not isinstance(virtual_record_id, str):
+            return
+        pipeline = self._indexing_pipeline()
+        if pipeline is None:
+            self.logger.error(
+                "No indexing pipeline available — vectors for abandoned VRID %s "
+                "were not rewritten or deleted",
+                virtual_record_id,
+            )
+            return
+        try:
+            await pipeline.rewrite_or_delete_vector_membership(virtual_record_id)
+        except Exception as e:
+            self.logger.error(
+                "Failed to rewrite/delete vectors for %s: %s", virtual_record_id, e
+            )
+
     async def _pdf_needs_ocr(self, file_content: bytes) -> bool:
         if PDF_OCR_DETECTION_WORKERS <= 1:
             return await asyncio.to_thread(_detect_pdf_needs_ocr, file_content)
@@ -140,6 +200,107 @@ class EventProcessor:
         )
 
 
+
+    async def _dispatch_pdf_binary(
+        self,
+        record_name: str,
+        record_id: str,
+        record_version: int,
+        connector: str,
+        org_id: str,
+        pdf_binary: bytes,
+        virtual_record_id: str,
+        event_type: str | None = None,
+        prev_virtual_record_id: str | None = None,
+    ) -> AsyncGenerator[PipelineEvent, None]:
+        """Route PDF bytes to OCR, pdfplumber+OpenCV, or Docling — whichever the
+        existing PDF pipeline would pick for a native PDF. Shared by the native
+        PDF branch and the EPUB branch (EPUB is converted to PDF via LibreOffice
+        before reaching here) so both stay on the identical Docling/pdfplumber
+        selection logic.
+        """
+        self.logger.info("🔍 Checking if PDF needs OCR processing")
+        try:
+            needs_ocr = await self._pdf_needs_ocr(pdf_binary)
+            self.logger.info("📊 OCR requirement: %s", 'YES - Using OCR handler' if needs_ocr else 'NO - Using layout parser')
+        except Exception as e:
+            self.logger.warning("⚠️ Error checking OCR need: %s, defaulting to layout parser", str(e))
+            needs_ocr = False
+
+        if needs_ocr:
+            # Skip docling and use OCR handler directly
+            self.logger.info("🤖 PDF needs OCR, skipping layout parser")
+            async for event in self.processor.process_pdf_document_with_ocr(
+                recordName=record_name,
+                recordId=record_id,
+                version=record_version,
+                source=connector,
+                orgId=org_id,
+                pdf_binary=pdf_binary,
+                virtual_record_id=virtual_record_id,
+                event_type=event_type,
+                prev_virtual_record_id=prev_virtual_record_id,
+            ):
+                yield event
+            return
+
+        use_pdfplumber = os.environ.get("ENABLE_PDFPLUMBER_PROCESSOR", "false").lower() == "true"
+        if use_pdfplumber:
+            self.logger.info("📄 Using PdfPlumber+OpenCV processor (ENABLE_PDFPLUMBER_PROCESSOR=true)")
+            try:
+                async for event in self.processor.process_pdf_with_pdf_plumber(
+                    recordName=record_name,
+                    recordId=record_id,
+                    pdf_binary=pdf_binary,
+                    virtual_record_id=virtual_record_id,
+                    event_type=event_type,
+                    prev_virtual_record_id=prev_virtual_record_id,
+                ):
+                    yield event
+            except Exception as e:
+                self.logger.warning(f"⚠️ PdfPlumber+OpenCV processing failed, falling back to OCR: {e}")
+                async for event in self.processor.process_pdf_document_with_ocr(
+                    recordName=record_name,
+                    recordId=record_id,
+                    version=record_version,
+                    source=connector,
+                    orgId=org_id,
+                    pdf_binary=pdf_binary,
+                    virtual_record_id=virtual_record_id,
+                    event_type=event_type,
+                    prev_virtual_record_id=prev_virtual_record_id,
+                ):
+                    yield event
+            return
+
+        # Use docling for PDFs that don't need OCR
+        docling_failed = False
+        async for event in self.processor.process_pdf_with_docling(
+            recordName=record_name,
+            recordId=record_id,
+            pdf_binary=pdf_binary,
+            virtual_record_id=virtual_record_id,
+            event_type=event_type,
+            prev_virtual_record_id=prev_virtual_record_id,
+        ):
+            if event.event == IndexingEvent.DOCLING_FAILED:
+                docling_failed = True
+            else:
+                yield event
+
+        if docling_failed:
+            async for event in self.processor.process_pdf_document_with_ocr(
+                recordName=record_name,
+                recordId=record_id,
+                version=record_version,
+                source=connector,
+                orgId=org_id,
+                pdf_binary=pdf_binary,
+                virtual_record_id=virtual_record_id,
+                event_type=event_type,
+                prev_virtual_record_id=prev_virtual_record_id,
+            ):
+                yield event
 
     def _use_service_pipeline(self) -> bool:
         """Return True when the new HTTP service pipeline should be used."""
@@ -175,7 +336,7 @@ class EventProcessor:
         from app.modules.transformers.transformer import TransformContext  # noqa: PLC0415
 
         # ── Step 1: Parse ────────────────────────────────────────────────────
-        self.logger.info(
+        self.logger.debug(
             "📤 Sending '%s' to Parsing Service (mime=%s ext=%s)", record_name, mime_type, extension
         )
         provider = ParserProvider(os.getenv("PARSER_BACKEND") or ParserProvider.DEFAULT.value)
@@ -188,7 +349,7 @@ class EventProcessor:
             provider=provider,
         )
         block_container = parse_result.block_container
-        self.logger.info(
+        self.logger.debug(
             "✅ Parsing complete via provider '%s' (%d blocks)",
             parse_result.provider_used.value if parse_result.provider_used else "unknown",
             len(block_container.blocks),
@@ -251,9 +412,9 @@ class EventProcessor:
         )
 
         # ── Step 2: Index (VectorStore + BlobStorage) ────────────────────────
-        self.logger.info("📥 Indexing record %s (making searchable)", record_id)
+        self.logger.debug("📥 Indexing record %s (making searchable)", record_id)
         await self.sink_orchestrator.index(ctx)
-        self.logger.info("✅ Record %s is now searchable (indexingStatus=COMPLETED)", record_id)
+        self.logger.debug("✅ Record %s is now searchable (indexingStatus=COMPLETED)", record_id)
 
         # ── Step 3: Enrich (Extraction Service → GraphDB) ────────────────────
         defer_extraction = (
@@ -405,6 +566,21 @@ class EventProcessor:
         except (json.JSONDecodeError, Exception):
             return content
 
+    async def _find_duplicate_records(
+        self,
+        doc: dict[str, Any],
+        md5_checksum: str,
+        record_type: str | None,
+        size_in_bytes: int | None,
+    ) -> list[dict]:
+        
+        return await self.graph_provider.find_duplicate_records(
+            record_key=_record_key(doc),
+            md5_checksum=md5_checksum,
+            record_type=record_type,
+            size_in_bytes=size_in_bytes,
+        )
+
     async def _check_duplicate_by_md5(
         self,
         content: bytes | str | dict | list | None,
@@ -441,19 +617,17 @@ class EventProcessor:
 
         if not md5_checksum:
             return False
-
-        rec_key = doc.get('_key') or doc.get('id')
-        duplicate_records = await self.graph_provider.find_duplicate_records(
-            record_key=_record_key(doc),
+        duplicate_records = await self._find_duplicate_records(
+            doc=doc,
             md5_checksum=md5_checksum,
             record_type=record_type,
-            size_in_bytes=size_in_bytes
+            size_in_bytes=size_in_bytes,
         )
 
         duplicate_records = [r for r in duplicate_records if r is not None]
 
         if not duplicate_records:
-            self.logger.info(
+            self.logger.debug(
                 f"🚀 No duplicate records found for record {_record_key(doc)}"
             )
             return False
@@ -491,6 +665,9 @@ class EventProcessor:
                 _record_key(processed_duplicate),
                 _record_key(doc),
             )
+            attached_vrid = processed_duplicate.get("virtualRecordId")
+            if attached_vrid:
+                await self.sync_vector_membership(attached_vrid)
             self.logger.debug(
                 f"✅ Duplicate record {_record_key(processed_duplicate)} returning TRUE"
             )
@@ -552,7 +729,7 @@ class EventProcessor:
             record_id = event_data.get("recordId")
             org_id = event_data.get("orgId")
             virtual_record_id = event_data.get("virtualRecordId")
-            self.logger.info(f"📥 Processing event: {event_type}: for record {record_id} with virtual_record_id {virtual_record_id}")
+            self.logger.debug(f"📥 Processing event: {event_type}: for record {record_id} with virtual_record_id {virtual_record_id}")
 
             if not record_id:
                 self.logger.error("❌ No record ID provided in event data")
@@ -578,6 +755,21 @@ class EventProcessor:
             mime_type = event_data.get("mimeType", "unknown")
             origin = event_data.get("origin", "CONNECTOR" if connector != "" else "UPLOAD")
             record_name = event_data.get("recordName", f"Untitled-{record_id}")
+
+            # A CODE_FILE's mime is not trustworthy: connectors that walk a git
+            # tree default it to text/plain for anything they do not recognise,
+            # and they do not always populate `extension`. Derive a separate
+            # extension for code dispatch and language detection — the original
+            # value must stay intact for reconciliation, tier, and generic dispatch.
+            code_ext = extension
+            if not code_ext or code_ext == "unknown":
+                file_path_raw = event_data.get("filePath") or ""
+                fp_base = file_path_raw.rsplit("/", 1)[-1]
+                rn_base = record_name.rsplit("/", 1)[-1]
+                if "." in fp_base and fp_base.rsplit(".", 1)[-1]:
+                    code_ext = fp_base.rsplit(".", 1)[-1].lower()
+                elif "." in rn_base and rn_base.rsplit(".", 1)[-1]:
+                    code_ext = rn_base.rsplit(".", 1)[-1].lower()
 
             file_content = event_data.get("buffer")
 
@@ -652,6 +844,7 @@ class EventProcessor:
                 await self.mark_record_status(doc, ProgressStatus.IN_PROGRESS)
 
             prev_virtual_record_id = None
+            abandoned_virtual_record_id = None
             if event_type == EventTypes.UPDATE_RECORD.value or event_type == EventTypes.REINDEX_RECORD.value:
                 # For reconciliation-enabled types, decide whether to keep or generate new vrid
                 from app.config.constants.arangodb import (
@@ -672,6 +865,7 @@ class EventProcessor:
                         if len(records_with_vrid) > 1:
                             # N:1 case: multiple records share this vrid, isolate with new vrid
                             virtual_record_id = str(uuid4())
+                            abandoned_virtual_record_id = prev_virtual_record_id
                             self.logger.info(
                                 f"📊 Multiple records ({len(records_with_vrid)}) share vrid {prev_virtual_record_id}, "
                                 f"generated new vrid: {virtual_record_id}"
@@ -685,6 +879,7 @@ class EventProcessor:
                         # No existing vrid, treat as new record
                         self.logger.info("📊 No existing virtual_record_id for reconciliation type, treating as new")
                 else:
+                    abandoned_virtual_record_id = virtual_record_id
                     virtual_record_id = str(uuid4())
 
             if virtual_record_id is None:
@@ -701,12 +896,32 @@ class EventProcessor:
                 await self.update_record_fields(
                     doc, {"virtualRecordId": virtual_record_id}
                 )
+            if (
+                abandoned_virtual_record_id
+                and abandoned_virtual_record_id != virtual_record_id
+            ):
+                await self._rewrite_or_delete_vrid_vectors(abandoned_virtual_record_id)
 
             # Ask the consumer for a nested parsing slot only after the record
-            # is already IN_PROGRESS under the outer indexing gate.
+            # is already IN_PROGRESS under the outer indexing gate. Tier/size
+            # are already known here (extension, mime and content_len were
+            # read above) so the consumer can route to the matching
+            # resource_governor pool instead of re-deriving format itself.
+            # content_len is a char count for str content (set before we knew
+            # the type); re-derive actual bytes here so XL-cost routing isn't
+            # underestimated for non-ASCII text.
+            size_bytes = (
+                len(file_content.encode("utf-8"))
+                if isinstance(file_content, str)
+                else content_len
+            )
             yield PipelineEvent(
                 event=IndexingEvent.START_PARSING,
-                data=PipelineEventData(record_id=record_id),
+                data=PipelineEventData(
+                    record_id=record_id,
+                    tier=classify(extension, mime_type),
+                    size_bytes=size_bytes,
+                ),
             )
 
             # ── New service pipeline (opt-in via USE_PARSING_SERVICE=true) ──
@@ -794,6 +1009,25 @@ class EventProcessor:
                     yield event
                 return
 
+            # Must precede the PLAIN_TEXT branch: code files routinely arrive as
+            # text/plain, and that branch returns early.
+            if (
+                mime_type in CODE_FILE_MIME_TYPE_VALUES
+                or normalize_file_extension(code_ext) in CODE_FILE_EXTENSION_VALUES
+            ):
+                async for event in self.processor.process_code_document(
+                    recordName=record_name,
+                    recordId=record_id,
+                    code_binary=file_content,
+                    virtual_record_id=virtual_record_id,
+                    extension=code_ext,
+                    file_path=event_data.get("filePath"),
+                    event_type=event_type,
+                    prev_virtual_record_id=prev_virtual_record_id,
+                ):
+                    yield event
+                return
+
             if mime_type == MimeTypes.PLAIN_TEXT.value:
                 async for event in self.processor.process_txt_document(
                     recordName=record_name,
@@ -844,88 +1078,35 @@ class EventProcessor:
                 return
 
             if extension == ExtensionTypes.PDF.value or mime_type == MimeTypes.PDF.value:
-                # Check if document needs OCR before using docling
+                async for event in self._dispatch_pdf_binary(
+                    record_name=record_name,
+                    record_id=record_id,
+                    record_version=record_version,
+                    connector=connector,
+                    org_id=org_id,
+                    pdf_binary=file_content,
+                    virtual_record_id=virtual_record_id,
+                    event_type=event_type,
+                    prev_virtual_record_id=prev_virtual_record_id,
+                ):
+                    yield event
 
-                self.logger.info("🔍 Checking if PDF needs OCR processing")
-                try:
-                    needs_ocr = await self._pdf_needs_ocr(file_content)
-                    self.logger.info("📊 OCR requirement: %s", 'YES - Using OCR handler' if needs_ocr else 'NO - Using layout parser')
-                except Exception as e:
-                    self.logger.warning("⚠️ Error checking OCR need: %s, defaulting to layout parser", str(e))
-                    needs_ocr = False
-
-                if needs_ocr:
-                    # Skip docling and use OCR handler directly
-                    self.logger.info("🤖 PDF needs OCR, skipping layout parser")
-                    async for event in self.processor.process_pdf_document_with_ocr(
-                        recordName=record_name,
-                        recordId=record_id,
-                        version=record_version,
-                        source=connector,
-                        orgId=org_id,
-                        pdf_binary=file_content,
-                        virtual_record_id=virtual_record_id,
-                        event_type=event_type,
-                        prev_virtual_record_id=prev_virtual_record_id,
-                    ):
-                        yield event
-                else:
-                    use_pdfplumber = os.environ.get("ENABLE_PDFPLUMBER_PROCESSOR", "false").lower() == "true"
-                    if use_pdfplumber:
-                        self.logger.info("📄 Using PdfPlumber+OpenCV processor (ENABLE_PDFPLUMBER_PROCESSOR=true)")
-                        try:
-                            async for event in self.processor.process_pdf_with_pdf_plumber(
-                                recordName=record_name,
-                                recordId=record_id,
-                                pdf_binary=file_content,
-                                virtual_record_id=virtual_record_id,
-                                event_type=event_type,
-                                prev_virtual_record_id=prev_virtual_record_id,
-                            ):
-                                yield event
-                        except Exception as e:
-                            self.logger.warning(f"⚠️ PdfPlumber+OpenCV processing failed, falling back to OCR: {e}")
-                            async for event in self.processor.process_pdf_document_with_ocr(
-                                recordName=record_name,
-                                recordId=record_id,
-                                version=record_version,
-                                source=connector,
-                                orgId=org_id,
-                                pdf_binary=file_content,
-                                virtual_record_id=virtual_record_id,
-                                event_type=event_type,
-                                prev_virtual_record_id=prev_virtual_record_id,
-                            ):
-                                yield event
-                    else:
-                    # Use docling for PDFs that don't need OCR
-                        docling_failed = False
-                        async for event in self.processor.process_pdf_with_docling(
-                            recordName=record_name,
-                            recordId=record_id,
-                            pdf_binary=file_content,
-                            virtual_record_id=virtual_record_id,
-                            event_type=event_type,
-                            prev_virtual_record_id=prev_virtual_record_id,
-                        ):
-                            if event.event == IndexingEvent.DOCLING_FAILED:
-                                docling_failed = True
-                            else:
-                                yield event
-
-                        if docling_failed:
-                            async for event in self.processor.process_pdf_document_with_ocr(
-                                recordName=record_name,
-                                recordId=record_id,
-                                version=record_version,
-                                source=connector,
-                                orgId=org_id,
-                                pdf_binary=file_content,
-                                virtual_record_id=virtual_record_id,
-                                event_type=event_type,
-                                prev_virtual_record_id=prev_virtual_record_id,
-                            ):
-                                yield event
+            elif extension == ExtensionTypes.EPUB.value or mime_type == MimeTypes.EPUB.value:
+                self.logger.info("📚 Converting EPUB to PDF via LibreOffice for record: %s", record_name)
+                pdf_binary = await convert_with_libreoffice(file_content, "epub", "pdf")
+                pdf_record_name = f"{Path(record_name).stem}.pdf" if record_name else "converted.pdf"
+                async for event in self._dispatch_pdf_binary(
+                    record_name=pdf_record_name,
+                    record_id=record_id,
+                    record_version=record_version,
+                    connector=connector,
+                    org_id=org_id,
+                    pdf_binary=pdf_binary,
+                    virtual_record_id=virtual_record_id,
+                    event_type=event_type,
+                    prev_virtual_record_id=prev_virtual_record_id,
+                ):
+                    yield event
 
             elif extension == ExtensionTypes.DOCX.value or mime_type == MimeTypes.DOCX.value:
                 async for event in self.processor.process_docx_document(
@@ -1090,16 +1271,6 @@ class EventProcessor:
                 ):
                     yield event
 
-            elif mime_type in CODE_FILE_MIME_TYPE_VALUES or normalize_file_extension(extension) in CODE_FILE_EXTENSION_VALUES:
-                async for event in self.processor.process_md_document(
-                    recordName=record_name,
-                    recordId=record_id,
-                    md_binary=file_content,
-                    virtual_record_id=virtual_record_id,
-                    event_type=event_type,
-                    prev_virtual_record_id=prev_virtual_record_id,
-                ):
-                    yield event
 
             elif mime_type == MimeTypes.SQL_TABLE.value or extension == ExtensionTypes.SQL_TABLE.value:
                 self.logger.info(f"🚀 Processing SQL Table: {record_name}")

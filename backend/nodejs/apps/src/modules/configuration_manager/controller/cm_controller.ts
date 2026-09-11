@@ -1,4 +1,4 @@
-import { v4 as uuidv4 } from 'uuid';
+import { randomUUID } from 'crypto';
 import { Response, NextFunction } from 'express';
 import {
   AuthenticatedServiceRequest,
@@ -60,7 +60,7 @@ import {
 import { HttpMethod } from '../../../libs/enums/http-methods.enum';
 import { PLATFORM_FEATURE_FLAGS } from '../constants/constants';
 import { getPlatformSettingsFromStore } from '../utils/util';
-import { AIModelConfiguration, AIModelsConfig } from '../types/ai-models.types';
+import { AIModelConfiguration, AIModelsConfig, SystemPromptsConfig } from '../types/ai-models.types';
 import { WebSearchConfig } from '../types/web-search.types';
 import { WebSearchProviderConfiguration } from '../types/web-search.types';
 import {
@@ -636,7 +636,7 @@ export const createSlackBotConfig =
 
           const timestamp = new Date().toISOString();
           const createdConfig: SlackBotConfigEntry = {
-            id: uuidv4(),
+            id: randomUUID(),
             name,
             botToken,
             signingSecret,
@@ -811,6 +811,30 @@ export const getAvailablePlatformFeatureFlags =
     // Labs UI.
     const flags = PLATFORM_FEATURE_FLAGS.filter((f) => !f.hidden);
     res.status(200).json({ flags }).end();
+  };
+
+export const getEffectivePlatformFeatureFlags =
+  (keyValueStoreService: KeyValueStoreService) =>
+  async (
+    _req: AuthenticatedUserRequest | AuthenticatedServiceRequest,
+    res: Response,
+    next: NextFunction,
+  ) => {
+    // Unlike getPlatformSettings/getAvailablePlatformFeatureFlags (admin-only),
+    // this is callable by every authenticated user: flag values are just
+    // booleans (no secrets), and non-admin UI (chat, agent builder, personal
+    // pages) needs them to decide whether to render flag-gated features.
+    try {
+      const { featureFlags } = await getPlatformSettingsFromStore(
+        keyValueStoreService,
+      );
+      res.status(200).json({ featureFlags }).end();
+    } catch (error: any) {
+      logger.error('Error getting effective platform feature flags', {
+        error,
+      });
+      next(error);
+    }
   };
 
 export const getAzureAdAuthConfig =
@@ -2559,19 +2583,23 @@ export const createAIModelsConfig =
 
       if (aiConfig.llm.length > 0) {
         aiConfig.llm.forEach((llm: any, index: number) => {
-          const modelKey = uuidv4();
+          const modelKey = randomUUID();
           llm.modelKey = modelKey;
-          llm.isMultimodal = false;
-          llm.isReasoning = false;
+          // Keep what the caller declared and the health check just verified.
+          // These used to be forced to false here, so a vision model onboarded
+          // through this route was registered text-only and never sent an
+          // image, whatever the health check had proved.
+          llm.isMultimodal = llm.isMultimodal ?? false;
+          llm.isReasoning = llm.isReasoning ?? false;
           llm.isDefault = index === 0;
         });
       }
 
       if (aiConfig.embedding.length > 0) {
         aiConfig.embedding.forEach((embedding: any, index: number) => {
-          const modelKey = uuidv4();
+          const modelKey = randomUUID();
           embedding.modelKey = modelKey;
-          embedding.isMultimodal = false;
+          embedding.isMultimodal = embedding.isMultimodal ?? false;
           embedding.isDefault = index === 0;
         });
       }
@@ -3164,7 +3192,7 @@ export const addAIModelProvider =
       let modelKey: string;
       let existingKeys: string[];
       do {
-        modelKey = uuidv4();
+        modelKey = randomUUID();
         existingKeys = aiModels[modelType].map(
           (config: any) => config.modelKey,
         );
@@ -3567,7 +3595,7 @@ export const deleteAIModelProvider =
           .map((a: { name?: string }) => a?.name)
           .filter((n: unknown): n is string => typeof n === 'string' && n.length > 0);
         // Prefer the user-defined friendly name (what the UI card shows, e.g. "gpt").
-        // Fall back through the technical model id (e.g. "gpt-5.4-mini") and finally
+        // Fall back through the technical model id (e.g. "gpt-5.6-luna") and finally
         // the opaque modelKey so the message is never empty.
         const modelDisplayName: string =
           (deletedModel?.modelFriendlyName as string | undefined) ||
@@ -3907,35 +3935,45 @@ export const getCustomSystemPrompt =
   ) => {
     try {
       const configManagerConfig = loadConfigurationManagerConfig();
-      const encryptedAIConfig = await keyValueStoreService.get<string>(
-        configPaths.aiModels,
-      );
+      const decrypt = (enc: string): string =>
+        EncryptionService.getInstance(
+          configManagerConfig.algorithm,
+          configManagerConfig.secretKey,
+        ).decrypt(enc);
 
-      if (!encryptedAIConfig) {
+      // 1. Try the new dedicated key first
+      const encryptedPrompts = await keyValueStoreService.get<string>(configPaths.systemPrompts);
+      if (encryptedPrompts) {
+        const p = JSON.parse(decrypt(encryptedPrompts)) as SystemPromptsConfig;
         res
           .status(200)
           .json({
-            customSystemPrompt: '',
-            customSystemPromptWebSearch: '',
-            customSystemPromptAgent: '',
+            customSystemPrompt:          p.customSystemPrompt          || '',
+            customSystemPromptWebSearch: p.customSystemPromptWebSearch || '',
+            customSystemPromptAgent:     p.customSystemPromptAgent     || '',
           })
           .end();
         return;
       }
 
-      const aiModels: AIModelsConfig = JSON.parse(
-        EncryptionService.getInstance(
-          configManagerConfig.algorithm,
-          configManagerConfig.secretKey,
-        ).decrypt(encryptedAIConfig),
-      );
+      // 2. OSS backward compat: prompts were previously stored inside the aiModels blob
+      const encryptedAIConfig = await keyValueStoreService.get<string>(configPaths.aiModels);
+      if (encryptedAIConfig) {
+        const aiModels = JSON.parse(decrypt(encryptedAIConfig)) as AIModelsConfig;
+        res
+          .status(200)
+          .json({
+            customSystemPrompt:          aiModels.customSystemPrompt          || '',
+            customSystemPromptWebSearch: aiModels.customSystemPromptWebSearch || '',
+            customSystemPromptAgent:     aiModels.customSystemPromptAgent     || '',
+          })
+          .end();
+        return;
+      }
 
-      const customSystemPrompt = aiModels.customSystemPrompt || '';
-      const customSystemPromptWebSearch = aiModels.customSystemPromptWebSearch || '';
-      const customSystemPromptAgent = aiModels.customSystemPromptAgent || '';
       res
         .status(200)
-        .json({ customSystemPrompt, customSystemPromptWebSearch, customSystemPromptAgent })
+        .json({ customSystemPrompt: '', customSystemPromptWebSearch: '', customSystemPromptAgent: '' })
         .end();
     } catch (error: any) {
       logger.error('Error getting custom system prompt', { error });
@@ -3967,42 +4005,28 @@ export const setCustomSystemPrompt =
       }
 
       const configManagerConfig = loadConfigurationManagerConfig();
+      const encrypt = (val: string): string =>
+        EncryptionService.getInstance(
+          configManagerConfig.algorithm,
+          configManagerConfig.secretKey,
+        ).encrypt(val);
 
-      // Use Compare-and-Set (CAS) pattern with retries to prevent race conditions
       const MAX_RETRIES = 5;
       let success = false;
 
       for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-        const encryptedAIConfig = await keyValueStoreService.get<string>(
-          configPaths.aiModels,
-        );
+        const existing = await keyValueStoreService.get<string>(configPaths.systemPrompts);
+        const promptsConfig: SystemPromptsConfig = {
+          customSystemPrompt,
+          customSystemPromptWebSearch,
+          customSystemPromptAgent,
+        };
+        const encrypted = encrypt(JSON.stringify(promptsConfig));
 
-        let aiModels: AIModelsConfig = {};
-        if (encryptedAIConfig) {
-          aiModels = JSON.parse(
-            EncryptionService.getInstance(
-              configManagerConfig.algorithm,
-              configManagerConfig.secretKey,
-            ).decrypt(encryptedAIConfig),
-          );
-        }
-
-        // Update only the custom prompt fields, keeping everything else intact
-        aiModels.customSystemPrompt = customSystemPrompt;
-        aiModels.customSystemPromptWebSearch = customSystemPromptWebSearch;
-        aiModels.customSystemPromptAgent = customSystemPromptAgent;
-
-        // Encrypt the updated configuration
-        const encryptedUpdatedConfig = EncryptionService.getInstance(
-          configManagerConfig.algorithm,
-          configManagerConfig.secretKey,
-        ).encrypt(JSON.stringify(aiModels));
-
-        // Attempt atomic compare-and-set operation
         const casSuccess = await keyValueStoreService.compareAndSet<string>(
-          configPaths.aiModels,
-          encryptedAIConfig,
-          encryptedUpdatedConfig,
+          configPaths.systemPrompts,
+          existing,
+          encrypted,
         );
 
         if (casSuccess) {
@@ -4013,14 +4037,11 @@ export const setCustomSystemPrompt =
             'Failed to update custom system prompts due to persistent concurrent modification. Please try again.',
           );
         }
-        // If CAS failed, retry with exponential backoff
         await new Promise((resolve) => setTimeout(resolve, 50 * (attempt + 1)));
       }
 
       if (!success) {
-        throw new Error(
-          'Failed to update custom system prompts after maximum retries.',
-        );
+        throw new Error('Failed to update custom system prompts after maximum retries.');
       }
 
       res.status(200).json({
@@ -4320,7 +4341,7 @@ export const addWebSearchProvider =
       }
 
       // Generate a unique providerKey
-      const providerKey = uuidv4();
+      const providerKey = randomUUID();
 
       // If this is set as default, remove default flag from other providers
       if (isDefault) {

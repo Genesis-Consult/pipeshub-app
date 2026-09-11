@@ -11,20 +11,17 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.api.middlewares.auth import authMiddleware
+from app.edition_config import authMiddleware, agent_router, agent_sharing_router, chatbot_router, search_router, ensure_org_context
 from app.api.middlewares.request_context import RequestContextMiddleware
 from app.utils.request_context import set_service_suffix
 
 set_service_suffix("-qs")
-from app.api.routes.agent import router as agent_router
-from app.api.routes.chatbot import router as chatbot_router
 from app.api.routes.health import router as health_router
-from app.api.routes.search import router as search_router
 from app.api.routes.ai_models_registry import router as ai_models_registry_router
 from app.api.routes.speech import router as speech_router
 from app.api.routes.skills import router as skills_router
 from app.api.routes.toolsets import router as toolsets_router
-from app.containers.query import QueryAppContainer
+from app.edition_containers import QueryAppContainer
 from app.health.health import Health
 from app.services.messaging.config import MessageBrokerType, get_message_broker_type
 from app.services.messaging.kafka.utils.utils import KafkaUtils
@@ -168,6 +165,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         graph_provider = await app_container.graph_provider()
     app.state.graph_provider = graph_provider
 
+    # KB uploads made through chat index in this process, so it invalidates too.
+    try:
+        from app.services.cache.invalidation_hooks import (
+            init_accessible_records_invalidator,
+        )
+        init_accessible_records_invalidator(
+            logger, await app_container.accessible_records_cache(), graph_provider
+        )
+    except Exception as e:
+        logger.warning(f"❌ Failed to register accessible-records invalidator: {e}")
+
     # Start all message consumers centrally
     try:
         consumers = await start_kafka_consumers(app_container)
@@ -246,6 +254,18 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.toolset_registry = toolset_registry
     logger.info(f"✅ Loaded {len(toolset_registry.list_toolsets())} toolsets in memory")
 
+    # Initialize MCP catalog registry (mirrors the toolset registry above) — needed
+    # by `get_assistant_agent`'s `mcpServers` resolution and by the agent-loop
+    # runtime's `MCPToolProvider`/`MCPAccessResolver`. Lightweight (no heavy SDK
+    # imports, unlike the toolset registry), so no `to_thread` offload needed.
+    logger.info("🔄 Initializing in-memory MCP server registry for agents...")
+    from app.agents.mcp.registry import get_mcp_registry
+
+    mcp_registry = get_mcp_registry()
+    mcp_registry.auto_discover_templates()
+    app.state.mcp_registry = mcp_registry
+    logger.info(f"✅ Loaded {len(mcp_registry.list_templates())} MCP server templates in memory")
+
     yield
     # Shutdown
     logger.info("🔄 Shutting down application")
@@ -284,15 +304,37 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     except Exception as e:
         logger.error(f"❌ Error shutting down PDF rasterization pool: {e}")
 
+    try:
+        from app.modules.transformers.blob_storage import (
+            close_shared_redis,
+            close_shared_session,
+        )
+        await close_shared_session()
+        await close_shared_redis()
+        logger.info("✅ Blob storage session closed")
+    except Exception as e:
+        logger.error(f"❌ Error closing blob storage session: {e}")
+
+    try:
+        accessible_records_cache = await app_container.accessible_records_cache()
+        await accessible_records_cache.close()
+        logger.info("✅ Accessible-records cache closed")
+    except Exception as e:
+        logger.error(f"❌ Error closing accessible-records cache: {e}")
+
 
 # Create FastAPI app with lifespan
+_app_dependencies = [Depends(get_initialized_container)]
+if ensure_org_context is not None:
+    _app_dependencies.append(Depends(ensure_org_context))
+
 app = FastAPI(
     title="Retrieval API",
     description="API for retrieving information from vector store",
     version="1.0.0",
     lifespan=lifespan,
     redirect_slashes=False,
-    dependencies=[Depends(get_initialized_container)],
+    dependencies=_app_dependencies,
 )
 
 EXCLUDE_PATHS = ["/health"]  # Exclude health endpoint from authentication for monitoring purposes
@@ -387,7 +429,8 @@ app.include_router(skills_router, prefix="/api/v1/skills")
 app.include_router(toolsets_router)
 app.include_router(health_router, prefix="/api/v1")
 app.include_router(ai_models_registry_router, prefix="/api/v1")
-
+if agent_sharing_router is not None:
+    app.include_router(agent_sharing_router, prefix="/api/v1/agent")
 
 def run(host: str = "0.0.0.0", port: int = 8000, reload: bool = True) -> None:
     """Run the application"""

@@ -21,6 +21,7 @@ from app.config.constants.arangodb import (
     Connectors,
     MimeTypes,
     OriginTypes,
+    PermissionModel,
     RecordRelations,
 )
 from app.connectors.core.constants import IconPaths
@@ -188,6 +189,7 @@ class SyncStats:
     .with_description("Sync databases, tables, views, stages and files from Snowflake")\
     .with_categories(["Database", "Data Warehouse"])\
     .with_scopes([ConnectorScope.PERSONAL.value, ConnectorScope.TEAM.value])\
+    .with_permission_model(PermissionModel.APP_LEVEL)\
     .with_auth([
         # Option 1: Personal Access Token (PAT) authentication
         AuthBuilder.type(AuthType.ACCESS_KEY).fields([
@@ -952,19 +954,18 @@ class SnowflakeConnector(BaseConnector):
         
         # Process in batches to avoid query size limits
         batch_size = 100
-        async with self.data_store_provider.transaction() as tx_store:
-            for i in range(0, len(external_ids), batch_size):
-                batch = external_ids[i:i + batch_size]
-                for ext_id in batch:
-                    try:
-                        record = await tx_store.get_record_by_external_id(
-                            connector_id=self.connector_id,
-                            external_id=ext_id
-                        )
-                        if record:
-                            result[ext_id] = record
-                    except Exception as e:
-                        self.logger.warning(f"Error fetching record {ext_id}: {e}")
+        for i in range(0, len(external_ids), batch_size):
+            batch = external_ids[i:i + batch_size]
+            for ext_id in batch:
+                try:
+                    record = await self.data_entities_processor.get_record_by_external_id(
+                        connector_id=self.connector_id,
+                        external_record_id=ext_id
+                    )
+                    if record:
+                        result[ext_id] = record
+                except Exception as e:
+                    self.logger.warning(f"Error fetching record {ext_id}: {e}")
         
         return result
 
@@ -1425,11 +1426,9 @@ class SnowflakeConnector(BaseConnector):
         """Ensure connector app edges are created according to connector scope."""
         try:
             if self.scope == ConnectorScope.TEAM.value:
-                async with self.data_store_provider.transaction() as tx_store:
-                    await tx_store.ensure_team_app_edge(
-                        self.connector_id,
-                        self.data_entities_processor.org_id,
-                    )
+                await self.data_entities_processor.ensure_team_app_edge(
+                    self.connector_id
+                )
                 self.logger.info("Ensured team-app edge for Snowflake connector")
                 return
 
@@ -2995,12 +2994,9 @@ class SnowflakeConnector(BaseConnector):
         data_store_provider: DataStoreProvider,
         config_service: ConfigurationService,
         connector_id: str,
+        data_entities_processor,
         **kwargs,
     ) -> "SnowflakeConnector":
-        data_entities_processor = DataSourceEntitiesProcessor(
-            logger, data_store_provider, config_service
-        )
-        await data_entities_processor.initialize()
         return cls(
             logger,
             data_entities_processor,

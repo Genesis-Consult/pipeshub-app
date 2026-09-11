@@ -146,3 +146,21 @@ def test_record_permissions_use_staff_group() -> None:
         permission.source_connector_id
         == BullhornConnector.DEFAULT_STAFF_GROUP_CONNECTOR_ID
     )
+
+
+@pytest.mark.asyncio
+async def test_factory_preserves_injected_processor_and_org_scope() -> None:
+    processor = MagicMock(org_id="org-from-factory")
+    connector = await BullhornConnector.create_connector(
+        logger=MagicMock(),
+        data_store_provider=MagicMock(),
+        config_service=MagicMock(),
+        connector_id="bullhorn-app",
+        scope="team",
+        created_by="creator-id",
+        data_entities_processor=processor,
+        future_factory_option=True,
+    )
+
+    assert connector.data_entities_processor is processor
+    assert connector.data_entities_processor.org_id == "org-from-factory"

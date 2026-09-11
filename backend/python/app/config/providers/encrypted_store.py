@@ -253,6 +253,9 @@ class EncryptedKeyValueStore(KeyValueStore[T], Generic[T]):
 
             if encrypted_value is not None:
                 try:
+                    if isinstance(encrypted_value, (dict, list, int, float)):
+                        return encrypted_value
+                        
                     # Determine if value needs decryption
                     UNENCRYPTED_KEYS = [
                         config_node_constants.ENDPOINTS.value,
@@ -378,7 +381,9 @@ class EncryptedKeyValueStore(KeyValueStore[T], Generic[T]):
             return decrypted_keys
 
         except Exception as e:
-            self.logger.error(f"Failed to list keys in directory {directory}: {e}")
+            self.logger.error(
+                "Failed to list keys in directory (%s)", type(e).__name__
+            )
             raise
 
     async def cancel_watch(self, key: str, watch_id: str) -> None:
