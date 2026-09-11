@@ -8,6 +8,7 @@ import binascii
 import random
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs, urlparse
 
@@ -211,11 +212,13 @@ class BullhornClient:
         self, modified_since_ms: int | None = None
     ) -> AsyncIterator[BullhornCandidate]:
         start = 0
-        query = (
-            f"dateLastModified:[{int(modified_since_ms)} TO *]"
-            if modified_since_ms is not None
-            else "isDeleted:0"
-        )
+        # Bullhorn's Lucene date fields use UTC yyyyMMddHHmmss, not the epoch
+        # milliseconds returned in entity data. Numeric epoch bounds can match
+        # years of unchanged candidates instead of the incremental window.
+        query = "isDeleted:0"
+        if modified_since_ms is not None:
+            cutoff = datetime.fromtimestamp(modified_since_ms // 1000, timezone.utc)
+            query = f"dateLastModified:[{cutoff:%Y%m%d%H%M%S} TO *]"
         while True:
             payload = await self._authorized_json(
                 "GET",
