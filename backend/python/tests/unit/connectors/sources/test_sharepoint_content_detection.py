@@ -28,7 +28,7 @@ async def test_drive_content_detection_uses_persisted_file_hash(
     stored_file = FileRecord(
         id='record-1', org_id='org-1', record_name='example.docx',
         record_type=RecordType.FILE, external_record_id='external-1',
-        external_revision_id='v1', origin=OriginTypes.CONNECTOR,
+        external_revision_id='v1', version=1, origin=OriginTypes.CONNECTOR,
         connector_name=Connectors.SHAREPOINT_ONLINE, connector_id='connector-1',
         quick_xor_hash=stored_hash, is_file=True,
     )
