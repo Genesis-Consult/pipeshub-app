@@ -33,6 +33,7 @@ jobs:
           pytest tests/unit/connectors/core
           tests/unit/connectors/sources/test_bookstack*
           tests/unit/connectors/sources/test_bullhorn_connector.py
+          tests/unit/connectors/sources/test_sharepoint*
           tests/unit/sources/client/test_bullhorn_client.py
           tests/unit/events/test_processor*
           tests/unit/services/graph_db

@@ -1374,11 +1374,21 @@ class SharePointConnector(BaseConnector):
                     is_updated = True
 
                 # Check content changes for files
-                if hasattr(item, 'file') and item.file and hasattr(item.file, 'hashes') and item.file.hashes:
-                    current_hash = getattr(item.file.hashes, 'quick_xor_hash', None)
-                    if getattr(existing_record, 'quick_xor_hash', None) != current_hash:
-                        content_changed = True
-                        is_updated = True
+                if getattr(item, 'file', None):
+                    current_hash = getattr(getattr(item.file, 'hashes', None), 'quick_xor_hash', None)
+                    stored_hash = getattr(existing_record, 'quick_xor_hash', None)
+                    if current_hash is not None and stored_hash is None:
+                        # The external-ID lookup returns a base Record. File
+                        # hashes live in the related File node, not that object.
+                        stored_file = await self.data_entities_processor.get_file_record_by_id(existing_record.id)
+                        stored_hash = getattr(stored_file, 'quick_xor_hash', None)
+                    if current_hash is not None and stored_hash is not None:
+                        content_changed = stored_hash != current_hash
+                    else:
+                        # Without comparable hashes, use the source revision.
+                        # Missing hash metadata alone is not a content change.
+                        content_changed = metadata_changed
+                    is_updated = is_updated or content_changed
 
             # Create file record
             file_record = await self._create_file_record(item, drive_id, existing_record)
