@@ -544,7 +544,7 @@ class ToolsetTokenRefreshService:
                 raise ValueError(f"Could not load toolset config from {config_path}")
 
             # Use the new centralized OAuth credential fetching
-            from app.api.routes.toolsets import get_oauth_credentials_for_toolset
+            from app.edition_config import get_oauth_credentials_for_toolset
 
             oauth_creds = await get_oauth_credentials_for_toolset(
                 toolset_config=full_user_config,

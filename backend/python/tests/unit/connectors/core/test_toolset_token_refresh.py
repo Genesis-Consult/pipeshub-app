@@ -743,7 +743,7 @@ class TestBuildCompleteOauthConfig:
         }
 
         with patch(
-            "app.api.routes.toolsets.get_oauth_credentials_for_toolset",
+            "app.edition_config.get_oauth_credentials_for_toolset",
             new_callable=AsyncMock,
             return_value=mock_creds
         ):
@@ -806,7 +806,7 @@ class TestBuildCompleteOauthConfig:
         mock_creds = {"clientId": "cid"}  # Missing clientSecret
 
         with patch(
-            "app.api.routes.toolsets.get_oauth_credentials_for_toolset",
+            "app.edition_config.get_oauth_credentials_for_toolset",
             new_callable=AsyncMock,
             return_value=mock_creds
         ):
@@ -859,7 +859,7 @@ class TestBuildCompleteOauthConfig:
             "clientSecret": "csecret",
         }
         with patch(
-            "app.api.routes.toolsets.get_oauth_credentials_for_toolset",
+            "app.edition_config.get_oauth_credentials_for_toolset",
             new_callable=AsyncMock,
             return_value=mock_creds
         ):
@@ -908,7 +908,7 @@ class TestBuildCompleteOauthConfig:
 
         mock_creds = {"clientId": "cid", "clientSecret": "csecret"}
         with patch(
-            "app.api.routes.toolsets.get_oauth_credentials_for_toolset",
+            "app.edition_config.get_oauth_credentials_for_toolset",
             new_callable=AsyncMock,
             return_value=mock_creds
         ):
@@ -933,7 +933,7 @@ class TestBuildCompleteOauthConfig:
 
         mock_creds = {"clientId": "cid", "clientSecret": "csecret"}
         with patch(
-            "app.api.routes.toolsets.get_oauth_credentials_for_toolset",
+            "app.edition_config.get_oauth_credentials_for_toolset",
             new_callable=AsyncMock,
             return_value=mock_creds
         ):
@@ -966,7 +966,7 @@ class TestBuildCompleteOauthConfig:
             "domain": "example.slack.com",
         }
         with patch(
-            "app.api.routes.toolsets.get_oauth_credentials_for_toolset",
+            "app.edition_config.get_oauth_credentials_for_toolset",
             new_callable=AsyncMock,
             return_value=mock_creds
         ):
@@ -999,7 +999,7 @@ class TestBuildCompleteOauthConfig:
             "scopes": ["read", "write"],
         }
         with patch(
-            "app.api.routes.toolsets.get_oauth_credentials_for_toolset",
+            "app.edition_config.get_oauth_credentials_for_toolset",
             new_callable=AsyncMock,
             return_value=mock_creds
         ):
@@ -1040,7 +1040,7 @@ class TestBuildCompleteOauthConfig:
 
         mock_creds = {"clientId": "cid", "clientSecret": "csecret"}
         with patch(
-            "app.api.routes.toolsets.get_oauth_credentials_for_toolset",
+            "app.edition_config.get_oauth_credentials_for_toolset",
             new_callable=AsyncMock,
             return_value=mock_creds
         ):
@@ -1079,7 +1079,7 @@ class TestBuildCompleteOauthConfig:
 
         mock_creds = {"clientId": "cid", "clientSecret": "csecret"}
         with patch(
-            "app.api.routes.toolsets.get_oauth_credentials_for_toolset",
+            "app.edition_config.get_oauth_credentials_for_toolset",
             new_callable=AsyncMock,
             return_value=mock_creds
         ):
