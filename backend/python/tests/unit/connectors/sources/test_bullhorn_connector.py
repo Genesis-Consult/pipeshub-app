@@ -164,3 +164,28 @@ async def test_factory_preserves_injected_processor_and_org_scope() -> None:
 
     assert connector.data_entities_processor is processor
     assert connector.data_entities_processor.org_id == "org-from-factory"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'state, expected_mode, expected_cutoff',
+    [
+        ({'last_full_sync_ms': 1999999900000, 'last_successful_sync_ms': 1999999990000},
+         'incremental', 1999999990000 - BullhornConnector.INCREMENTAL_OVERLAP_MS),
+        ({}, 'full_reconciliation', None),
+        ({'last_full_sync_ms': 2000000000000 - BullhornConnector.FULL_RECONCILIATION_INTERVAL_MS,
+          'last_successful_sync_ms': 1999999990000}, 'full_reconciliation', None),
+    ],
+)
+async def test_sync_entrypoint_respects_checkpoint(state, expected_mode, expected_cutoff):
+    """The entrypoint used by startup and scheduled/manual sync must be incremental.
+
+    Full Sync deletes the checkpoint before entering, like a first sync.
+    Daily reconciliation is still allowed even after a recent incremental run.
+    """
+    connector, _ = build_connector()
+    connector.record_sync_point.read_sync_point = AsyncMock(return_value=state)
+    connector._sync = AsyncMock()
+    with patch('app.connectors.sources.bullhorn.connector.time.time', return_value=2000000000):
+        await connector.run_sync()
+    connector._sync.assert_awaited_once_with(modified_since_ms=expected_cutoff, mode=expected_mode)

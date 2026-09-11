@@ -285,7 +285,10 @@ class BullhornConnector(BaseConnector):
         return bool(self.client and await self.client.test_connection())
 
     async def run_sync(self) -> None:
-        await self._sync(modified_since_ms=None, mode="full")
+        # Scheduled/manual syncs and startup all enter through run_sync().
+        # An explicit Full Sync clears the checkpoint before calling us, so the
+        # same path also handles first syncs and full reconciliation safely.
+        await self.run_incremental_sync()
 
     async def run_incremental_sync(self) -> None:
         state = await self.record_sync_point.read_sync_point(self.SYNC_POINT_KEY)
