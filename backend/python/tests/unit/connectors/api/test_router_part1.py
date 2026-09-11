@@ -73,14 +73,17 @@ def _mock_request(
     """Build a minimal mock FastAPI request object."""
     req = MagicMock()
 
-    # state.user
-    user_data = user or {"userId": "user-1", "orgId": "org-1"}
+    _headers = headers or {}
+    user_data = dict(user or {"userId": "user-1", "orgId": "org-1"})
+    if "role" not in user_data:
+        admin_hdr = str(
+            _headers.get("X-Is-Admin") or _headers.get("x-is-admin") or ""
+        ).lower()
+        user_data["role"] = "admin" if admin_hdr == "true" else "member"
     req.state = MagicMock()
     req.state.user = MagicMock()
     req.state.user.get = lambda k, default=None: user_data.get(k, default)
 
-    # headers
-    _headers = headers or {}
     req.headers = MagicMock()
     req.headers.get = lambda k, default=None: _headers.get(k, default)
 
@@ -959,7 +962,7 @@ class TestHandleRecordDeletion:
         gp = AsyncMock()
         gp.delete_records_and_relations = AsyncMock(return_value={"deleted": True})
 
-        result = await handle_record_deletion("rec-1", gp)
+        result = await handle_record_deletion("rec-1", request=MagicMock(), graph_provider=gp)
         assert result["status"] == "success"
 
     async def test_not_found_raises_404(self):
@@ -969,7 +972,7 @@ class TestHandleRecordDeletion:
         gp.delete_records_and_relations = AsyncMock(return_value=None)
 
         with pytest.raises(HTTPException) as exc_info:
-            await handle_record_deletion("rec-missing", gp)
+            await handle_record_deletion("rec-missing", request=MagicMock(), graph_provider=gp)
         assert exc_info.value.status_code == HttpStatusCode.NOT_FOUND.value
 
     async def test_unexpected_error_raises_500(self):
@@ -979,7 +982,7 @@ class TestHandleRecordDeletion:
         gp.delete_records_and_relations = AsyncMock(side_effect=RuntimeError("boom"))
 
         with pytest.raises(HTTPException) as exc_info:
-            await handle_record_deletion("rec-1", gp)
+            await handle_record_deletion("rec-1", request=MagicMock(), graph_provider=gp)
         assert exc_info.value.status_code == HttpStatusCode.INTERNAL_SERVER_ERROR.value
 
 
@@ -1258,9 +1261,65 @@ class TestDeleteRecord:
         container.logger = MagicMock(return_value=MagicMock())
         request = _mock_request(container=container)
 
-        with patch("app.connectors.api.router.get_epoch_timestamp_in_ms", return_value=999):
+        with patch("app.connectors.api.router.get_epoch_timestamp_in_ms", return_value=999), \
+             patch("app.utils.retry.asyncio.sleep", new_callable=AsyncMock):
             result = await delete_record("rec-1", request, gp, kafka)
         assert result["success"] is True
+        assert result["vectorCleanupPending"] is True
+        assert result["vectorCleanupFailedRecordIds"] == ["rec-1"]
+        assert kafka.publish_event.await_count == 3  # retried before giving up (#3008)
+
+    async def test_malformed_event_data_skips_publish_and_flags_pending(self):
+        """eventData missing a required field (eventType/topic/payload) must not
+        crash a completed deletion via KeyError — skip publishing and flag
+        cleanup as pending instead."""
+        from app.connectors.api.router import delete_record
+
+        gp = AsyncMock()
+        gp.delete_record = AsyncMock(return_value={
+            "success": True,
+            "eventData": {"payload": {"recordId": "rec-1"}},  # missing eventType/topic
+        })
+
+        kafka = AsyncMock()
+        container = MagicMock()
+        container.logger = MagicMock(return_value=MagicMock())
+        request = _mock_request(container=container)
+
+        result = await delete_record("rec-1", request, gp, kafka)
+        assert result["success"] is True
+        assert result["vectorCleanupPending"] is True
+        assert result["vectorCleanupFailedRecordIds"] == ["rec-1"]
+        kafka.publish_event.assert_not_called()
+
+    async def test_transient_event_publish_failure_recovers(self):
+        """A broker hiccup that clears on retry must not be reported as a
+        cleanup gap — this is the common case #3008 flags as fixable."""
+        from app.connectors.api.router import delete_record
+
+        gp = AsyncMock()
+        gp.delete_record = AsyncMock(return_value={
+            "success": True,
+            "eventData": {
+                "eventType": "record.deleted",
+                "topic": "sync-events",
+                "payload": {"recordId": "rec-1"},
+            },
+        })
+
+        kafka = AsyncMock()
+        kafka.publish_event = AsyncMock(side_effect=[Exception("kafka hiccup"), True])
+
+        container = MagicMock()
+        container.logger = MagicMock(return_value=MagicMock())
+        request = _mock_request(container=container)
+
+        with patch("app.connectors.api.router.get_epoch_timestamp_in_ms", return_value=999), \
+             patch("app.utils.retry.asyncio.sleep", new_callable=AsyncMock):
+            result = await delete_record("rec-1", request, gp, kafka)
+        assert result["success"] is True
+        assert "vectorCleanupPending" not in result
+        assert kafka.publish_event.await_count == 2
 
 
 # ============================================================================
@@ -1380,7 +1439,7 @@ class TestGetConnectorStatsEndpoint:
         request.headers = MagicMock()
         request.headers.get = lambda k, default=None: default
 
-        result = await get_connector_stats_endpoint(request, "org-1", "conn-1", gp)
+        result = await get_connector_stats_endpoint(request, connector_id="conn-1", org_id="org-1", graph_provider=gp)
         assert result["success"] is True
         assert result["data"]["totalRecords"] == 100
 
@@ -1409,7 +1468,7 @@ class TestGetConnectorStatsEndpoint:
         request.headers.get = lambda k, default=None: default
 
         with pytest.raises(HTTPException) as exc_info:
-            await get_connector_stats_endpoint(request, "org-1", "conn-1", gp)
+            await get_connector_stats_endpoint(request, connector_id="conn-1", org_id="org-1", graph_provider=gp)
         assert exc_info.value.status_code == HttpStatusCode.NOT_FOUND.value
 
 

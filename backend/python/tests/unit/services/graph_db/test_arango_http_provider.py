@@ -1763,6 +1763,40 @@ class TestGetOrgApps:
         assert result == []
 
 
+class TestVectorStoreRebuildGraphQueries:
+    @pytest.mark.asyncio
+    async def test_active_only_false_omits_is_active_filter(self, connected_provider):
+        connected_provider.http_client.execute_aql.return_value = [{"_key": "app1"}]
+        result = await connected_provider.get_org_apps("org1", active_only=False)
+        assert result == [{"_key": "app1"}]
+        query = connected_provider.http_client.execute_aql.await_args.args[0]
+        assert "isActive" not in query
+
+    @pytest.mark.asyncio
+    async def test_reset_indexing_status_for_connector(self, connected_provider):
+        connected_provider.execute_query = AsyncMock(return_value=[])
+        await connected_provider.reset_indexing_status_for_connector(
+            "app-1", "NOT_STARTED", exclude_statuses=["IN_PROGRESS"]
+        )
+        bind = connected_provider.execute_query.await_args.kwargs["bind_vars"]
+        assert bind["connector_id"] == "app-1"
+        assert bind["status"] == "NOT_STARTED"
+        assert bind["exclude_statuses"] == ["IN_PROGRESS"]
+
+    @pytest.mark.asyncio
+    async def test_reset_failure_propagates(self, connected_provider):
+        """The rebuild drops the vector collection immediately after this call.
+
+        Swallowing the error would drop it against records that kept their old
+        statuses, so nothing re-indexes them and search stays silently empty.
+        """
+        connected_provider.execute_query = AsyncMock(side_effect=RuntimeError("aql"))
+        with pytest.raises(RuntimeError):
+            await connected_provider.reset_indexing_status_for_connector(
+                "app-1", "NOT_STARTED"
+            )
+
+
 # ---------------------------------------------------------------------------
 # get_departments
 # ---------------------------------------------------------------------------
@@ -4647,6 +4681,139 @@ class TestDeleteRecordsRecursive:
 
 
 # ---------------------------------------------------------------------------
+# delete_single_record
+# ---------------------------------------------------------------------------
+
+
+class TestDeleteSingleRecord:
+    @pytest.mark.asyncio
+    async def test_empty_id(self, connected_provider):
+        result = await connected_provider.delete_single_record("")
+        assert result["success"] is True
+        assert result["total_requested"] == 0
+        assert result["eventData"] is None
+
+    @pytest.mark.asyncio
+    async def test_found_with_event(self, connected_provider):
+        inventory = {
+            "valid_root_keys": ["r1"],
+            "records_with_type": [{
+                "record": {
+                    "_key": "r1",
+                    "recordName": "doc.pdf",
+                    "virtualRecordId": "virt-1",
+                    "connectorName": "GITHUB",
+                    "origin": "CONNECTOR",
+                },
+                "type_target": {"doc": {}, "collection": "files", "key": "r1"},
+            }],
+        }
+        with patch.object(connected_provider, "_get_all_edge_collections", AsyncMock(return_value=["permission"])), \
+             patch.object(connected_provider, "begin_transaction", AsyncMock(return_value="txn1")), \
+             patch.object(connected_provider, "execute_query", AsyncMock(return_value=[inventory])), \
+             patch.object(connected_provider, "_delete_edges_by_node_ids", AsyncMock()) as mock_edges, \
+             patch.object(connected_provider, "_delete_isoftype_targets_from_collected", AsyncMock()) as mock_type, \
+             patch.object(connected_provider, "_delete_nodes_by_keys", AsyncMock()) as mock_nodes, \
+             patch.object(connected_provider, "commit_transaction", AsyncMock()), \
+             patch.object(connected_provider, "_create_deleted_record_event_payload", AsyncMock(return_value={"recordId": "r1"})):
+            result = await connected_provider.delete_single_record("r1")
+
+        mock_edges.assert_awaited_once()
+        mock_type.assert_awaited_once()
+        mock_nodes.assert_awaited_once()
+        assert result["successfully_deleted"] == 1
+        assert result["eventData"]["eventType"] == "deleteRecord"
+        assert result["eventData"]["payloads"][0]["connectorName"] == "GITHUB"
+
+    @pytest.mark.asyncio
+    async def test_missing_is_noop(self, connected_provider):
+        with patch.object(connected_provider, "_get_all_edge_collections", AsyncMock(return_value=["permission"])), \
+             patch.object(connected_provider, "begin_transaction", AsyncMock(return_value="txn1")), \
+             patch.object(connected_provider, "execute_query", AsyncMock(return_value=[])), \
+             patch.object(connected_provider, "commit_transaction", AsyncMock()) as mock_commit, \
+             patch.object(connected_provider, "_delete_nodes_by_keys", AsyncMock()) as mock_nodes:
+            result = await connected_provider.delete_single_record("missing")
+
+        mock_commit.assert_awaited_once()
+        mock_nodes.assert_not_awaited()
+        assert result["success"] is True
+        assert result["successfully_deleted"] == 0
+        assert result["eventData"] is None
+
+    @pytest.mark.asyncio
+    async def test_no_virtual_record_id(self, connected_provider):
+        inventory = {
+            "valid_root_keys": ["r1"],
+            "records_with_type": [{
+                "record": {"_key": "r1", "recordName": "draft.txt", "connectorName": "GITHUB", "origin": "CONNECTOR"},
+                "type_target": {"doc": {}, "collection": "files", "key": "r1"},
+            }],
+        }
+        with patch.object(connected_provider, "_get_all_edge_collections", AsyncMock(return_value=["permission"])), \
+             patch.object(connected_provider, "begin_transaction", AsyncMock(return_value="txn1")), \
+             patch.object(connected_provider, "execute_query", AsyncMock(return_value=[inventory])), \
+             patch.object(connected_provider, "_delete_edges_by_node_ids", AsyncMock()), \
+             patch.object(connected_provider, "_delete_isoftype_targets_from_collected", AsyncMock()), \
+             patch.object(connected_provider, "_delete_nodes_by_keys", AsyncMock()), \
+             patch.object(connected_provider, "commit_transaction", AsyncMock()):
+            result = await connected_provider.delete_single_record("r1")
+
+        assert result["successfully_deleted"] == 1
+        assert result["eventData"] is None
+
+    @pytest.mark.asyncio
+    async def test_db_error_rolls_back(self, connected_provider):
+        with patch.object(connected_provider, "_get_all_edge_collections", AsyncMock(return_value=["permission"])), \
+             patch.object(connected_provider, "begin_transaction", AsyncMock(return_value="txn1")), \
+             patch.object(connected_provider, "execute_query", AsyncMock(side_effect=RuntimeError("query failed"))), \
+             patch.object(connected_provider, "rollback_transaction", AsyncMock()) as mock_rb:
+            result = await connected_provider.delete_single_record("r1")
+
+        assert result["success"] is False
+        assert result["code"] == 500
+        mock_rb.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_external_transaction_not_committed(self, connected_provider):
+        with patch.object(connected_provider, "_get_all_edge_collections", AsyncMock(return_value=["permission"])), \
+             patch.object(connected_provider, "begin_transaction", AsyncMock()) as mock_begin, \
+             patch.object(connected_provider, "execute_query", AsyncMock(return_value=[])), \
+             patch.object(connected_provider, "commit_transaction", AsyncMock()) as mock_commit:
+            await connected_provider.delete_single_record("r1", transaction="ext-txn")
+
+        mock_begin.assert_not_awaited()
+        mock_commit.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_payload_build_failure_still_deletes(self, connected_provider):
+        inventory = {
+            "valid_root_keys": ["r1"],
+            "records_with_type": [{
+                "record": {
+                    "_key": "r1",
+                    "recordName": "doc.pdf",
+                    "virtualRecordId": "virt-1",
+                    "connectorName": "GITHUB",
+                    "origin": "CONNECTOR",
+                },
+                "type_target": {"doc": {}, "collection": "files", "key": "r1"},
+            }],
+        }
+        with patch.object(connected_provider, "_get_all_edge_collections", AsyncMock(return_value=["permission"])), \
+             patch.object(connected_provider, "begin_transaction", AsyncMock(return_value="txn1")), \
+             patch.object(connected_provider, "execute_query", AsyncMock(return_value=[inventory])), \
+             patch.object(connected_provider, "_delete_edges_by_node_ids", AsyncMock()), \
+             patch.object(connected_provider, "_delete_isoftype_targets_from_collected", AsyncMock()), \
+             patch.object(connected_provider, "_delete_nodes_by_keys", AsyncMock()), \
+             patch.object(connected_provider, "commit_transaction", AsyncMock()), \
+             patch.object(connected_provider, "_create_deleted_record_event_payload", AsyncMock(side_effect=RuntimeError("bad payload"))):
+            result = await connected_provider.delete_single_record("r1")
+
+        assert result["success"] is True
+        assert result["eventData"] is None
+
+
+# ---------------------------------------------------------------------------
 # delete_connector_instance
 # ---------------------------------------------------------------------------
 
@@ -5094,7 +5261,7 @@ class TestEnsureIndexes:
     async def test_calls_ensure_persistent_index(self, connected_provider):
         connected_provider.http_client.ensure_persistent_index = AsyncMock()
         await connected_provider._ensure_indexes()
-        assert connected_provider.http_client.ensure_persistent_index.await_count == 20
+        assert connected_provider.http_client.ensure_persistent_index.await_count == 21
 
 
 # ---------------------------------------------------------------------------
@@ -7277,77 +7444,6 @@ class TestGetAgent:
 
 
 # ---------------------------------------------------------------------------
-# share_agent_template
-# ---------------------------------------------------------------------------
-
-
-class TestShareAgentTemplate:
-    @pytest.mark.asyncio
-    async def test_share_with_users(self, connected_provider):
-        with patch.object(
-            connected_provider, "execute_query",
-            new_callable=AsyncMock, return_value=[{"role": "OWNER"}]
-        ), patch.object(
-            connected_provider, "get_user_by_user_id",
-            new_callable=AsyncMock, return_value={"_key": "uk1"}
-        ), patch.object(
-            connected_provider, "batch_create_edges",
-            new_callable=AsyncMock, return_value=True
-        ):
-            result = await connected_provider.share_agent_template(
-                "t1", "owner1", user_ids=["u1", "u2"]
-            )
-            assert result is True
-
-    @pytest.mark.asyncio
-    async def test_share_with_teams(self, connected_provider):
-        with patch.object(
-            connected_provider, "execute_query",
-            new_callable=AsyncMock, return_value=[{"role": "OWNER"}]
-        ), patch.object(
-            connected_provider, "batch_create_edges",
-            new_callable=AsyncMock, return_value=True
-        ):
-            result = await connected_provider.share_agent_template(
-                "t1", "owner1", team_ids=["team1"]
-            )
-            assert result is True
-
-    @pytest.mark.asyncio
-    async def test_no_owner_permission(self, connected_provider):
-        with patch.object(
-            connected_provider, "execute_query",
-            new_callable=AsyncMock, return_value=[]
-        ):
-            result = await connected_provider.share_agent_template(
-                "t1", "user1", user_ids=["u2"]
-            )
-            assert result is False
-
-    @pytest.mark.asyncio
-    async def test_no_user_or_team_ids(self, connected_provider):
-        with patch.object(
-            connected_provider, "execute_query",
-            new_callable=AsyncMock, return_value=[{"role": "OWNER"}]
-        ):
-            result = await connected_provider.share_agent_template(
-                "t1", "owner1", user_ids=None, team_ids=None
-            )
-            assert result is False
-
-    @pytest.mark.asyncio
-    async def test_exception_returns_false(self, connected_provider):
-        with patch.object(
-            connected_provider, "execute_query",
-            new_callable=AsyncMock, side_effect=Exception("fail")
-        ):
-            result = await connected_provider.share_agent_template(
-                "t1", "owner1", user_ids=["u1"]
-            )
-            assert result is False
-
-
-# ---------------------------------------------------------------------------
 # clone_agent_template
 # ---------------------------------------------------------------------------
 
@@ -7742,7 +7838,7 @@ class TestEnsureIndexesExtended:
     async def test_calls_ensure_persistent_index(self, connected_provider):
         connected_provider.http_client.ensure_persistent_index = AsyncMock()
         await connected_provider._ensure_indexes()
-        assert connected_provider.http_client.ensure_persistent_index.await_count == 20
+        assert connected_provider.http_client.ensure_persistent_index.await_count == 21
 
 
 # ---------------------------------------------------------------------------
@@ -8931,247 +9027,6 @@ class TestDeleteAgent:
 
 
 # ---------------------------------------------------------------------------
-# share_agent
-# ---------------------------------------------------------------------------
-
-
-class TestShareAgent:
-    @pytest.mark.asyncio
-    async def test_share_to_users(self, connected_provider):
-        with patch.object(
-            connected_provider, "get_agent",
-            new_callable=AsyncMock, return_value={"can_share": True}
-        ), patch.object(
-            connected_provider, "get_user_by_user_id",
-            new_callable=AsyncMock, return_value={"_key": "target_u1"}
-        ), patch.object(
-            connected_provider, "batch_create_edges",
-            new_callable=AsyncMock, return_value=True
-        ):
-            result = await connected_provider.share_agent(
-                "agent1", "u1", "org1", user_ids=["target_u1"], team_ids=None
-            )
-            assert result is True
-
-    @pytest.mark.asyncio
-    async def test_share_to_teams(self, connected_provider):
-        with patch.object(
-            connected_provider, "get_agent",
-            new_callable=AsyncMock, return_value={"can_share": True}
-        ), patch.object(
-            connected_provider, "get_document",
-            new_callable=AsyncMock, return_value={"_key": "team1"}
-        ), patch.object(
-            connected_provider, "batch_create_edges",
-            new_callable=AsyncMock, return_value=True
-        ):
-            result = await connected_provider.share_agent(
-                "agent1", "u1", "org1", user_ids=None, team_ids=["team1"]
-            )
-            assert result is True
-
-    @pytest.mark.asyncio
-    async def test_no_share_permission(self, connected_provider):
-        with patch.object(
-            connected_provider, "get_agent",
-            new_callable=AsyncMock, return_value={"can_share": False}
-        ):
-            result = await connected_provider.share_agent(
-                "agent1", "u1", "org1", user_ids=["u2"], team_ids=None
-            )
-            assert result is False
-
-    @pytest.mark.asyncio
-    async def test_no_permission(self, connected_provider):
-        with patch.object(
-            connected_provider, "get_agent",
-            new_callable=AsyncMock, return_value=None
-        ):
-            result = await connected_provider.share_agent(
-                "agent1", "u1", "org1", user_ids=["u2"], team_ids=None
-            )
-            assert result is False
-
-    @pytest.mark.asyncio
-    async def test_exception(self, connected_provider):
-        with patch.object(
-            connected_provider, "get_agent",
-            new_callable=AsyncMock, side_effect=Exception("fail")
-        ):
-            result = await connected_provider.share_agent(
-                "agent1", "u1", "org1", user_ids=["u2"], team_ids=None
-            )
-            assert result is False
-
-
-# ---------------------------------------------------------------------------
-# unshare_agent
-# ---------------------------------------------------------------------------
-
-
-class TestUnshareAgent:
-    @pytest.mark.asyncio
-    async def test_success_with_users(self, connected_provider):
-        with patch.object(
-            connected_provider, "check_agent_permission",
-            new_callable=AsyncMock, return_value={"can_share": True}
-        ), patch.object(
-            connected_provider, "execute_query",
-            new_callable=AsyncMock, return_value=["perm1"]
-        ):
-            result = await connected_provider.unshare_agent(
-                "agent1", "u1", "org1", user_ids=["u2"], team_ids=None
-            )
-            assert result["success"] is True
-
-    @pytest.mark.asyncio
-    async def test_no_permission(self, connected_provider):
-        with patch.object(
-            connected_provider, "check_agent_permission",
-            new_callable=AsyncMock, return_value=None
-        ):
-            result = await connected_provider.unshare_agent(
-                "agent1", "u1", "org1", user_ids=["u2"], team_ids=None
-            )
-            assert result["success"] is False
-
-    @pytest.mark.asyncio
-    async def test_no_users_or_teams(self, connected_provider):
-        with patch.object(
-            connected_provider, "check_agent_permission",
-            new_callable=AsyncMock, return_value={"can_share": True}
-        ):
-            result = await connected_provider.unshare_agent(
-                "agent1", "u1", "org1", user_ids=None, team_ids=None
-            )
-            assert result["success"] is False
-
-    @pytest.mark.asyncio
-    async def test_exception(self, connected_provider):
-        with patch.object(
-            connected_provider, "check_agent_permission",
-            new_callable=AsyncMock, side_effect=Exception("fail")
-        ):
-            result = await connected_provider.unshare_agent(
-                "agent1", "u1", "org1", user_ids=["u2"], team_ids=None
-            )
-            assert result["success"] is False
-
-
-# ---------------------------------------------------------------------------
-# update_agent_permission
-# ---------------------------------------------------------------------------
-
-
-class TestUpdateAgentPermission:
-    @pytest.mark.asyncio
-    @pytest.mark.asyncio
-    async def test_not_owner(self, connected_provider):
-        with patch.object(
-            connected_provider, "check_agent_permission",
-            new_callable=AsyncMock, return_value={"user_role": "READER"}
-        ):
-            result = await connected_provider.update_agent_permission(
-                "agent1", "u1", "org1", user_ids=["u2"], team_ids=None, role="WRITER"
-            )
-            assert result["success"] is False
-
-    @pytest.mark.asyncio
-    async def test_no_permission(self, connected_provider):
-        with patch.object(
-            connected_provider, "check_agent_permission",
-            new_callable=AsyncMock, return_value=None
-        ):
-            result = await connected_provider.update_agent_permission(
-                "agent1", "u1", "org1", user_ids=["u2"], team_ids=None, role="WRITER"
-            )
-            assert result["success"] is False
-
-    @pytest.mark.asyncio
-    async def test_no_users_or_teams(self, connected_provider):
-        with patch.object(
-            connected_provider, "check_agent_permission",
-            new_callable=AsyncMock, return_value={"user_role": "OWNER"}
-        ):
-            result = await connected_provider.update_agent_permission(
-                "agent1", "u1", "org1", user_ids=None, team_ids=None, role="WRITER"
-            )
-            assert result["success"] is False
-
-    @pytest.mark.asyncio
-    async def test_exception(self, connected_provider):
-        with patch.object(
-            connected_provider, "check_agent_permission",
-            new_callable=AsyncMock, side_effect=Exception("fail")
-        ):
-            result = await connected_provider.update_agent_permission(
-                "agent1", "u1", "org1", user_ids=["u2"], team_ids=None, role="WRITER"
-            )
-            assert result["success"] is False
-
-
-# ---------------------------------------------------------------------------
-# get_agent_permissions
-# ---------------------------------------------------------------------------
-
-
-class TestGetAgentPermissions:
-    @pytest.mark.asyncio
-    async def test_owner_gets_permissions(self, connected_provider):
-        with patch.object(
-            connected_provider, "check_agent_permission",
-            new_callable=AsyncMock, return_value={"user_role": "OWNER"}
-        ), patch.object(
-            connected_provider, "execute_query",
-            new_callable=AsyncMock, return_value=[
-                {"id": "u1", "role": "OWNER", "type": "USER"},
-                {"id": "u2", "role": "READER", "type": "USER"},
-            ]
-        ):
-            result = await connected_provider.get_agent_permissions("agent1", "u1", "org1")
-            assert len(result) == 2
-
-    @pytest.mark.asyncio
-    async def test_not_owner_returns_none(self, connected_provider):
-        with patch.object(
-            connected_provider, "check_agent_permission",
-            new_callable=AsyncMock, return_value={"user_role": "READER"}
-        ):
-            result = await connected_provider.get_agent_permissions("agent1", "u1", "org1")
-            assert result is None
-
-    @pytest.mark.asyncio
-    async def test_no_permission_returns_none(self, connected_provider):
-        with patch.object(
-            connected_provider, "check_agent_permission",
-            new_callable=AsyncMock, return_value=None
-        ):
-            result = await connected_provider.get_agent_permissions("agent1", "u1", "org1")
-            assert result is None
-
-    @pytest.mark.asyncio
-    async def test_empty_result(self, connected_provider):
-        with patch.object(
-            connected_provider, "check_agent_permission",
-            new_callable=AsyncMock, return_value={"user_role": "OWNER"}
-        ), patch.object(
-            connected_provider, "execute_query",
-            new_callable=AsyncMock, return_value=[]
-        ):
-            result = await connected_provider.get_agent_permissions("agent1", "u1", "org1")
-            assert result == []
-
-    @pytest.mark.asyncio
-    async def test_exception(self, connected_provider):
-        with patch.object(
-            connected_provider, "check_agent_permission",
-            new_callable=AsyncMock, side_effect=Exception("fail")
-        ):
-            result = await connected_provider.get_agent_permissions("agent1", "u1", "org1")
-            assert result is None
-
-
-# ---------------------------------------------------------------------------
 # get_all_agent_templates
 # ---------------------------------------------------------------------------
 
@@ -9239,63 +9094,6 @@ class TestGetTemplate:
         ):
             result = await connected_provider.get_template("t1", "u1")
             assert result is None
-
-
-# ---------------------------------------------------------------------------
-# share_agent_template
-# ---------------------------------------------------------------------------
-
-
-class TestShareAgentTemplate:
-    @pytest.mark.asyncio
-    async def test_success_with_users(self, connected_provider):
-        with patch.object(
-            connected_provider, "execute_query",
-            new_callable=AsyncMock, return_value=[{"role": "OWNER"}]
-        ), patch.object(
-            connected_provider, "get_user_by_user_id",
-            new_callable=AsyncMock, return_value={"_key": "target_u1"}
-        ), patch.object(
-            connected_provider, "batch_create_edges",
-            new_callable=AsyncMock, return_value=True
-        ):
-            result = await connected_provider.share_agent_template(
-                "t1", "u1", user_ids=["target_u1"]
-            )
-            assert result is True
-
-    @pytest.mark.asyncio
-    async def test_no_owner_access(self, connected_provider):
-        with patch.object(
-            connected_provider, "execute_query",
-            new_callable=AsyncMock, return_value=[]
-        ):
-            result = await connected_provider.share_agent_template(
-                "t1", "u1", user_ids=["target_u1"]
-            )
-            assert result is False
-
-    @pytest.mark.asyncio
-    async def test_no_users_or_teams(self, connected_provider):
-        with patch.object(
-            connected_provider, "execute_query",
-            new_callable=AsyncMock, return_value=[{"role": "OWNER"}]
-        ):
-            result = await connected_provider.share_agent_template(
-                "t1", "u1", user_ids=None, team_ids=None
-            )
-            assert result is False
-
-    @pytest.mark.asyncio
-    async def test_exception(self, connected_provider):
-        with patch.object(
-            connected_provider, "execute_query",
-            new_callable=AsyncMock, side_effect=Exception("fail")
-        ):
-            result = await connected_provider.share_agent_template(
-                "t1", "u1", user_ids=["target_u1"]
-            )
-            assert result is False
 
 
 # ---------------------------------------------------------------------------
@@ -12586,6 +12384,7 @@ class TestCreateDeletedRecordEventPayload:
         assert result["orgId"] == "o1"
         assert result["recordId"] == "r1"
         assert result["extension"] == ".pdf"
+        assert result["connectorId"] is None
 
     @pytest.mark.asyncio
     async def test_no_file_record(self, connected_provider):
@@ -14315,6 +14114,8 @@ class TestHardDeleteAllAgents:
                 [{"_key": "tool1"}],  # tool nodes
                 [{"_key": "tse1"}],  # toolset edges
                 [{"_key": "ts1"}],  # toolset nodes
+                [],  # no mcp server ids
+                [],  # no agent->mcp server edges deleted
                 [{"_key": "pe1"}],  # permission edges
                 [{"_key": "a1"}],  # agent docs
             ]
@@ -14324,6 +14125,7 @@ class TestHardDeleteAllAgents:
         assert result["toolsets_deleted"] == 1
         assert result["tools_deleted"] == 1
         assert result["knowledge_deleted"] == 1
+        assert result["mcp_servers_deleted"] == 0
 
     @pytest.mark.asyncio
     async def test_nothing_to_delete(self, connected_provider):
@@ -14333,12 +14135,15 @@ class TestHardDeleteAllAgents:
                 None,  # no toolset ids
                 None,  # no toolset edges
                 None,  # no toolsets
+                None,  # no mcp server ids
+                None,  # no agent->mcp server edges deleted
                 None,  # no permissions
                 None,  # no agents
             ]
         )
         result = await connected_provider.hard_delete_all_agents()
         assert result["agents_deleted"] == 0
+        assert result["mcp_servers_deleted"] == 0
 
     @pytest.mark.asyncio
     async def test_exception(self, connected_provider):
@@ -15547,83 +15352,6 @@ class TestGetKbVirtualIdsExtended:
 
 
 # ---------------------------------------------------------------------------
-# share_agent
-# ---------------------------------------------------------------------------
-
-
-class TestShareAgentExtended:
-    @pytest.mark.asyncio
-    async def test_no_permission(self, connected_provider):
-        connected_provider.get_agent = AsyncMock(return_value=None)
-        result = await connected_provider.share_agent("a1", "u1", "org1", ["u2"], [])
-        assert result is False
-
-    @pytest.mark.asyncio
-    async def test_cannot_share(self, connected_provider):
-        connected_provider.get_agent = AsyncMock(return_value={"can_share": False})
-        result = await connected_provider.share_agent("a1", "u1", "org1", ["u2"], [])
-        assert result is False
-
-    @pytest.mark.asyncio
-    async def test_success_users(self, connected_provider):
-        connected_provider.get_agent = AsyncMock(return_value={"can_share": True})
-        connected_provider.get_user_by_user_id = AsyncMock(
-            return_value={"_key": "uk2", "userId": "u2"}
-        )
-        connected_provider.batch_create_edges = AsyncMock(return_value=True)
-        result = await connected_provider.share_agent("a1", "u1", "org1", ["u2"], [])
-        assert result is True
-
-
-# ---------------------------------------------------------------------------
-# unshare_agent
-# ---------------------------------------------------------------------------
-
-
-class TestUnshareAgentExtended:
-    @pytest.mark.asyncio
-    async def test_no_permission(self, connected_provider):
-        connected_provider.check_agent_permission = AsyncMock(return_value=None)
-        result = await connected_provider.unshare_agent("a1", "u1", "org1", ["u2"], [])
-        assert result is not None
-        assert result.get("success") is False
-
-    @pytest.mark.asyncio
-    async def test_cannot_share(self, connected_provider):
-        connected_provider.check_agent_permission = AsyncMock(return_value={"can_share": False})
-        result = await connected_provider.unshare_agent("a1", "u1", "org1", ["u2"], [])
-        assert result is not None
-        assert result.get("success") is False
-
-
-# ---------------------------------------------------------------------------
-# update_agent_permission
-# ---------------------------------------------------------------------------
-
-
-class TestUpdateAgentPermissionExtended:
-    @pytest.mark.asyncio
-    async def test_no_permission(self, connected_provider):
-        connected_provider.get_agent = AsyncMock(return_value=None)
-        result = await connected_provider.update_agent_permission("a1", "u1", "org1", ["u2"], [], "WRITER")
-        assert result is not None
-        assert result.get("success") is False
-
-
-# ---------------------------------------------------------------------------
-# get_agent_permissions
-# ---------------------------------------------------------------------------
-
-
-class TestGetAgentPermissionsExtended:
-    @pytest.mark.asyncio
-    async def test_no_permission(self, connected_provider):
-        connected_provider.get_agent = AsyncMock(return_value=None)
-        result = await connected_provider.get_agent_permissions("a1", "u1", "org1")
-        assert result is None
-
-
-# ---------------------------------------------------------------------------
 # _delete_record_with_type
 # ---------------------------------------------------------------------------
 
@@ -16250,14 +15978,6 @@ class TestExecuteKbRecordDeletion:
 # share_agent_template / clone_agent_template / delete_agent_template / update_agent_template
 # (remaining agent template methods if not already covered)
 # ---------------------------------------------------------------------------
-
-
-class TestShareAgentTemplateExtended:
-    @pytest.mark.asyncio
-    async def test_no_template(self, connected_provider):
-        connected_provider.get_template = AsyncMock(return_value=None)
-        result = await connected_provider.share_agent_template("t1", "u1")
-        assert result is None or result is False
 
 
 class TestCloneAgentTemplateExtended:
@@ -16919,6 +16639,10 @@ class TestHardDeleteAgent:
             [{"_key": "e1"}],
             # deleted_toolsets from step 7
             [{"_key": "ts1"}],
+            # mcp_server_ids (no MCP servers attached)
+            [],
+            # deleted_mcp_server_edges (none)
+            [],
             # deleted_permissions from step 8
             [{"_key": "p1"}, {"_key": "p2"}],
             # deleted_agents from step 9
@@ -16930,6 +16654,7 @@ class TestHardDeleteAgent:
         assert result["knowledge_deleted"] == 1
         assert result["tools_deleted"] == 1
         assert result["toolsets_deleted"] == 1
+        assert result["mcp_servers_deleted"] == 0
         assert result["edges_deleted"] > 0
 
     @pytest.mark.asyncio
@@ -16939,6 +16664,8 @@ class TestHardDeleteAgent:
             [],    # no knowledge_ids
             [],    # no toolset_ids
             [],    # no toolset edges deleted
+            [],    # no mcp_server_ids
+            [],    # no deleted_mcp_server_edges
             [],    # no permissions
             [{"_key": "a1"}],  # agent deleted
         ])
@@ -16948,6 +16675,7 @@ class TestHardDeleteAgent:
         assert result["knowledge_deleted"] == 0
         assert result["tools_deleted"] == 0
         assert result["toolsets_deleted"] == 0
+        assert result["mcp_servers_deleted"] == 0
 
     @pytest.mark.asyncio
     async def test_knowledge_with_no_orphans(self, connected_provider):
@@ -16957,6 +16685,8 @@ class TestHardDeleteAgent:
             [],                       # no deleted_knowledge (still referenced)
             [],                       # no toolsets
             [],                       # no toolset edges
+            [],                       # no mcp_server_ids
+            [],                       # no deleted_mcp_server_edges
             [],                       # no permissions
             [{"_key": "a1"}],         # agent deleted
         ])
@@ -16975,6 +16705,8 @@ class TestHardDeleteAgent:
             [],                      # no deleted_tools (still referenced)
             [{"_key": "e1"}],        # toolset edges deleted
             [],                      # no deleted_toolsets (still referenced)
+            [],                      # no mcp_server_ids
+            [],                      # no deleted_mcp_server_edges
             [],                      # no permissions
             [{"_key": "a1"}],        # agent deleted
         ])
@@ -16983,6 +16715,7 @@ class TestHardDeleteAgent:
         assert result["agents_deleted"] == 1
         assert result["tools_deleted"] == 0
         assert result["toolsets_deleted"] == 0
+        assert result["mcp_servers_deleted"] == 0
 
     @pytest.mark.asyncio
     async def test_exception_returns_zeros(self, connected_provider):
@@ -16993,6 +16726,7 @@ class TestHardDeleteAgent:
         assert result["tools_deleted"] == 0
         assert result["knowledge_deleted"] == 0
         assert result["edges_deleted"] == 0
+        assert result["mcp_servers_deleted"] == 0
 
     @pytest.mark.asyncio
     async def test_permissions_deleted(self, connected_provider):
@@ -17001,6 +16735,8 @@ class TestHardDeleteAgent:
             [],                      # no knowledge
             [],                      # no toolsets
             [{"_key": "te1"}],       # toolset edges deleted
+            [],                      # no mcp_server_ids
+            [],                      # no deleted_mcp_server_edges
             [{"_key": "p1"}, {"_key": "p2"}, {"_key": "p3"}],  # 3 permissions deleted
             [{"_key": "a1"}],        # agent deleted
         ])
@@ -17210,59 +16946,6 @@ class TestExecuteKbRecordDeletionDetailed:
 
 
 # ---------------------------------------------------------------------------
-# share_agent (lines 19056-19093)
-# ---------------------------------------------------------------------------
-
-
-class TestShareAgent:
-    @pytest.mark.asyncio
-    async def test_share_with_users(self, connected_provider):
-        connected_provider.get_agent = AsyncMock(return_value={"_key": "a1", "can_share": True})
-        connected_provider.get_user_by_user_id = AsyncMock(return_value={"_key": "u2"})
-        connected_provider.batch_create_edges = AsyncMock(return_value=True)
-
-        result = await connected_provider.share_agent("a1", "u1", "org1", user_ids=["u2"], team_ids=None)
-        assert result is True
-
-    @pytest.mark.asyncio
-    async def test_share_with_teams(self, connected_provider):
-        connected_provider.get_agent = AsyncMock(return_value={"_key": "a1", "can_share": True})
-        connected_provider.get_document = AsyncMock(return_value={"_key": "team1"})
-        connected_provider.batch_create_edges = AsyncMock(return_value=True)
-
-        result = await connected_provider.share_agent("a1", "u1", "org1", user_ids=None, team_ids=["team1"])
-        assert result is True
-
-    @pytest.mark.asyncio
-    async def test_share_user_not_found_skipped(self, connected_provider):
-        """User not found should be skipped (continue), not fail."""
-        connected_provider.get_agent = AsyncMock(return_value={"_key": "a1", "can_share": True})
-        connected_provider.get_user_by_user_id = AsyncMock(return_value=None)
-        connected_provider.batch_create_edges = AsyncMock(return_value=True)
-
-        result = await connected_provider.share_agent("a1", "u1", "org1", user_ids=["u2"], team_ids=None)
-        assert result is True
-
-    @pytest.mark.asyncio
-    async def test_share_team_not_found_skipped(self, connected_provider):
-        connected_provider.get_agent = AsyncMock(return_value={"_key": "a1", "can_share": True})
-        connected_provider.get_document = AsyncMock(return_value=None)
-        connected_provider.batch_create_edges = AsyncMock(return_value=True)
-
-        result = await connected_provider.share_agent("a1", "u1", "org1", user_ids=None, team_ids=["team1"])
-        assert result is True
-
-    @pytest.mark.asyncio
-    async def test_share_fails_on_edge_creation(self, connected_provider):
-        connected_provider.get_agent = AsyncMock(return_value={"_key": "a1", "can_share": True})
-        connected_provider.get_user_by_user_id = AsyncMock(return_value={"_key": "u2"})
-        connected_provider.batch_create_edges = AsyncMock(return_value=False)
-
-        result = await connected_provider.share_agent("a1", "u1", "org1", user_ids=["u2"], team_ids=None)
-        assert result is False
-
-
-# ---------------------------------------------------------------------------
 # update_agent_permission (lines 19180-19208)
 # ---------------------------------------------------------------------------
 
@@ -17319,59 +17002,6 @@ class TestUpdateAgentPermission:
             "a1", "u1", "org1", user_ids=None, team_ids=None, role="WRITER"
         )
         assert result["success"] is False
-
-
-# ---------------------------------------------------------------------------
-# share_agent_template (lines 19466-19491)
-# ---------------------------------------------------------------------------
-
-
-class TestShareAgentTemplateDetailed:
-    @pytest.mark.asyncio
-    async def test_share_with_users(self, connected_provider):
-        # Query returns the template doc; share_agent_template checks role == "OWNER"
-        connected_provider.execute_query = AsyncMock(return_value=[{"_key": "t1", "role": "OWNER"}])
-        connected_provider.get_user_by_user_id = AsyncMock(return_value={"_key": "u2"})
-        connected_provider.batch_create_edges = AsyncMock(return_value=True)
-
-        result = await connected_provider.share_agent_template("t1", "u1", user_ids=["u2"], team_ids=None)
-        assert result is True
-
-    @pytest.mark.asyncio
-    async def test_share_with_teams(self, connected_provider):
-        connected_provider.execute_query = AsyncMock(return_value=[{"_key": "t1", "role": "OWNER"}])
-        connected_provider.batch_create_edges = AsyncMock(return_value=True)
-
-        result = await connected_provider.share_agent_template("t1", "u1", user_ids=None, team_ids=["team1"])
-        assert result is True
-
-    @pytest.mark.asyncio
-    async def test_user_not_found_returns_false(self, connected_provider):
-        connected_provider.execute_query = AsyncMock(return_value=[{"_key": "t1", "role": "OWNER"}])
-        connected_provider.get_user_by_user_id = AsyncMock(return_value=None)
-
-        result = await connected_provider.share_agent_template("t1", "u1", user_ids=["u2"], team_ids=None)
-        assert result is False
-
-    @pytest.mark.asyncio
-    async def test_batch_create_fails(self, connected_provider):
-        connected_provider.execute_query = AsyncMock(return_value=[{"_key": "t1", "role": "OWNER"}])
-        connected_provider.batch_create_edges = AsyncMock(return_value=False)
-
-        result = await connected_provider.share_agent_template("t1", "u1", user_ids=None, team_ids=["team1"])
-        assert result is False
-
-    @pytest.mark.asyncio
-    async def test_no_owner_access(self, connected_provider):
-        connected_provider.execute_query = AsyncMock(return_value=[])
-        result = await connected_provider.share_agent_template("t1", "u1", user_ids=["u2"])
-        assert result is False
-
-    @pytest.mark.asyncio
-    async def test_no_users_or_teams(self, connected_provider):
-        connected_provider.execute_query = AsyncMock(return_value=[{"_key": "t1", "role": "OWNER"}])
-        result = await connected_provider.share_agent_template("t1", "u1", user_ids=None, team_ids=None)
-        assert result is False
 
 
 # ---------------------------------------------------------------------------
@@ -19823,6 +19453,8 @@ class TestMigrateLegacyKbToApp:
         
         assert result["success"] is True
         connected_provider.delete_edge.assert_not_called()
+        kb_data = connected_provider.batch_upsert_nodes.call_args[0][0][0]
+        assert kb_data["vectorMembershipBackfilled"] is False
 
     @pytest.mark.asyncio
     async def test_successful_edge_retargeting(self, connected_provider):

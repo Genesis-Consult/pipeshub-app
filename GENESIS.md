@@ -1,7 +1,9 @@
 # Genesis extensions
 
-This fork is pinned to upstream PipesHub `v0.6.0-beta` (`730bdee534048fe209b0cc2ed707f3e8994adf85`).
-It carries one functional extension: indexing uploaded BookStack attachments.
+This fork is based on upstream PipesHub `v0.7.0`.
+Genesis extensions include BookStack attachment indexing, the Bullhorn connector
+with StaffGC access reconciliation, bounded role-based document navigation,
+DOCX conversion safeguards, embedded assistant support, and Internal Search by default.
 
 ## BookStack attachments
 

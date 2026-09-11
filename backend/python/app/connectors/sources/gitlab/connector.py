@@ -92,6 +92,13 @@ _GITLAB_EXECUTOR_MAX_WORKERS = 8
     .with_description("Sync content from your GitLab instance")
     .with_categories(["Knowledge Management"])
     .with_scopes([ConnectorScope.TEAM.value])
+    # No APP_LEVEL here: GitLab syncs real per-project member ACLs
+    # (`projects.py::_transform_restrictions_to_permissions` writes a per-user
+    # permission for every project member), and creator-only is merely the
+    # fallback when member enumeration fails. Declaring APP_LEVEL routes these
+    # users to the connector-wide record scan, which returns every synced
+    # project's records to anyone linked to the app regardless of project
+    # membership. RECORD_LEVEL (the default) is correct.
     .with_auth(
         [
             AuthBuilder.type(AuthType.OAUTH).oauth(
@@ -188,11 +195,6 @@ _GITLAB_EXECUTOR_MAX_WORKERS = 8
             display_name="Index Code Files",
             filter_type=FilterType.BOOLEAN, category=FilterCategory.INDEXING, default_value=True,
         ))
-        .add_filter_field(FilterField(
-            name=IndexingFilterKey.COMMENTS.value,
-            display_name="Index Comments",
-            filter_type=FilterType.BOOLEAN, category=FilterCategory.INDEXING, default_value=True,
-        ))
         .add_filter_field(CommonFields.enable_manual_sync_filter())
         .with_admin_access_required(True, personal_connector_type="GitLab Personal")
         .with_agent_support(False)
@@ -256,7 +258,7 @@ class GitLabConnector(BaseConnector):
         )
 
         # Helper modules — instantiated once, hold a reference back to self
-        self.runtime = RuntimeHelper(self)
+        self.runtime = self._create_runtime()
         self.scope = ScopeHelper(self)
         self.users = UsersSync(self)
         self.projects = ProjectsSync(self)
@@ -267,6 +269,10 @@ class GitLabConnector(BaseConnector):
         self.attachments = AttachmentsHelper(self)
         self.filters = FiltersHelper(self)
         self.streaming = StreamingHelper(self)
+
+    def _create_runtime(self) -> RuntimeHelper:
+        """EE override point: return EE RuntimeHelper for org-scoped token refresh."""
+        return RuntimeHelper(self)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -485,13 +491,11 @@ class GitLabConnector(BaseConnector):
         connector_id: str,
         scope: str,
         created_by: str,
+        data_entities_processor,
+        **kwargs,
     ) -> "BaseConnector":
         """Factory method to create and return an initialized GitLabConnector."""
-        data_entities_processor = DataSourceEntitiesProcessor(
-            logger, data_store_provider, config_service
-        )
-        await data_entities_processor.initialize()
-        return GitLabConnector(
+        return cls(
             logger, data_entities_processor, data_store_provider,
             config_service, connector_id, scope, created_by,
         )

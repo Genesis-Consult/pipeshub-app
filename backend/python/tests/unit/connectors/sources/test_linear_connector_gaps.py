@@ -35,6 +35,9 @@ def _make_connector() -> LinearConnector:
     dep.on_new_record_groups = AsyncMock()
     dep.on_new_records = AsyncMock()
     dep.reindex_existing_records = AsyncMock()
+    dep.get_placeholder_records = AsyncMock(return_value=[])
+    dep.get_record_by_external_id = AsyncMock(return_value=None)
+    dep.get_record_by_weburl = AsyncMock(return_value=None)
     dsp = MagicMock()
     tx = AsyncMock()
     tx.get_record_by_external_id = AsyncMock(return_value=None)
@@ -684,7 +687,6 @@ class TestContentAndCommentFileChildren:
                 parent_node_id="node-1",
                 parent_record_type=RecordType.TICKET,
                 team_id="team-1",
-                tx_store=conn._tx_store,
             )
 
         conn.data_entities_processor.on_new_records.assert_awaited_once()
@@ -700,7 +702,6 @@ class TestContentAndCommentFileChildren:
             parent_node_id="node-1",
             parent_record_type=RecordType.TICKET,
             team_id="team-1",
-            tx_store=conn._tx_store,
         )
         assert children == []
 
@@ -732,7 +733,6 @@ class TestContentAndCommentFileChildren:
                 issue_node_id="node-1",
                 team_id="team-1",
                 issue_weburl="https://linear.app/issue/ENG-1",
-                tx_store=conn._tx_store,
             )
 
         assert "c1" in result
@@ -854,7 +854,7 @@ class TestSyncAttachmentsEdgeCases:
         conn.sync_filters = None
         conn.indexing_filters = None
         rg, perms = _make_team_rg("team-1")
-        conn._tx_store.get_record_by_external_id = AsyncMock(return_value=None)
+        conn.data_entities_processor.get_record_by_external_id = AsyncMock(return_value=None)
 
         attachments = [
             {"id": "a1", "issue": {"id": "i1", "team": {"id": "other-team"}}},
@@ -879,7 +879,7 @@ class TestSyncAttachmentsEdgeCases:
         rg, perms = _make_team_rg()
         parent = MagicMock()
         parent.id = "parent-node"
-        conn._tx_store.get_record_by_external_id = AsyncMock(return_value=parent)
+        conn.data_entities_processor.get_record_by_external_id = AsyncMock(return_value=parent)
 
         attachment = {
             "id": "attach-1",
@@ -1040,12 +1040,13 @@ class TestSyncAttachmentsExtended:
         related.id = "related-node"
 
         async def lookup(**kwargs):
-            if kwargs.get("external_id") == "issue-1":
+            ext_id = kwargs.get("external_record_id")
+            if ext_id == "issue-1":
                 return parent
             return None
 
-        conn._tx_store.get_record_by_external_id = AsyncMock(side_effect=lookup)
-        conn._tx_store.get_record_by_weburl = AsyncMock(return_value=related)
+        conn.data_entities_processor.get_record_by_external_id = AsyncMock(side_effect=lookup)
+        conn.data_entities_processor.get_record_by_weburl = AsyncMock(return_value=related)
 
         attachment = {
             "id": "attach-1",
@@ -1076,7 +1077,7 @@ class TestSyncAttachmentsExtended:
         rg, perms = _make_team_rg()
         parent = MagicMock()
         parent.id = "parent-node"
-        conn._tx_store.get_record_by_external_id = AsyncMock(return_value=parent)
+        conn.data_entities_processor.get_record_by_external_id = AsyncMock(return_value=parent)
 
         attachment = {
             "id": "attach-1",
@@ -1140,8 +1141,8 @@ class TestSyncDocumentsExtended:
         rg, perms = _make_team_rg()
         parent = MagicMock()
         parent.id = "parent-node"
-        conn._tx_store.get_record_by_external_id = AsyncMock(side_effect=lambda **kw: (
-            parent if kw.get("external_id") == "issue-1" else None
+        conn.data_entities_processor.get_record_by_external_id = AsyncMock(side_effect=lambda **kw: (
+            parent if kw.get("external_record_id") == "issue-1" else None
         ))
 
         doc = {
@@ -1308,7 +1309,6 @@ class TestReindexExtended:
         ))
         parent = MagicMock()
         parent.id = "node-1"
-        conn._tx_store.get_record_by_external_id = AsyncMock(return_value=parent)
 
         with patch.object(conn, "_get_fresh_datasource", new=AsyncMock(return_value=mock_ds)):
             result = await conn._check_and_fetch_updated_record(record)
@@ -1338,7 +1338,7 @@ class TestReindexExtended:
             source_updated_at=1700000000000,
         )
         parent = _ticket_record(id="node-1", external_record_id="iss-1")
-        conn._tx_store.get_record_by_external_id = AsyncMock(return_value=parent)
+        conn.data_entities_processor.get_record_by_external_id = AsyncMock(return_value=parent)
 
         with patch.object(
             conn,
@@ -1423,12 +1423,13 @@ class TestRunSyncFilterLogging:
         )
         conn._fetch_users = AsyncMock(return_value=[])
         conn._fetch_teams = AsyncMock(return_value=([], []))
-        conn._sync_issues_for_teams = AsyncMock()
+        conn._sync_issues_for_teams = AsyncMock(return_value=set())
         conn._sync_attachments = AsyncMock()
         conn._sync_documents = AsyncMock()
         conn._sync_projects_for_teams = AsyncMock()
         conn._sync_deleted_issues = AsyncMock()
         conn._sync_deleted_projects = AsyncMock()
+        conn._sweep_placeholder_records = AsyncMock(return_value=0)
 
         with patch(
             "app.connectors.sources.linear.connector.load_connector_filters",
@@ -1455,7 +1456,7 @@ class TestSyncIndexingFiltersAndErrors:
         rg, perms = _make_team_rg()
         parent = MagicMock()
         parent.id = "parent-node"
-        conn._tx_store.get_record_by_external_id = AsyncMock(return_value=parent)
+        conn.data_entities_processor.get_record_by_external_id = AsyncMock(return_value=parent)
 
         attachment = {
             "id": "attach-1",
@@ -1485,8 +1486,8 @@ class TestSyncIndexingFiltersAndErrors:
         rg, perms = _make_team_rg()
         parent = MagicMock()
         parent.id = "parent-node"
-        conn._tx_store.get_record_by_external_id = AsyncMock(return_value=parent)
-        conn._tx_store.get_record_by_weburl = AsyncMock(side_effect=RuntimeError("db down"))
+        conn.data_entities_processor.get_record_by_external_id = AsyncMock(return_value=parent)
+        conn.data_entities_processor.get_record_by_weburl = AsyncMock(side_effect=RuntimeError("db down"))
 
         attachment = {
             "id": "attach-1",
@@ -1515,7 +1516,7 @@ class TestSyncIndexingFiltersAndErrors:
         rg, perms = _make_team_rg()
         parent = MagicMock()
         parent.id = "parent-node"
-        conn._tx_store.get_record_by_external_id = AsyncMock(return_value=parent)
+        conn.data_entities_processor.get_record_by_external_id = AsyncMock(return_value=parent)
 
         attachment = {
             "id": "attach-bad",
@@ -1562,7 +1563,7 @@ class TestSyncIndexingFiltersAndErrors:
         rg, perms = _make_team_rg()
         parent = MagicMock()
         parent.id = "parent-node"
-        conn._tx_store.get_record_by_external_id = AsyncMock(return_value=parent)
+        conn.data_entities_processor.get_record_by_external_id = AsyncMock(return_value=parent)
 
         doc = {
             "id": "doc-1",
@@ -1593,7 +1594,7 @@ class TestSyncIndexingFiltersAndErrors:
         rg, perms = _make_team_rg()
         parent = MagicMock()
         parent.id = "parent-node"
-        conn._tx_store.get_record_by_external_id = AsyncMock(return_value=parent)
+        conn.data_entities_processor.get_record_by_external_id = AsyncMock(return_value=parent)
 
         doc = {
             "id": "doc-bad",
@@ -2138,7 +2139,7 @@ class TestReindexFullFlows:
             source_updated_at=1700000000000,
         )
         parent = _project_record(id="node-1", external_record_id="proj-1")
-        conn._tx_store.get_record_by_external_id = AsyncMock(return_value=parent)
+        conn.data_entities_processor.get_record_by_external_id = AsyncMock(return_value=parent)
 
         project_data = {
             "id": "proj-1",
@@ -2184,7 +2185,7 @@ class TestReindexFullFlows:
         parent = _ticket_record(id="node-1", external_record_id="iss-1")
         related = MagicMock()
         related.id = "related-node"
-        conn._tx_store.get_record_by_weburl = AsyncMock(return_value=related)
+        conn.data_entities_processor.get_record_by_weburl = AsyncMock(return_value=related)
 
         attach_data = {
             "id": "att-1",
@@ -2305,8 +2306,8 @@ class TestProjectExternalLinksExtended:
         conn = _make_connector()
         conn.indexing_filters = MagicMock()
         conn.indexing_filters.is_enabled = MagicMock(return_value=False)
-        conn._tx_store.get_record_by_external_id = AsyncMock(return_value=None)
-        conn._tx_store.get_record_by_weburl = AsyncMock(side_effect=RuntimeError("lookup failed"))
+        conn.data_entities_processor.get_record_by_external_id = AsyncMock(return_value=None)
+        conn.data_entities_processor.get_record_by_weburl = AsyncMock(side_effect=RuntimeError("lookup failed"))
 
         links = [{
             "id": "link-1",
@@ -2321,7 +2322,6 @@ class TestProjectExternalLinksExtended:
             project_id="proj-1",
             project_node_id="node-1",
             team_id="team-1",
-            tx_store=conn._tx_store,
             create_block_groups=True,
         )
 
@@ -2405,7 +2405,7 @@ class TestCoverageBoostFinal:
         ]
         mock_ds = MagicMock()
         mock_ds.documents = AsyncMock(return_value=_documents_resp(docs))
-        conn._tx_store.get_record_by_external_id = AsyncMock(return_value=None)
+        conn.data_entities_processor.get_record_by_external_id = AsyncMock(return_value=None)
 
         with patch.object(conn, "_get_fresh_datasource", new=AsyncMock(return_value=mock_ds)), patch.object(
             conn, "_get_documents_sync_checkpoint", new=AsyncMock(return_value=None),
@@ -2444,7 +2444,7 @@ class TestCoverageBoostFinal:
         conn = _make_connector()
         conn.indexing_filters = MagicMock()
         conn.indexing_filters.is_enabled = MagicMock(return_value=False)
-        conn._tx_store.get_record_by_external_id = AsyncMock(return_value=None)
+        conn.data_entities_processor.get_record_by_external_id = AsyncMock(return_value=None)
 
         attachments = [{
             "id": "att-1",
@@ -2459,7 +2459,6 @@ class TestCoverageBoostFinal:
             issue_id="iss-1",
             issue_node_id="node-1",
             team_id="team-1",
-            tx_store=conn._tx_store,
         )
 
         assert children
@@ -2469,14 +2468,13 @@ class TestCoverageBoostFinal:
     @pytest.mark.asyncio
     async def test_process_issue_attachments_error_continues(self):
         conn = _make_connector()
-        conn._tx_store.get_record_by_external_id = AsyncMock(side_effect=RuntimeError("db"))
+        conn.data_entities_processor.get_record_by_external_id = AsyncMock(side_effect=RuntimeError("db"))
 
         children = await conn._process_issue_attachments(
             attachments_data=[{"id": "att-bad"}],
             issue_id="iss-1",
             issue_node_id="node-1",
             team_id="team-1",
-            tx_store=conn._tx_store,
         )
 
         assert children == []
@@ -2485,7 +2483,7 @@ class TestCoverageBoostFinal:
     async def test_process_issue_documents_creates_record(self):
         conn = _make_connector()
         conn.indexing_filters = None
-        conn._tx_store.get_record_by_external_id = AsyncMock(return_value=None)
+        conn.data_entities_processor.get_record_by_external_id = AsyncMock(return_value=None)
 
         documents = [{
             "id": "doc-1",
@@ -2501,7 +2499,6 @@ class TestCoverageBoostFinal:
             issue_id="iss-1",
             issue_node_id="node-1",
             team_id="team-1",
-            tx_store=conn._tx_store,
         )
 
         assert children
@@ -2531,7 +2528,6 @@ class TestCoverageBoostFinal:
                 issue_node_id="node-1",
                 team_id="team-1",
                 issue_weburl="https://linear.app/org/issue/ENG-1",
-                tx_store=conn._tx_store,
             )
 
         assert "c1" in result
@@ -2578,7 +2574,7 @@ class TestCoverageBoostFinal:
             url="https://example.com",
             is_public=LinkPublicStatus.UNKNOWN,
         )
-        conn._tx_store.get_record_by_external_id = AsyncMock(return_value=None)
+        conn.data_entities_processor.get_record_by_external_id = AsyncMock(return_value=None)
 
         result = await conn._check_and_fetch_updated_record(record)
         assert result is None
@@ -2638,7 +2634,7 @@ class TestCoverageBoostFinal:
         parent = _project_record(id="node-1", external_record_id="proj-1")
         related = MagicMock()
         related.id = "related-node"
-        conn._tx_store.get_record_by_weburl = AsyncMock(return_value=related)
+        conn.data_entities_processor.get_record_by_weburl = AsyncMock(return_value=related)
 
         project_data = {
             "id": "proj-1",
@@ -2710,7 +2706,7 @@ class TestCoverageBoostFinal:
         }
         parent = MagicMock()
         parent.id = "parent-node"
-        conn._tx_store.get_record_by_external_id = AsyncMock(return_value=parent)
+        conn.data_entities_processor.get_record_by_external_id = AsyncMock(return_value=parent)
         mock_ds = MagicMock()
         mock_ds.documents = AsyncMock(return_value=_documents_resp([doc]))
 

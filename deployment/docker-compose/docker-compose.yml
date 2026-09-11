@@ -47,6 +47,17 @@ services:
         limits:
           # OOM cap only (not reserved). Lower via APP_MEMORY_LIMIT on smaller hosts.
           memory: ${APP_MEMORY_LIMIT:-12G}
+    # Lets the kernel page out memory that a co-located idle service (e.g.
+    # Docling's model weights between documents) is holding but not
+    # actively using, instead of counting it against the hard OOM cap above
+    # forever. memswap_limit is the combined memory+swap ceiling (not a
+    # separate swap allowance), so the 12G/16G defaults give 4G of swap on
+    # top of APP_MEMORY_LIMIT. Keep APP_MEMSWAP_LIMIT >= APP_MEMORY_LIMIT and
+    # raise/lower both together to change the swap budget.
+    # mem_swappiness (per-container swap aggressiveness) is a cgroup v1-only
+    # knob and is silently discarded with a warning on cgroup v2 hosts
+    # (Docker Desktop, modern Linux distros) -- intentionally omitted here.
+    memswap_limit: ${APP_MEMSWAP_LIMIT:-16G}
     shm_size: 2gb
     # 7 services (node, frontend, 5 python) share one container's fd budget;
     # docker's 1024 default hits EMFILE on accept() during startup.
@@ -55,6 +66,21 @@ services:
         soft: 65536
         hard: 65536
     init: true
+    # Compose `${VAR:-}` injects "" when the key is blank. Hub slim still does
+    # int(os.getenv(KEY, default)) and crashes on "". Unset blanks so the key
+    # is absent (slim uses its built-in default; new Python sizes from CPU).
+    # A numeric value in .env is kept as an operator cap.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - >-
+        for k in MAX_CONCURRENT_PARSING MAX_CONCURRENT_INDEXING
+        MAX_PENDING_INDEXING_TASKS EMBEDDING_SERVER_MAX_CONCURRENCY
+        EMBEDDING_BATCH_CONCURRENCY; do
+        v=$$(printenv "$$k" || true);
+        [ -z "$$v" ] && unset "$$k";
+        done;
+        exec /app/process_monitor.sh
     logging:
       driver: local
       options:
@@ -160,19 +186,53 @@ services:
       # ML threading
       - OMP_NUM_THREADS=${OMP_NUM_THREADS:-2}
 
-      # Indexing concurrency
-      - MAX_CONCURRENT_PARSING=${MAX_CONCURRENT_PARSING:-5}
-      - MAX_CONCURRENT_INDEXING=${MAX_CONCURRENT_INDEXING:-7}
-      - MAX_PENDING_INDEXING_TASKS=${MAX_PENDING_INDEXING_TASKS:-40}
+      # HuggingFace Hub offline mode. Leave unset so slim images can download
+      # the embedding model on first use. The dense loader tries the local
+      # cache first; sparse BM25 does the same. Set both to 1 only for
+      # air-gapped hosts that already have models cached (the full `latest` image).
+      - HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-}
+      - TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-}
+
+      # Leave unset so new images size parse/index from CPU. Hub slim int()s
+      # empty strings; entrypoint unsets blanks before start. Set an integer
+      # to cap.
+      - MAX_CONCURRENT_PARSING=${MAX_CONCURRENT_PARSING:-}
+      - MAX_CONCURRENT_INDEXING=${MAX_CONCURRENT_INDEXING:-}
+      # Slots-per-CPU / indexing multiplier (in-tree defaults 1 / 10 / 100).
+      # Empty is safe: Hub slim ignores these; new Python treats empty as unset.
+      - GOVERNOR_HEAVY_PARSE_SLOTS_PER_CPU=${GOVERNOR_HEAVY_PARSE_SLOTS_PER_CPU:-}
+      - GOVERNOR_LIGHT_PARSE_SLOTS_PER_CPU=${GOVERNOR_LIGHT_PARSE_SLOTS_PER_CPU:-}
+      - GOVERNOR_INDEX_SLOTS_PER_PARSE_SLOT=${GOVERNOR_INDEX_SLOTS_PER_PARSE_SLOT:-}
+      # Memory assumed resident per in-flight heavy parse (GiB); sizes the
+      # memory gate that holds heavy parsing below its CPU-derived ceiling.
+      - GOVERNOR_HEAVY_PARSE_WORKING_SET_GB=${GOVERNOR_HEAVY_PARSE_WORKING_SET_GB:-}
+      # Memory the governor should credit to co-located idle services (all 7
+      # run in this one container) rather than to parse/index workload, so a
+      # large resident footprint doesn't hold every pool at its floor. Leave
+      # unset to auto-calibrate from the lowest working set observed; set an
+      # explicit MiB figure when the idle footprint is known. Growth-side
+      # only — the shrink brake always reads true cgroup occupancy.
+      - GOVERNOR_BASELINE_MEMORY_MB=${GOVERNOR_BASELINE_MEMORY_MB:-}
+      - MAX_PENDING_INDEXING_TASKS=${MAX_PENDING_INDEXING_TASKS:-}
       - INDEXING_UVICORN_WORKERS=${INDEXING_UVICORN_WORKERS:-1}
       - PARSING_UVICORN_WORKERS=${PARSING_UVICORN_WORKERS:-1}
       - DOCLING_UVICORN_WORKERS=${DOCLING_UVICORN_WORKERS:-1}
+      # Raising this above 1 gives /stream/record requests more headroom
+      # during a large connector sync, but sync/reindex dedup
+      # (sync_task_manager/reindex_task_manager) is in-memory per worker
+      # process — only raise if concurrent duplicate syncs are acceptable.
+      - CONNECTOR_UVICORN_WORKERS=${CONNECTOR_UVICORN_WORKERS:-1}
       - LOCAL_DOCLING_PARSE_WORKERS=${LOCAL_DOCLING_PARSE_WORKERS:-1}
       - PDF_OCR_DETECTION_WORKERS=${PDF_OCR_DETECTION_WORKERS:-1}
       - MAX_TABLE_ROWS_FOR_LLM=${MAX_TABLE_ROWS_FOR_LLM:-1000}
       - EXCEL_MAX_TABLE_ROWS_TO_INDEX=${EXCEL_MAX_TABLE_ROWS_TO_INDEX:-20000}
       - EXCEL_HEADER_GENERATION_SAMPLE_SCAN_LIMIT=${EXCEL_HEADER_GENERATION_SAMPLE_SCAN_LIMIT:-500}
       - EMBEDDING_SERVER_ALLOW_REMOTE_CODE=${EMBEDDING_SERVER_ALLOW_REMOTE_CODE:-false}
+      - EMBEDDING_SERVER_MAX_CONCURRENCY=${EMBEDDING_SERVER_MAX_CONCURRENCY:-}
+      - EMBEDDING_BATCH_CONCURRENCY=${EMBEDDING_BATCH_CONCURRENCY:-}
+      # Skip per-sentence embeddings unless the block has more than this many
+      # words (default 100). Set 0 to split every multi-sentence block.
+      - EMBED_SENTENCE_MIN_WORDS=${EMBED_SENTENCE_MIN_WORDS:-100}
 
       # Slack bot (optional)
       - SLACK_SIGNING_SECRET=${SLACK_SIGNING_SECRET:-}
@@ -233,11 +293,16 @@ services:
       - "host.docker.internal:host-gateway"
 
     healthcheck:
+      # Gate on the core services only. embedding is intentionally excluded: it
+      # may be absent (not deployed) or sit 'unhealthy' for minutes while it
+      # downloads its model on first run, and it is not required for the app to
+      # be usable. This mirrors the installer's readiness check so `docker ps`
+      # health agrees with what install.sh reports.
       test:
         - CMD-SHELL
         - >
           curl -sf http://localhost:3000/api/v1/health/services -o /tmp/hc.json &&
-          python3 -c "import json,sys; d=json.load(open('/tmp/hc.json')); s=d.get('services',{}) or {}; required=('query','connector','indexing','docling'); sys.exit(0 if all(s.get(k)=='healthy' for k in required) and s.get('embedding') in ('healthy','starting') else 1)"
+          python3 -c "import json,sys; d=json.load(open('/tmp/hc.json')); s=d.get('services',{}) or {}; required=('query','connector','indexing','docling'); sys.exit(0 if all(s.get(k)=='healthy' for k in required) else 1)"
       interval: 15s
       timeout: 10s
       retries: 5
@@ -250,7 +315,6 @@ services:
   mongodb:
     # Pin via MONGO_IMAGE_TAG to recover from host-specific MongoDB 8.x crashes.
     image: mongo:${MONGO_IMAGE_TAG:-8.0.17}
-    container_name: mongodb
     restart: always
     # Shared ~16 GB hosts: WiredTiger otherwise grabs ~half of RAM. Cap cache at
     # 1 GB / container at 2 GB. Sibling deploy.limits (app/graph/vector) are OOM
@@ -279,8 +343,7 @@ services:
       retries: 5
 
   redis:
-    image: redis:bookworm
-    container_name: redis
+    image: redis:7.4-bookworm
     restart: always
     command: >
       sh -c "redis-server
@@ -299,16 +362,18 @@ services:
 
   qdrant:
     image: qdrant/qdrant:v1.15
-    container_name: qdrant
+    stop_grace_period: 120s
     restart: always
     environment:
+      - QDRANT__STORAGE__ON_DISK_PAYLOAD=true
       - QDRANT__SERVICE__API_KEY=${QDRANT_API_KEY:-}
       - QDRANT__SERVICE__MAX_REQUEST_SIZE_MB=64
       - QDRANT__SERVICE__GRPC_PORT=6334
       - QDRANT__SERVICE__HTTP_PORT=6333
-      - QDRANT__STORAGE__PERFORMANCE__MAX_SEARCH_THREADS=0
+      - QDRANT__STORAGE__PERFORMANCE__MAX_SEARCH_THREADS=4
       - QDRANT__STORAGE__OPTIMIZERS__DEFAULT_SEGMENT_NUMBER=8
-      - QDRANT__STORAGE__OPTIMIZERS__MEMMAP_THRESHOLD=50000
+      - QDRANT__STORAGE__OPTIMIZERS__MEMMAP_THRESHOLD=10000  # KB, not points: memory-map any segment over 10 MB
+      - QDRANT__STORAGE__OPTIMIZERS__INDEXING_THRESHOLD_KB=20000
       - QDRANT__STORAGE__WAL__WAL_CAPACITY_MB=256
       - QDRANT__CLUSTER__CONSENSUS__MAX_MESSAGE_QUEUE_SIZE=1000
     volumes:
@@ -317,7 +382,7 @@ services:
       resources:
         limits:
           cpus: '4'
-          memory: 4G
+          memory: 6G
         reservations:
           cpus: '2'
           memory: 2G
@@ -343,7 +408,6 @@ services:
     build:
       context: ../../deployment/sandbox
       dockerfile: Dockerfile
-    container_name: sandbox-image
     restart: "no"
     command: ["sh", "-c", "echo 'sandbox image ready'"]
     networks:
@@ -355,7 +419,6 @@ services:
   arango:
     profiles: ["graph-arango"]
     image: arangodb:3.12.4
-    container_name: arango
     restart: always
     environment:
       - ARANGO_ROOT_PASSWORD=${ARANGO_PASSWORD:-}
@@ -375,7 +438,6 @@ services:
   neo4j:
     profiles: ["graph-neo4j"]
     image: neo4j:5.26.0
-    container_name: neo4j
     restart: always
     environment:
       - NEO4J_AUTH=neo4j/${NEO4J_PASSWORD:-}
@@ -411,7 +473,6 @@ services:
   etcd:
     profiles: ["kv-etcd"]
     image: quay.io/coreos/etcd:v3.5.17
-    container_name: etcd
     restart: always
     command: >
       etcd
@@ -439,7 +500,6 @@ services:
   zookeeper:
     profiles: ["broker-kafka"]
     image: confluentinc/cp-zookeeper:7.9.0
-    container_name: zookeeper
     restart: always
     environment:
       - ZOOKEEPER_CLIENT_PORT=2181
@@ -458,7 +518,6 @@ services:
   kafka-1:
     profiles: ["broker-kafka"]
     image: confluentinc/cp-kafka:7.9.0
-    container_name: kafka-1
     restart: always
     depends_on:
       zookeeper:
@@ -523,4 +582,3 @@ volumes:
 networks:
   pipeshub:
     driver: bridge
-    name: pipeshub-ai_network

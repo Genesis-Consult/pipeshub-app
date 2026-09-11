@@ -31,6 +31,7 @@ from app.models.blocks import (
     Point,
 )
 from app.models.entities import Record, RecordType
+from app.modules.parsers.code_parser.lang_config import config_for_extension, detect_language
 from app.modules.parsers.markdown.markdown_parser import MarkdownParser
 from app.modules.parsers.pdf.docling_processor import DoclingProcessor
 from app.modules.parsers.pdf.ocr_handler import OCRHandler
@@ -86,8 +87,16 @@ def convert_record_dict_to_record(record_dict: dict) -> Record:
         version=record_dict.get("version", 1),
         origin=origin,
         summary_document_id=record_dict.get("summaryDocumentId"),
-        created_at=record_dict.get("createdAtTimestamp"),
-        updated_at=record_dict.get("updatedAtTimestamp"),
+        created_at=(
+            record_dict["createdAtTimestamp"]
+            if record_dict.get("createdAtTimestamp") is not None
+            else get_epoch_timestamp_in_ms()
+        ),
+        updated_at=(
+            record_dict["updatedAtTimestamp"]
+            if record_dict.get("updatedAtTimestamp") is not None
+            else get_epoch_timestamp_in_ms()
+        ),
         source_created_at=record_dict.get("sourceCreatedAtTimestamp"),
         source_updated_at=record_dict.get("sourceLastModifiedTimestamp"),
         weburl=record_dict.get("webUrl"),
@@ -123,6 +132,20 @@ class Processor:
 
         # Initialize Docling client for external service
         self.docling_client = DoclingClient()
+        # Shared local block-builder: parsing (DoclingDocument) is fetched either
+        # from the external Docling service (PDF) or parsed in-process (DOCX/PPTX/OCR),
+        # but block construction (incl. LLM table enrichment) always happens here.
+        self.docling_processor = DoclingProcessor(logger=self.logger, config=self.config_service)
+
+    async def _get_llm_for_role(self, role: str, *, reasoning_effort: str | None = None):
+        """Resolve LLM for a role."""
+        return await get_llm_for_role(
+            self.config_service, role, reasoning_effort=reasoning_effort
+        )
+
+    def _convert_record(self, record_dict: dict) -> Record:
+        """Map a record document to a Record model."""
+        return convert_record_dict_to_record(record_dict)
 
     def _create_transform_context(
         self,
@@ -155,7 +178,7 @@ class Processor:
                 yield PipelineEvent(event=IndexingEvent.INDEXING_COMPLETE, data=PipelineEventData(record_id=record_id))
                 return
 
-            _ , config = await get_llm_for_role(self.config_service, "indexing", reasoning_effort="low")
+            _ , config = await self._get_llm_for_role("indexing", reasoning_effort="low")
             is_multimodal_llm = config.get("isMultimodal")
 
             embedding_config = await get_embedding_model_config(self.config_service)
@@ -200,7 +223,7 @@ class Processor:
                 raise Exception(f"Unsupported extension: {extension}")
 
             block_containers = parser.parse_image(content, extension)
-            record = convert_record_dict_to_record(record)
+            record = self._convert_record(record)
             record.block_containers = block_containers
             record.virtual_record_id = virtual_record_id
 
@@ -292,7 +315,7 @@ class Processor:
                 yield PipelineEvent(event=IndexingEvent.INDEXING_COMPLETE, data=PipelineEventData(record_id=recordId))
                 return
 
-            record = convert_record_dict_to_record(record)
+            record = self._convert_record(record)
             record.block_containers = block_containers
             record.virtual_record_id = virtual_record_id
 
@@ -323,13 +346,17 @@ class Processor:
 
             record_name = recordName if recordName.endswith(".pdf") else f"{recordName}.pdf"
 
-            block_containers = await self.docling_client.process_pdf(record_name, pdf_binary)
-            if block_containers is None:
-                self.logger.error(f"❌ External Docling service failed to process {recordName}")
+            # Phase 1: Parse PDF via the external Docling service (no LLM calls)
+            doc = await self.docling_client.parse_pdf_batched(record_name, pdf_binary)
+            if doc is None:
+                self.logger.error(f"❌ External Docling service failed to parse {recordName}")
                 yield PipelineEvent(event=IndexingEvent.DOCLING_FAILED, data=PipelineEventData(record_id=recordId))
                 return
 
             yield PipelineEvent(event=IndexingEvent.PARSING_COMPLETE, data=PipelineEventData(record_id=recordId))
+
+            # Phase 2: Create blocks locally (involves LLM calls for tables)
+            block_containers = await self.docling_processor.create_blocks(doc)
 
             record = await self.graph_provider.get_document(
                 recordId, CollectionNames.RECORDS.value
@@ -340,7 +367,7 @@ class Processor:
                 yield PipelineEvent(event=IndexingEvent.INDEXING_COMPLETE, data=PipelineEventData(record_id=recordId))
                 return
 
-            record = convert_record_dict_to_record(record)
+            record = self._convert_record(record)
             record.block_containers = block_containers
             record.virtual_record_id = virtual_record_id
 
@@ -430,7 +457,7 @@ class Processor:
 
                 # Phase 1: Parse all pages with Docling (no LLM calls yet)
                 all_conv_results = []
-                processor = DoclingProcessor(logger=self.logger, config=self.config_service)
+                processor = self.docling_processor
 
                 for page in pages:
                     page_number = page.get("page_number")
@@ -490,45 +517,15 @@ class Processor:
                     await asyncio.gather(*page_build_tasks, return_exceptions=True)
                     raise
 
-                all_blocks = []
-                all_block_groups = []
-                block_index_offset = 0
-                block_group_index_offset = 0
-
+                combined_block_containers = BlocksContainer()
                 for page_block_containers in page_block_results:
                     if page_block_containers:
-                        # Adjust block indices to be unique across all pages
-                        for block in page_block_containers.blocks:
-                            block.index = block.index + block_index_offset
-                            if block.parent_index is not None:
-                                block.parent_index = (
-                                    block.parent_index + block_group_index_offset
-                                )
-                            all_blocks.append(block)
+                        combined_block_containers.extend(page_block_containers)
 
-                        for block_group in page_block_containers.block_groups:
-                            block_group.index = (
-                                block_group.index + block_group_index_offset
-                            )
-                            if block_group.parent_index is not None:
-                                block_group.parent_index = (
-                                    block_group.parent_index + block_group_index_offset
-                                )
-                            if block_group.children:
-                                for range_obj in block_group.children.block_ranges:
-                                    range_obj.start += block_index_offset
-                                    range_obj.end += block_index_offset
-                                for range_obj in block_group.children.block_group_ranges:
-                                    range_obj.start += block_group_index_offset
-                                    range_obj.end += block_group_index_offset
-                            all_block_groups.append(block_group)
-
-                        block_index_offset = len(all_blocks)
-                        block_group_index_offset = len(all_block_groups)
-
-                # Create combined BlocksContainer
-                combined_block_containers = BlocksContainer(blocks=all_blocks, block_groups=all_block_groups)
-                self.logger.info(f"📦 Combined {len(all_blocks)} blocks and {len(all_block_groups)} block groups from all pages")
+                self.logger.info(
+                    f"📦 Combined {len(combined_block_containers.blocks)} blocks and "
+                    f"{len(combined_block_containers.block_groups)} block groups from all pages"
+                )
 
                 # Get record and run indexing pipeline
                 record = await self.graph_provider.get_document(recordId, CollectionNames.RECORDS.value)
@@ -537,7 +534,7 @@ class Processor:
                     yield PipelineEvent(event=IndexingEvent.INDEXING_COMPLETE, data=PipelineEventData(record_id=recordId))
                     return
 
-                record = convert_record_dict_to_record(record)
+                record = self._convert_record(record)
                 record.block_containers = combined_block_containers
                 record.virtual_record_id = virtual_record_id
                 record.is_vlm_ocr_processed = True
@@ -615,7 +612,7 @@ class Processor:
                 self.logger.error(f"❌ Record {recordId} not found in database")
                 yield PipelineEvent(event=IndexingEvent.INDEXING_COMPLETE, data=PipelineEventData(record_id=recordId))
                 return
-            record = convert_record_dict_to_record(record)
+            record = self._convert_record(record)
             record.block_containers = BlocksContainer(blocks=blocks, block_groups=block_groups)
             record.virtual_record_id = virtual_record_id
 
@@ -700,7 +697,7 @@ class Processor:
                     yield event
                 return
 
-            processor = DoclingProcessor(logger=self.logger, config=self.config_service)
+            processor = self.docling_processor
 
             # Phase 1: Parse document with Docling (no LLM calls)
             conv_res = await processor.parse_document(recordName, docx_binary)
@@ -721,7 +718,7 @@ class Processor:
                 # Must yield indexing_complete to release indexing semaphore properly
                 yield PipelineEvent(event=IndexingEvent.INDEXING_COMPLETE, data=PipelineEventData(record_id=recordId))
                 return
-            record = convert_record_dict_to_record(record)
+            record = self._convert_record(record)
             record.block_containers = block_containers
             record.virtual_record_id = virtual_record_id
 
@@ -804,7 +801,7 @@ class Processor:
                 return
 
             # Convert to Record entity and attach blocks
-            record = convert_record_dict_to_record(record)
+            record = self._convert_record(record)
             record.block_containers = block_containers
             record.virtual_record_id = virtual_record_id
 
@@ -1329,7 +1326,7 @@ class Processor:
 
         try:
             self.logger.debug("📊 Processing Excel content")
-            llm, _ = await get_llm_for_role(self.config_service, "indexing", reasoning_effort="low")
+            llm, _ = await self._get_llm_for_role("indexing", reasoning_effort="low")
             parser = self.parsers[ExtensionTypes.XLSX.value]
             if not excel_binary:
                 self.logger.info(f"No Excel binary found for record: {recordName}")
@@ -1355,7 +1352,7 @@ class Processor:
                 # Must yield indexing_complete to release indexing semaphore properly
                 yield PipelineEvent(event=IndexingEvent.INDEXING_COMPLETE, data=PipelineEventData(record_id=recordId))
                 return
-            record = convert_record_dict_to_record(record)
+            record = self._convert_record(record)
             record.block_containers = blocks_containers
             record.virtual_record_id = virtual_record_id
 
@@ -1431,7 +1428,7 @@ class Processor:
             else:
                 parser = self.parsers[extension]
 
-            llm, _ = await get_llm_for_role(self.config_service, "indexing", reasoning_effort="low")
+            llm, _ = await self._get_llm_for_role("indexing", reasoning_effort="low")
 
             # Try different encodings to decode binary data
             encodings = ["utf-8", "latin1", "cp1252", "iso-8859-1"]
@@ -1486,7 +1483,7 @@ class Processor:
                 yield PipelineEvent(event=IndexingEvent.PARSING_COMPLETE, data=PipelineEventData(record_id=recordId))
                 yield PipelineEvent(event=IndexingEvent.INDEXING_COMPLETE, data=PipelineEventData(record_id=recordId))
                 return
-            record = convert_record_dict_to_record(record)
+            record = self._convert_record(record)
             record.virtual_record_id = virtual_record_id
 
             # Signal parsing complete after delimited file is parsed (before LLM block creation)
@@ -1623,7 +1620,7 @@ class Processor:
                 self.logger.error(f"❌ Record {recordId} not found in database")
                 yield PipelineEvent(event=IndexingEvent.INDEXING_COMPLETE, data=PipelineEventData(record_id=recordId))
                 return
-            record = convert_record_dict_to_record(record)
+            record = self._convert_record(record)
 
             record.block_containers = block_containers
             record.virtual_record_id = virtual_record_id
@@ -1743,7 +1740,7 @@ class Processor:
                 # Must yield indexing_complete to release indexing semaphore properly
                 yield PipelineEvent(event=IndexingEvent.INDEXING_COMPLETE, data=PipelineEventData(record_id=recordId))
                 return
-            record = convert_record_dict_to_record(record)
+            record = self._convert_record(record)
 
             record.block_containers = block_containers
             record.virtual_record_id = virtual_record_id
@@ -1761,6 +1758,106 @@ class Processor:
             raise
         except Exception as e:
             self.logger.error(f"❌ Error processing Markdown document: {str(e)}")
+            raise DocumentProcessingError(
+                f"Failed to process document: {str(e)}",
+                doc_id=recordId,
+                details={"error": str(e)},
+            ) from e
+
+    async def _lookup_code_file_path(self, record_id: str) -> Optional[str]:
+        """Read filePath from the codeFiles node when the event omits it."""
+        try:
+            doc = await self.graph_provider.get_document(
+                record_id, CollectionNames.CODE_FILES.value
+            )
+            return (doc or {}).get("filePath")
+        except Exception as e:
+            self.logger.warning(f"Could not read filePath for {record_id}: {e}")
+            return None
+
+    async def process_code_document(
+        self, recordName, recordId, code_binary, virtual_record_id, extension=None,
+        file_path: Optional[str] = None,
+        event_type: Optional[str] = None, prev_virtual_record_id: Optional[str] = None
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Process a source file into code blocks, yielding phase events."""
+        self.logger.info(f"🚀 Starting code document processing for record: {recordName}")
+
+        try:
+            if isinstance(code_binary, str):
+                code_binary = code_binary.encode("utf-8")
+
+            record = await self.graph_provider.get_document(
+                recordId, CollectionNames.RECORDS.value
+            )
+            if record is None:
+                self.logger.error(f"❌ Record {recordId} not found in database")
+                yield PipelineEvent(event=IndexingEvent.PARSING_COMPLETE, data=PipelineEventData(record_id=recordId))
+                yield PipelineEvent(event=IndexingEvent.INDEXING_COMPLETE, data=PipelineEventData(record_id=recordId))
+                return
+            record = convert_record_dict_to_record(record)
+
+            # Preserve the repo-relative path so block metadata remains unique
+            # when different directories contain files with the same basename.
+            if not file_path:
+                file_path = await self._lookup_code_file_path(recordId)
+            file_path = file_path or recordName
+            language = detect_language(recordName) or detect_language(file_path)
+            if not language and extension:
+                cfg = config_for_extension(extension)
+                if cfg:
+                    language = cfg.name
+            if not language:
+                self.logger.info(
+                    f"No code grammar for {recordName}; falling back to text parsing"
+                )
+                async for event in self.process_md_document(
+                    recordName=recordName,
+                    recordId=recordId,
+                    md_binary=code_binary.decode("utf-8", errors="replace"),
+                    virtual_record_id=virtual_record_id,
+                    event_type=event_type,
+                    prev_virtual_record_id=prev_virtual_record_id,
+                ):
+                    yield event
+                return
+
+            parser = self.parsers[ExtensionTypes.CODE.value]
+            block_containers = parser.parse_to_blocks(
+                code_binary, recordName, file_path, language
+            )
+
+            if block_containers is None:
+                self.logger.info(
+                    f"Code parser skipped {recordName} (oversized); marking as not supported"
+                )
+                await self._mark_record(recordId, ProgressStatus.FILE_TYPE_NOT_SUPPORTED)
+                yield PipelineEvent(event=IndexingEvent.PARSING_COMPLETE, data=PipelineEventData(record_id=recordId))
+                yield PipelineEvent(event=IndexingEvent.INDEXING_COMPLETE, data=PipelineEventData(record_id=recordId))
+                return
+
+            if not block_containers.blocks and not block_containers.block_groups:
+                await self._mark_record(recordId, ProgressStatus.EMPTY)
+                yield PipelineEvent(event=IndexingEvent.PARSING_COMPLETE, data=PipelineEventData(record_id=recordId))
+                yield PipelineEvent(event=IndexingEvent.INDEXING_COMPLETE, data=PipelineEventData(record_id=recordId))
+                return
+
+            yield PipelineEvent(event=IndexingEvent.PARSING_COMPLETE, data=PipelineEventData(record_id=recordId))
+
+            record.block_containers = block_containers
+            record.virtual_record_id = virtual_record_id
+
+            ctx = self._create_transform_context(record, event_type, prev_virtual_record_id)
+            pipeline = IndexingPipeline(document_extraction=self.document_extraction, sink_orchestrator=self.sink_orchestrator)
+            await pipeline.apply(ctx)
+
+            yield PipelineEvent(event=IndexingEvent.INDEXING_COMPLETE, data=PipelineEventData(record_id=recordId))
+            self.logger.info("✅ Code processing completed successfully")
+            return
+        except IndexingError:
+            raise
+        except Exception as e:
+            self.logger.error(f"❌ Error processing code document: {str(e)}")
             raise DocumentProcessingError(
                 f"Failed to process document: {str(e)}",
                 doc_id=recordId,
@@ -1837,7 +1934,7 @@ class Processor:
             # Initialize PPTX parser
             self.logger.debug("📄 Processing PPTX content")
 
-            processor = DoclingProcessor(logger=self.logger, config=self.config_service)
+            processor = self.docling_processor
 
             # Phase 1: Parse document with Docling (no LLM calls)
             if not recordName.lower().endswith(".pptx"):
@@ -1857,7 +1954,7 @@ class Processor:
                 self.logger.error(f"❌ Record {recordId} not found in database")
                 yield PipelineEvent(event=IndexingEvent.INDEXING_COMPLETE, data=PipelineEventData(record_id=recordId))
                 return
-            record = convert_record_dict_to_record(record)
+            record = self._convert_record(record)
             record.block_containers = block_containers
             record.virtual_record_id = virtual_record_id
 
@@ -1974,7 +2071,7 @@ class Processor:
                     "Record not found in database", doc_id=recordId
                 )
             
-            record = convert_record_dict_to_record(record)
+            record = self._convert_record(record)
             record.block_containers = block_containers
             record.virtual_record_id = virtual_record_id
 
@@ -2048,7 +2145,7 @@ class Processor:
                     "Record not found in database", doc_id=recordId
                 )
 
-            record = convert_record_dict_to_record(record)
+            record = self._convert_record(record)
             record.block_containers = block_containers
             record.virtual_record_id = virtual_record_id
 

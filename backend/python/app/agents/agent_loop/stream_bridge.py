@@ -292,11 +292,15 @@ async def run_agent_loop_stream(
     # direct access to AgentContext — chat_state IS tool_state in AgentContext.
     chat_state["event_sink"] = event_sink
     chat_state["sse_protocol"] = protocol
-    context = AgentContext.from_chat_state(chat_state, event_sink=event_sink, protocol=protocol)
-    # Thread model profile fields from etcd llm_config (passed from the route).
-    context.llm_provider = llm_provider
-    context.context_length = context_length
-    context.is_reasoning_model = is_reasoning_model
+    # Model profile fields from etcd llm_config go in at construction, not
+    # after: `model_post_init` resolves this request's image policy from
+    # `llm_provider`, and a later assignment would leave it on the
+    # unknown-provider default (2 images) while the wire cap used the real one.
+    context = AgentContext.from_chat_state(
+        chat_state, event_sink=event_sink, protocol=protocol,
+        llm_provider=llm_provider, context_length=context_length,
+        is_reasoning_model=is_reasoning_model,
+    )
 
     async def _produce() -> None:
         agent: Any = None
@@ -357,13 +361,28 @@ async def run_agent_loop_stream(
             # (and the user-facing spinner) open unnecessarily.
             await event_sink.flush()
             await queue.put(_DONE)
-            log.info("agent-loop stream: _DONE enqueued, starting cleanup")
+            log.debug("agent-loop stream: _DONE enqueued, starting cleanup")
             await _cancel_orphaned_agent_tasks(agent)
             if context.sandbox_manager is not None:
                 try:
                     await context.sandbox_manager.destroy_all()
                 except Exception:
                     log.warning("agent-loop stream: sandbox cleanup failed", exc_info=True)
+            # Tears down every MCP session `MCPToolProvider`/`MCPToolAdapter`
+            # opened this request (see `mcp_session.py`). Guarded on the cache
+            # dict itself (rather than always constructing a manager) so a
+            # request with no MCP servers attached skips this entirely; the
+            # `MCPSessionManager` constructed here shares the SAME cache dict
+            # via `context.tool_state`, so it tears down the real sessions.
+            if context.tool_state.get("_mcp_client_managers"):
+                try:
+                    from app.agents.agent_loop.mcp_session import MCPSessionManager
+
+                    await MCPSessionManager(context).aclose_all()
+                except Exception:
+                    log.warning("agent-loop stream: MCP session cleanup failed", exc_info=True)
+            await event_sink.flush()
+            await queue.put(_DONE)
 
     producer = asyncio.create_task(_produce())
     heartbeat = asyncio.create_task(_heartbeat(queue)) if protocol == "agui" else None

@@ -133,6 +133,9 @@ _OPTIONAL_PACKAGES = [
     "etcd3",
     "docling",
     "docling_core",
+    "chardet",
+    "talon",
+    "crawl4ai",
     "cv2",
     "spacy",
     "openpyxl",
@@ -161,6 +164,24 @@ _mock_finder.load_module("docling_parse")
 
 for _pkg in _OPTIONAL_PACKAGES:
     _ensure_module(_pkg)
+
+# ``docling`` may be installed as an incomplete stub/namespace (importable root
+# but missing datamodel/document_converter). Force-mock the submodules production
+# code needs so connector/query unit tests can import without a full docling install.
+try:
+    __import__("docling.datamodel.document")
+    __import__("docling.document_converter")
+except Exception:
+    for _dotted in (
+        "docling",
+        "docling.datamodel",
+        "docling.datamodel.document",
+        "docling.document_converter",
+    ):
+        _MOCK_PACKAGE_NAMES.add(_dotted)
+        for _k in [k for k in list(sys.modules) if k == _dotted or k.startswith(_dotted + ".")]:
+            del sys.modules[_k]
+        _mock_finder.load_module(_dotted)
 
 
 # ---------------------------------------------------------------------------
@@ -201,6 +222,19 @@ def _inject_document_stub() -> None:
 
 
 _inject_document_stub()
+
+
+@pytest.fixture(autouse=True)
+def _reset_default_backpressure_coordinator():
+    """ParsingClient/DoclingClient default to a process-wide
+    BackpressureCoordinator singleton when the caller doesn't pass one
+    explicitly (see app.services.messaging.backpressure) — without a reset,
+    a 429 signalled in one test's client would leak a pause into unrelated
+    tests constructed later in the same worker process."""
+    from app.services.messaging.backpressure import set_default_backpressure_coordinator
+    set_default_backpressure_coordinator(None)
+    yield
+    set_default_backpressure_coordinator(None)
 
 
 @pytest.fixture

@@ -1,0 +1,57 @@
+name: Genesis validation
+on:
+  push:
+    branches: ['genesis/**']
+  pull_request:
+    branches: ['genesis/main']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Prepare dependency build environment
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          sudo apt-get update
+          sudo apt-get install -y libmariadb-dev
+          pip install uv
+      - name: Install application and test dependencies
+        working-directory: backend/python
+        run: |
+          uv pip install --system -e .
+          uv pip install --system pytest pytest-asyncio pytest-timeout
+      - name: Test Genesis integrations and affected shared services
+        working-directory: backend/python
+        run: >-
+          pytest tests/unit/connectors/core
+          tests/unit/connectors/sources/test_bookstack*
+          tests/unit/connectors/sources/test_bullhorn_connector.py
+          tests/unit/sources/client/test_bullhorn_client.py
+          tests/unit/events/test_processor*
+          tests/unit/services/graph_db
+          tests/unit/utils/test_docx_preflight.py
+          tests/unit/utils/test_libreoffice_convert.py
+          --tb=short
+  node:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: backend/nodejs/apps
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: backend/nodejs/apps/package-lock.json
+      - run: npm ci
+      - run: npm run build
+      - run: npm test

@@ -19,6 +19,7 @@ import { NodeHandles } from './node-handles';
 import { AgentCoreNode } from './agent-core-node';
 import { ToolsetFlowNode } from './toolset-flow-node';
 import { NODE_TYPES_WITHOUT_INPUT_HANDLES } from './node-constants';
+import { McpFlowNode } from './mcp-flow-node';
 import { FLOW_NODE_CARD, FLOW_NODE_PANEL_BG, FLOW_NODE_WELL, getFlowNodeChrome } from '../flow-theme';
 
 export type FlowNodeProps = {
@@ -116,6 +117,10 @@ export const FlowNode = React.memo(function FlowNode({
     );
   }
 
+  if (data.type.startsWith('mcp-')) {
+    return <McpFlowNode id={id} data={data} selected={selected} readOnly={readOnly} onDelete={onDelete} />;
+  }
+
   const subtitle =
     data.type === 'user-input'
       ? t('agentBuilder.nodeDescUserMessages')
@@ -127,9 +132,9 @@ export const FlowNode = React.memo(function FlowNode({
       ? t('agentBuilder.nodeLabelChatInput')
       : data.type === 'chat-response'
         ? t('agentBuilder.nodeLabelChatOutput')
-        // Model names (e.g. "gpt-5.4-mini") have their own official casing —
+        // Model names (e.g. "gpt-5.6-luna") have their own official casing —
         // normalizeDisplayName's snake_case title-casing would mangle them
-        // (-> "Gpt-5.4-mini"), so show the raw label as-is, same as the
+        // (-> "gpt-5.6-luna"), so show the raw label as-is, same as the
         // Agent node's "Model" chip (agent-core-node.tsx's getModelLabel).
         : NODE_TYPES_WITHOUT_INPUT_HANDLES.LLM_MODELS(data.type)
           ? data.label

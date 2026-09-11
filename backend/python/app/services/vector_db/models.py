@@ -56,24 +56,51 @@ class FilterExpression:
 
 @dataclass
 class VectorChunkMetadata:
-    """Known metadata fields stored on indexed vector points."""
+    """Known metadata fields stored on indexed vector points.
+
+    blockType: mirrors ``app.models.blocks.BlockType`` (e.g. "text", "image",
+        "table_row", "record_summary", "sql_table", "sql_view") — set on every
+        point at indexing time so retrieval can filter/branch on it without
+        sniffing ``page_content`` (e.g. base64 detection). Points written
+        before this field existed simply omit it (``None``); callers must
+        treat ``None`` as "unknown" and fall back to legacy heuristics.
+    isImage: True when the point's dense vector is a native image embedding
+        (i.e. produced by a multimodal embedding provider from raw image
+        bytes) rather than a text embedding of a description. Absent/None on
+        VLM-description-fallback image points, which are text embeddings and
+        should be treated like any other text point for search purposes.
+    """
     orgId: Optional[str] = None
     virtualRecordId: Optional[str] = None
     blockId: Optional[str] = None
     blockIndex: Optional[int] = None
+    blockType: Optional[str] = None
+    isImage: Optional[bool] = None
 
 
 @dataclass
 class VectorChunkPayload:
-    """Typed payload for vector points crossing provider boundaries."""
+    """Typed payload for vector points crossing provider boundaries.
+
+    ``connectorIds`` and ``recordGroupIds`` are VRID-level arrays stored as
+    siblings of ``metadata`` / ``page_content`` so filter-based ``set_payload``
+    can rewrite them without wiping chunk metadata.
+    """
     page_content: str = ""
     metadata: VectorChunkMetadata = field(default_factory=VectorChunkMetadata)
+    connectorIds: List[str] = field(default_factory=list)
+    recordGroupIds: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         meta = {
             k: v for k, v in asdict(self.metadata).items() if v is not None
         }
-        return {"page_content": self.page_content, "metadata": meta}
+        return {
+            "page_content": self.page_content,
+            "metadata": meta,
+            "connectorIds": list(self.connectorIds),
+            "recordGroupIds": list(self.recordGroupIds),
+        }
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "VectorChunkPayload":
@@ -83,8 +110,25 @@ class VectorChunkPayload:
             virtualRecordId=meta_raw.get("virtualRecordId"),
             blockId=meta_raw.get("blockId"),
             blockIndex=meta_raw.get("blockIndex"),
+            blockType=meta_raw.get("blockType"),
+            isImage=meta_raw.get("isImage"),
         )
-        return cls(page_content=data.get("page_content", ""), metadata=metadata)
+        return cls(
+            page_content=data.get("page_content", ""),
+            metadata=metadata,
+            connectorIds=_as_str_list(data.get("connectorIds")),
+            recordGroupIds=_as_str_list(data.get("recordGroupIds")),
+        )
+
+
+def _as_str_list(value: Any) -> List[str]:
+    if not value:
+        return []
+    if isinstance(value, str):
+        return [p.strip() for p in value.split(",") if p.strip()]
+    if isinstance(value, (list, tuple)):
+        return [str(v).strip() for v in value if v is not None and str(v).strip()]
+    return []
 
 
 @dataclass
@@ -164,6 +208,16 @@ class CollectionConfig:
     quantization: QuantizationType = QuantizationType.SCALAR
     hnsw: Optional[HNSWConfig] = None
     mrl: Optional[MRLConfig] = None
+    # Keep bulk structures memory-mapped rather than RAM-resident. Page cache is
+    # reclaimable under a cgroup limit; anonymous memory is not, so pinning these
+    # is what turns a large collection into an OOM kill instead of a slow query.
+    on_disk_vectors: bool = True
+    on_disk_sparse: bool = True
+    on_disk_hnsw: bool = True
+    # The quantized copy is ~1/4 the size of the originals but still scales linearly
+    # with point count (1 byte per dimension per point), so pinning it only fits
+    # small collections. Operators with RAM to spare can set this True for speed.
+    quantization_always_ram: bool = False
 
 
 @dataclass

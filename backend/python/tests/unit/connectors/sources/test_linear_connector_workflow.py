@@ -489,12 +489,13 @@ class TestLinearRunSync:
             ))
 
             # Mock issue/attachment/document/project/deletion syncs
-            connector._sync_issues_for_teams = AsyncMock()
+            connector._sync_issues_for_teams = AsyncMock(return_value=set())
             connector._sync_attachments = AsyncMock()
             connector._sync_documents = AsyncMock()
             connector._sync_projects_for_teams = AsyncMock()
             connector._sync_deleted_issues = AsyncMock()
             connector._sync_deleted_projects = AsyncMock()
+            connector._sweep_placeholder_records = AsyncMock(return_value=0)
 
             await connector.run_sync()
 
@@ -507,6 +508,7 @@ class TestLinearRunSync:
             connector._sync_projects_for_teams.assert_called_once()
             connector._sync_deleted_issues.assert_called_once()
             connector._sync_deleted_projects.assert_called_once()
+            connector._sweep_placeholder_records.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_run_sync_no_users_returns_early(self):
@@ -529,12 +531,13 @@ class TestLinearRunSync:
             connector.init = AsyncMock()
             connector._fetch_users = AsyncMock(return_value=[])
             connector._fetch_teams = AsyncMock(return_value=([], []))
-            connector._sync_issues_for_teams = AsyncMock()
+            connector._sync_issues_for_teams = AsyncMock(return_value=set())
             connector._sync_attachments = AsyncMock()
             connector._sync_documents = AsyncMock()
             connector._sync_projects_for_teams = AsyncMock()
             connector._sync_deleted_issues = AsyncMock()
             connector._sync_deleted_projects = AsyncMock()
+            connector._sweep_placeholder_records = AsyncMock(return_value=0)
 
             await connector.run_sync()
             connector.init.assert_called_once()
@@ -612,10 +615,11 @@ class TestSyncAttachments:
         connector._get_attachments_sync_checkpoint = AsyncMock(return_value=None)
         connector._update_attachments_sync_checkpoint = AsyncMock()
 
-        # Mock parent record
+        # Mock parent record lookup and existing attachment lookup on data_entities_processor
         parent_record = MagicMock()
         parent_record.id = "parent-id"
-        tx.get_record_by_external_id = AsyncMock(side_effect=[parent_record, None])
+        dep.get_record_by_external_id = AsyncMock(side_effect=[parent_record, None])
+        dep.get_record_by_weburl = AsyncMock(return_value=None)
 
         mock_ds = MagicMock()
         attachments = [{
@@ -663,10 +667,10 @@ class TestSyncDocuments:
         connector._get_documents_sync_checkpoint = AsyncMock(return_value=None)
         connector._update_documents_sync_checkpoint = AsyncMock()
 
-        # Mock parent record
+        # Mock parent record and existing doc lookup on data_entities_processor
         parent_record = MagicMock()
         parent_record.id = "parent-id"
-        tx.get_record_by_external_id = AsyncMock(side_effect=[parent_record, None])
+        dep.get_record_by_external_id = AsyncMock(side_effect=[parent_record, None])
 
         mock_ds = MagicMock()
         documents = [{

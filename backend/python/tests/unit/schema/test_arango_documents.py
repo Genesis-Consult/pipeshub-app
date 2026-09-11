@@ -36,6 +36,7 @@ NODE_COLLECTION_SCHEMAS: dict[str, dict] = {
     CollectionNames.AGENT_KNOWLEDGE.value: documents.knowledge_schema,
     CollectionNames.AGENT_TOOLSETS.value: documents.toolset_schema,
     CollectionNames.AGENT_TOOLS.value: documents.tool_schema,
+    CollectionNames.AGENT_MCP_SERVERS.value: documents.mcp_server_schema,
     CollectionNames.TICKETS.value: documents.ticket_record_schema,
     CollectionNames.MEETINGS.value: documents.meeting_record_schema,
     CollectionNames.PROJECTS.value: documents.project_record_schema,
@@ -103,6 +104,10 @@ class TestDocumentSchemaInventory:
             "knowledge_schema",
             "toolset_schema",
             "tool_schema",
+            "mcp_server_schema",
+            "agent_skills_schema",
+            "agent_skill_versions_schema",
+            "agent_skill_candidates_schema",
             "code_file_record_schema",
             "agent_skills_schema",
             "agent_skill_versions_schema",
@@ -201,6 +206,46 @@ class TestRequiredFields:
     def test_user_schema_disallows_extra_properties(self):
         rule = documents.user_schema["rule"]
         assert rule.get("additionalProperties") is False
+
+
+def _valid_app_doc(**extra):
+    doc = {
+        "name": "Drive",
+        "type": "GOOGLE_DRIVE",
+        "appGroup": "Google Workspace",
+        "scope": "personal",
+        "isActive": True,
+        "createdAtTimestamp": 1,
+    }
+    doc.update(extra)
+    return doc
+
+
+class TestAppSchemaVectorMembership:
+    def test_accepts_backfill_fields(self):
+        validator = Draft4Validator(adapt_schema(documents.app_schema))
+        validator.validate(
+            _valid_app_doc(
+                vectorMembershipBackfilled=False,
+                vectorMembershipBackfillAfterKey="rec-1",
+            )
+        )
+        validator.validate(
+            _valid_app_doc(
+                vectorMembershipBackfilled=True,
+                vectorMembershipBackfillAfterKey=None,
+            )
+        )
+
+    def test_backfill_flag_defaults_false(self):
+        flag = documents.app_schema["rule"]["properties"]["vectorMembershipBackfilled"]
+        assert flag["type"] == "boolean"
+        assert flag["default"] is False
+
+    def test_still_rejects_unknown_properties(self):
+        validator = Draft4Validator(adapt_schema(documents.app_schema))
+        with pytest.raises(Exception):
+            validator.validate(_valid_app_doc(notARealAppField=True))
 
 
 # ---------------------------------------------------------------------------

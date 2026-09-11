@@ -888,12 +888,13 @@ async def _generate_chat_stream_via_agent_loop(
     protocol = resolve_protocol(query_info.protocol, request)
 
     try:
-        llm, model_config, ai_models_config = await get_llm_for_chat(
+        llm_bundle = await get_llm_for_chat(
             config_service, query_info.modelKey, query_info.modelName, query_info.chatMode,
             reasoning_effort=query_info.reasoningEffort,
         )
-        if llm is None:
+        if not llm_bundle or llm_bundle[0] is None:
             raise ValueError("Failed to initialize LLM service. LLM configuration is missing.")
+        llm, model_config, ai_models_config = llm_bundle
     except Exception as exc:
         logger_.error(f"Error initializing LLM for chat: {exc}", exc_info=True)
         if protocol == "agui":
@@ -902,6 +903,23 @@ async def _generate_chat_stream_via_agent_loop(
         else:
             yield create_sse_event("error", {"error": str(exc)})
         return
+
+    # Fetch system prompts from dedicated key; fall back to legacy aiModels blob for OSS
+    # deployments that haven't migrated yet.
+    system_prompts_config: dict[str, Any] = {}
+    try:
+        sp_raw = await config_service.get_config(config_node_constants.SYSTEM_PROMPTS.value)
+        if sp_raw:
+            system_prompts_config = sp_raw
+        else:
+            ai_raw = await config_service.get_config(config_node_constants.AI_MODELS.value)
+            if ai_raw:
+                system_prompts_config = {
+                    k: ai_raw[k] for k in ("customSystemPrompt", "customSystemPromptWebSearch", "customSystemPromptAgent")
+                    if k in ai_raw
+                }
+    except Exception:
+        logger_.debug("Could not load system prompts config", exc_info=True)
 
     policy = resolve_chat_mode_policy(query_info.chatMode)
     is_multimodal_llm = bool(model_config.get("isMultimodal"))
@@ -969,7 +987,8 @@ async def _generate_chat_stream_via_agent_loop(
         org_info=org_info,
         model_name=query_info.modelName, model_key=query_info.modelKey,
         is_multimodal_llm=is_multimodal_llm, context_length=context_length,
-        ai_models_config=ai_models_config, protocol=protocol,
+        llm_provider=model_config.get("provider") or "",
+        system_prompts_config=system_prompts_config, protocol=protocol,
         client_name=client_name,
     ):
         yield event
