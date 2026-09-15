@@ -178,6 +178,7 @@ describe('createAGUIEventHandler', () => {
       chunk: '',
       accumulated: body,
       citations: [],
+      confidence: 'High',
     });
   });
 
