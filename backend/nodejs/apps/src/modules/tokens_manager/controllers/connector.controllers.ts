@@ -14,7 +14,6 @@ import { Logger } from '../../../libs/services/logger.service';
 import {
   BadRequestError,
   ConflictError,
-  ForbiddenError,
   InternalServerError,
   NotFoundError,
   UnauthorizedError,
@@ -502,7 +501,7 @@ export const getConnectorInstances =
       if (isActive !== undefined) queryParams.append('isActive', String(isActive));
       if (connectorType !== undefined) queryParams.append('connectorType', String(connectorType));
 
-      logger.info(`Getting connector instances for user ${userId}`);
+      logger.debug(`Getting connector instances for user ${userId}`);
 
       const connectorResponse = await executeConnectorCommand(
         `${appConfig.connectorBackend}/api/v1/connectors/?${queryParams.toString()}`,
@@ -810,7 +809,7 @@ export const getConnectorInstanceConfig =
         throw new BadRequestError('Connector ID is required');
       }
 
-      logger.info(`Getting connector instance config for ${connectorId}`);
+      logger.debug(`Getting connector instance config for ${connectorId}`);
 
       const headers = buildProxyHeaders(req);
 
@@ -1766,73 +1765,34 @@ export const getConnectorStats =
         throw new BadRequestError('Connector ID is required');
       }
 
-      try {
-        // Call the Python service to get record
+      const queryParams = new URLSearchParams();
+      queryParams.append('connector_id', req.params.connectorId);
 
-        const queryParams = new URLSearchParams();
+      const response = await executeConnectorCommand(
+        `${appConfig.connectorBackend}/api/v1/stats?${queryParams.toString()}`,
+        HttpMethod.GET,
+        buildProxyHeaders(req),
+      );
 
-        queryParams.append('org_id', orgId);
-        queryParams.append('connector_id', req.params.connectorId);
+      handleConnectorResponse(
+        response,
+        res,
+        'Getting connector stats',
+        'Connector stats not found',
+      );
 
-        const headers = buildProxyHeaders(req);
-
-        const response = await executeConnectorCommand(
-          `${appConfig.connectorBackend}/api/v1/stats?${queryParams.toString()}`,
-          HttpMethod.GET,
-          headers,
-        );
-
-        if (response.statusCode !== 200) {
-          throw new InternalServerError(
-            'Failed to get connector stats via Python service',
-          );
-        }
-
-        const result = response.data;
-
-        // Log successful retrieval
-        logger.info('Connector stats retrieved successfully', {
-          userId,
-          orgId,
-          requestId: req.context?.requestId,
-        });
-
-        // Send response
-        res.status(200).json(result);
-      } catch (pythonServiceError: any) {
-        logger.error('Error calling Python service for record', {
-          userId,
-          orgId,
-          error: pythonServiceError.message,
-          response: pythonServiceError.response?.data,
-          requestId: req.context?.requestId,
-        });
-
-        // Handle different error types from Python service
-        if (pythonServiceError.response?.status === 403) {
-          throw new ForbiddenError(
-            'You do not have permission to access connector stats',
-          );
-        } else if (pythonServiceError.response?.status === 404) {
-          throw new NotFoundError('No records found or user not found');
-        } else if (pythonServiceError.response?.status === 400) {
-          throw new BadRequestError(
-            pythonServiceError.response?.data?.reason ||
-              'Invalid request parameters',
-          );
-        } else {
-          throw new InternalServerError(
-            `Failed to get connector stats: ${pythonServiceError.message}`,
-          );
-        }
-      }
+      logger.debug('Connector stats retrieved successfully', {
+        userId,
+        orgId,
+        requestId: req.context?.requestId,
+      });
     } catch (error: any) {
       logger.error('Error getting connector stats', {
         connectorId: req.params.connectorId,
         error,
       });
-      next(error);
-      return; // Added return statement
+      next(handleBackendError(error, 'get connector stats'));
+      return;
     }
   };
 

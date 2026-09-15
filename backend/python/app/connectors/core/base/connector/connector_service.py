@@ -14,6 +14,11 @@ from app.connectors.core.base.data_store.data_store import DataStoreProvider
 from app.connectors.core.constants import INTERNAL_CONNECTOR_GROUP_NAME
 from app.connectors.core.interfaces.connector.apps import App, AppGroup
 from app.connectors.core.registry.filters import FilterOptionsResponse
+from app.connectors.core.thread_pool import (
+    SharedConnectorThreadPool,
+    ThreadPoolLease,
+    acquire_connector_lease,
+)
 from app.models.entities import AppUser, AppUserGroup, Record
 from app.models.permission import EntityType, Permission, PermissionType
 from app.services.notification.types import NotificationSeverity, NotificationType, NotificationOrigin, NotificationRecipientRole
@@ -50,8 +55,12 @@ class BaseConnector(ABC):
     scope: str
     created_by: str
     creator_email: Optional[str]
+    last_synced_by: Optional[str]
     _notification_service: NotificationService | None
     _notification_cache: dict[str, tuple[int, int]] = {}
+    # Set by ConnectorFactory after construction, before init(). Connectors built
+    # directly (tests, scripts) fall back to the process-wide pool.
+    _shared_thread_pool: SharedConnectorThreadPool | None = None
 
     def __init__(
         self,
@@ -73,6 +82,10 @@ class BaseConnector(ABC):
         self.connector_id = connector_id
         self.scope = scope
         self.created_by = created_by
+        # User-given instance name from the connector's apps doc (e.g. "Engineering Jira").
+        # Injected post-construction by ConnectorFactory, same as _notification_service.
+        self.connector_instance_name: Optional[str] = None
+        self.last_synced_by: Optional[str] = None
         self.creator_email = None
         # Cached GROUP permission for the pseudo "ConnectorGroup" (see
         # ensure_connector_group_permission). Populated lazily by personal-scope
@@ -83,6 +96,7 @@ class BaseConnector(ABC):
         self._background_tasks: set[asyncio.Task] = set()
         self._resilience: Optional[ResiliencePolicy] = None
         self._resilience_loaded = False
+        self._thread_pool_lease: ThreadPoolLease | None = None
 
     @property
     def connector_metadata(self) -> Dict[str, Any]:
@@ -105,6 +119,38 @@ class BaseConnector(ABC):
             )
             self._resilience_loaded = True
         return self._resilience
+
+    def _thread_lease(self, max_concurrency: int) -> ThreadPoolLease:
+        """This connector's capped share of the shared connector thread pool.
+
+        Acquire from ``init()``, not ``__init__``: the factory injects the pool
+        between construction and initialization.
+        """
+        lease = self._thread_pool_lease
+        if lease is None:
+            lease = acquire_connector_lease(
+                self,
+                max_concurrency,
+                label=f"{self.connector_name}-{self.connector_id}",
+            )
+            self._thread_pool_lease = lease
+        return lease
+
+    async def _release_thread_lease(self) -> None:
+        """Cancel this connector's queued work and await what is in flight.
+
+        The shared pool is deliberately left running — other connectors are using
+        it. The closed lease stays on the connector so a sync racing cleanup()
+        fails loudly instead of silently falling back to the loop's default
+        executor.
+        """
+        lease = self._thread_pool_lease
+        if lease is None:
+            return
+        try:
+            await lease.shutdown_and_drain()
+        except Exception as e:
+            self.logger.warning(f"Thread lease drain raised; ignoring: {e}")
 
     @abstractmethod
     async def init(self) -> bool:
@@ -409,7 +455,10 @@ class BaseConnector(ABC):
             redirect_link = DEFAULT_CONNECTOR_NOTIFICATION_LINK + f"{self.scope}/?connectorType={connector_type}"
 
         if not recipient_user_ids and not recipient_roles:
-            recipient_user_ids = [self.created_by]
+            ids = [self.created_by]
+            if self.last_synced_by and self.last_synced_by != self.created_by:
+                ids.append(self.last_synced_by)
+            recipient_user_ids = ids
 
         async def _run() -> None:
             await svc.publish_notification(

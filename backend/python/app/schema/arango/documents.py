@@ -160,8 +160,11 @@ app_schema = {
             "vectorMembershipBackfillAfterKey": {"type": ["string", "null"]},
             "vectorMembershipBackfillFailures": {"type": ["integer", "null"]},
             "vectorMembershipBackfillAttempts": {"type": ["integer", "null"]},
+            "vectorMembershipBackfillVrids": {"type": ["integer", "null"]},
+            "vectorMembershipBackfillExhausted": {"type": ["boolean", "null"]},
             "createdBy": {"type": ["string", "null"]},
             "updatedBy": {"type": ["string", "null"]},
+            "lastSyncedBy": {"type": ["string", "null"]},
             "createdAtTimestamp": {"type": "number"},
             "updatedAtTimestamp": {"type": "number"},
             "status": {"type": ["string", "null"]},
@@ -228,6 +231,9 @@ record_schema = {
             "isVLMOcrProcessed": {"type": "boolean", "default": False},
             "deletedByUserId": {"type": ["string", "null"]},
             "processingStartedAt": {"type": ["number", "null"]},
+            # Clocks the stranded-record sweep in indexing_main ages rows on.
+            "queuedAtTimestamp": {"type": ["number", "null"]},
+            "lastRepublishedAt": {"type": ["number", "null"]},
             "parsingStatus": {
                 "type": "string",
                 "enum": [

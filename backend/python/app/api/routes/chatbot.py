@@ -24,7 +24,7 @@ from app.agents.chat_modes import resolve_chat_mode_policy, run_chat_stream
 from app.agents.chat_modes.policy import AgentCapabilities, resolve_agent_policy
 from app.api.middlewares.auth import require_scopes
 from app.config.configuration_service import ConfigurationService
-from app.config.constants.service import OAuthScopes, config_node_constants
+from app.config.constants.service import OAuthScopes, TokenScopes, config_node_constants
 from app.config.constants.arangodb import CollectionNames, Connectors
 from app.containers.query import QueryAppContainer
 from app.events.processor import convert_record_dict_to_record
@@ -258,7 +258,9 @@ async def get_model_config(config_service: ConfigurationService, model_key: str 
         return next((config for config in configs if config.get("modelKey") == key), None)
 
     # Get initial config
-    ai_models = await config_service.get_config(config_node_constants.AI_MODELS.value)
+    ai_models = await config_service.get_config(
+        config_node_constants.AI_MODELS.value, use_cache=True,
+    )
     llm_configs = ai_models["llm"]
 
     # Search based on provided parameters
@@ -417,7 +419,51 @@ class _AttachmentSinkNoopVectorStore:
         return True
 
 
-@router.post("/chat/attachments/upload", dependencies=[Depends(require_scopes(OAuthScopes.CONVERSATION_CHAT))])
+async def _rollback_attachment_records(
+    graph_provider: IGraphDBProvider,
+    record_ids: list[str],
+) -> None:
+    """Undo the graph half of an attachment upload that failed partway through.
+
+    Mirrors `delete_chat_attachment`: dropping the RECORDS node takes its
+    IS_OF_TYPE and PERMISSION edges with it, and the FILES node shares the key.
+    Blobs are not reachable from here -- `BlobStorage` exposes no delete, so the
+    normal delete path leaks them too.
+
+    Each collection is attempted independently so a failure on one still cleans
+    the other. Both go through `delete_nodes_and_edges` rather than the cheaper
+    `delete_nodes` the delete route uses for FILES: that route only reaches FILES
+    once RECORDS cleanup has already taken the isOfType edge, whereas here FILES
+    can be deleted while the edge is still live, and on Arango `delete_nodes`
+    leaves edges behind (on Neo4j both are the same DETACH DELETE).
+
+    Best-effort: a failure here must not replace the error that triggered it.
+    """
+    if not record_ids:
+        return
+    for collection in (CollectionNames.RECORDS.value, CollectionNames.FILES.value):
+        try:
+            await graph_provider.delete_nodes_and_edges(record_ids, collection)
+        except Exception:
+            logger.exception(
+                "Failed to roll back partially uploaded attachments from %s; "
+                "records may be orphaned: %s",
+                collection,
+                record_ids,
+            )
+
+
+@router.post(
+    "/chat/attachments/upload",
+    dependencies=[
+        Depends(
+            require_scopes(
+                OAuthScopes.CONVERSATION_CHAT,
+                service_scopes=(TokenScopes.CONVERSATION_CREATE,),
+            )
+        )
+    ],
+)
 @inject
 async def upload_chat_attachments(
     request: Request,
@@ -627,77 +673,87 @@ async def upload_chat_attachments(
             }
         )
 
-    await graph_provider.batch_upsert_nodes(record_docs, CollectionNames.RECORDS.value)
-    await graph_provider.batch_upsert_nodes(file_docs, CollectionNames.FILES.value)
+    # Records, files, edges and the sink's blob write are five separate round
+    # trips with no shared transaction, so a failure partway leaves a record the
+    # user can neither see nor delete. Undo the graph writes before surfacing it.
+    try:
+        await graph_provider.batch_upsert_nodes(record_docs, CollectionNames.RECORDS.value)
+        await graph_provider.batch_upsert_nodes(file_docs, CollectionNames.FILES.value)
 
-    ts = get_epoch_timestamp_in_ms()
-    is_of_type_edges = [
-        {
-            "_from": f"{CollectionNames.RECORDS.value}/{rd['_key']}",
-            "_to": f"{CollectionNames.FILES.value}/{rd['_key']}",
-            "createdAtTimestamp": ts,
-            "updatedAtTimestamp": ts,
-        }
-        for rd in record_docs
-    ]
-    await graph_provider.batch_create_edges(is_of_type_edges, CollectionNames.IS_OF_TYPE.value)
-    if is_service_account:
-        # Service accounts have no user graph node, so no USER -> RECORD edge
-        # can be created. Grant an org-scoped permission edge instead so the
-        # uploaded file is readable org-wide through the standard ACL path
-        # (orgAccessPermissionEdge in check_record_access_with_details).
-        permission_edges = [
+        ts = get_epoch_timestamp_in_ms()
+        is_of_type_edges = [
             {
-                "from_id": org_id,
-                "from_collection": CollectionNames.ORGS.value,
-                "to_id": rd["_key"],
-                "to_collection": CollectionNames.RECORDS.value,
-                "type": "ORGANIZATION",
-                "role": "READER",
+                "_from": f"{CollectionNames.RECORDS.value}/{rd['_key']}",
+                "_to": f"{CollectionNames.FILES.value}/{rd['_key']}",
                 "createdAtTimestamp": ts,
                 "updatedAtTimestamp": ts,
             }
             for rd in record_docs
         ]
-        await graph_provider.batch_create_edges(permission_edges, CollectionNames.PERMISSION.value)
-    else:
-        permission_edges = [
-            {
-                "from_id": user_key,
-                "from_collection": CollectionNames.USERS.value,
-                "to_id": rd["_key"],
-                "to_collection": CollectionNames.RECORDS.value,
-                "type": "USER",
-                "role": "OWNER",
-                "createdAtTimestamp": ts,
-                "updatedAtTimestamp": ts,
-            }
-            for rd in record_docs
-        ]
-        await graph_provider.batch_create_edges(permission_edges, CollectionNames.PERMISSION.value)
+        await graph_provider.batch_create_edges(is_of_type_edges, CollectionNames.IS_OF_TYPE.value)
+        if is_service_account:
+            # Service accounts have no user graph node, so no USER -> RECORD edge
+            # can be created. Grant an org-scoped permission edge instead so the
+            # uploaded file is readable org-wide through the standard ACL path
+            # (orgAccessPermissionEdge in check_record_access_with_details).
+            permission_edges = [
+                {
+                    "from_id": org_id,
+                    "from_collection": CollectionNames.ORGS.value,
+                    "to_id": rd["_key"],
+                    "to_collection": CollectionNames.RECORDS.value,
+                    "type": "ORGANIZATION",
+                    "role": "READER",
+                    "createdAtTimestamp": ts,
+                    "updatedAtTimestamp": ts,
+                }
+                for rd in record_docs
+            ]
+            await graph_provider.batch_create_edges(permission_edges, CollectionNames.PERMISSION.value)
+        else:
+            permission_edges = [
+                {
+                    "from_id": user_key,
+                    "from_collection": CollectionNames.USERS.value,
+                    "to_id": rd["_key"],
+                    "to_collection": CollectionNames.RECORDS.value,
+                    "type": "USER",
+                    "role": "OWNER",
+                    "createdAtTimestamp": ts,
+                    "updatedAtTimestamp": ts,
+                }
+                for rd in record_docs
+            ]
+            await graph_provider.batch_create_edges(permission_edges, CollectionNames.PERMISSION.value)
 
-    sink_orchestrator = SinkOrchestrator(
-        graphdb=graphdb,
-        blob_storage=blob_storage,
-        vector_store=_AttachmentSinkNoopVectorStore(),
-        graph_provider=graph_provider,
-        logger=service_logger,
-    )
-
-    for record_doc in record_docs:
-        record_id = record_doc.get("_key") or record_doc.get("id")
-        block_containers = parsed_blocks_by_record.get(record_id)
-        if block_containers is None:
-            continue
-
-        record = convert_record_dict_to_record(record_doc)
-        record.block_containers = block_containers
-        record.virtual_record_id = record_doc.get("virtualRecordId")
-        ctx = TransformContext(
-            record=record,
-            settings={"sink_only": True, "skip_vector_store": True},
+        sink_orchestrator = SinkOrchestrator(
+            graphdb=graphdb,
+            blob_storage=blob_storage,
+            vector_store=_AttachmentSinkNoopVectorStore(),
+            graph_provider=graph_provider,
+            logger=service_logger,
+            config_service=config_service,
         )
-        await sink_orchestrator.index(ctx)
+
+        for record_doc in record_docs:
+            record_id = record_doc.get("_key") or record_doc.get("id")
+            block_containers = parsed_blocks_by_record.get(record_id)
+            if block_containers is None:
+                continue
+
+            record = convert_record_dict_to_record(record_doc)
+            record.block_containers = block_containers
+            record.virtual_record_id = record_doc.get("virtualRecordId")
+            ctx = TransformContext(
+                record=record,
+                settings={"sink_only": True, "skip_vector_store": True},
+            )
+            await sink_orchestrator.index(ctx)
+    except Exception:
+        await _rollback_attachment_records(
+            graph_provider, [rd["_key"] for rd in record_docs]
+        )
+        raise
 
     return {
         "conversationId": payload.conversationId,
@@ -861,6 +917,47 @@ async def delete_chat_attachment(
     )
 
 
+async def _load_user_doc(graph_provider: IGraphDBProvider, user_id: str | None) -> dict | None:
+    """Deferred so the graph call happens inside the coroutine, not when the
+    task is created — enrichment is best-effort and its failures are handled
+    by the caller's `gather(..., return_exceptions=True)`."""
+    if not user_id:
+        return None
+    return await graph_provider.get_user_by_user_id(user_id)
+
+
+async def _load_org_doc(graph_provider: IGraphDBProvider, org_id: str | None) -> dict | None:
+    """See :func:`_load_user_doc`."""
+    if not org_id:
+        return None
+    return await graph_provider.get_document(org_id, CollectionNames.ORGS.value)
+
+
+async def load_system_prompts(
+    config_service: ConfigurationService, logger_: Any,
+) -> dict[str, Any]:
+    """System prompts from the dedicated key, falling back to the legacy
+    aiModels blob for OSS deployments that haven't migrated yet."""
+    try:
+        sp_raw = await config_service.get_config(
+            config_node_constants.SYSTEM_PROMPTS.value, use_cache=True,
+        )
+        if sp_raw:
+            return sp_raw
+        ai_raw = await config_service.get_config(
+            config_node_constants.AI_MODELS.value, use_cache=True,
+        )
+        if ai_raw:
+            return {
+                k: ai_raw[k]
+                for k in ("customSystemPrompt", "customSystemPromptWebSearch", "customSystemPromptAgent")
+                if k in ai_raw
+            }
+    except Exception:
+        logger_.debug("Could not load system prompts config", exc_info=True)
+    return {}
+
+
 async def _generate_chat_stream_via_agent_loop(
     request: Request,
     query_info: "ChatQuery",
@@ -887,15 +984,28 @@ async def _generate_chat_stream_via_agent_loop(
     user_id = user.get("userId")
     protocol = resolve_protocol(query_info.protocol, request)
 
-    try:
-        llm_bundle = await get_llm_for_chat(
+    # LLM init, system prompts and user/org enrichment are independent of each
+    # other and all sit before the first streamed byte, so they run as one wave
+    # instead of four serial round trips.
+    llm_task = asyncio.ensure_future(
+        get_llm_for_chat(
             config_service, query_info.modelKey, query_info.modelName, query_info.chatMode,
             reasoning_effort=query_info.reasoningEffort,
         )
+    )
+    prompts_task = asyncio.ensure_future(load_system_prompts(config_service, logger_))
+    user_doc_task = asyncio.ensure_future(_load_user_doc(graph_provider, user_id))
+    org_doc_task = asyncio.ensure_future(_load_org_doc(graph_provider, org_id))
+
+    try:
+        llm_bundle = await llm_task
         if not llm_bundle or llm_bundle[0] is None:
             raise ValueError("Failed to initialize LLM service. LLM configuration is missing.")
         llm, model_config, ai_models_config = llm_bundle
     except Exception as exc:
+        for pending in (prompts_task, user_doc_task, org_doc_task):
+            pending.cancel()
+        await asyncio.gather(prompts_task, user_doc_task, org_doc_task, return_exceptions=True)
         logger_.error(f"Error initializing LLM for chat: {exc}", exc_info=True)
         if protocol == "agui":
             evt = frame(AGUIEventType.RUN_ERROR, message=str(exc), code="llm_initialization_failed")
@@ -904,22 +1014,7 @@ async def _generate_chat_stream_via_agent_loop(
             yield create_sse_event("error", {"error": str(exc)})
         return
 
-    # Fetch system prompts from dedicated key; fall back to legacy aiModels blob for OSS
-    # deployments that haven't migrated yet.
-    system_prompts_config: dict[str, Any] = {}
-    try:
-        sp_raw = await config_service.get_config(config_node_constants.SYSTEM_PROMPTS.value)
-        if sp_raw:
-            system_prompts_config = sp_raw
-        else:
-            ai_raw = await config_service.get_config(config_node_constants.AI_MODELS.value)
-            if ai_raw:
-                system_prompts_config = {
-                    k: ai_raw[k] for k in ("customSystemPrompt", "customSystemPromptWebSearch", "customSystemPromptAgent")
-                    if k in ai_raw
-                }
-    except Exception:
-        logger_.debug("Could not load system prompts config", exc_info=True)
+    system_prompts_config: dict[str, Any] = await prompts_task
 
     policy = resolve_chat_mode_policy(query_info.chatMode)
     is_multimodal_llm = bool(model_config.get("isMultimodal"))
@@ -960,23 +1055,29 @@ async def _generate_chat_stream_via_agent_loop(
     }
 
     org_info: dict[str, Any] | None = None
-    try:
-        user_doc = await graph_provider.get_user_by_user_id(user_id) if user_id else None
-        if user_doc and isinstance(user_doc, dict):
-            for field in ("fullName", "firstName", "lastName", "displayName"):
-                if user_doc.get(field):
-                    user_info[field] = user_doc[field]
-        if org_id:
-            org_doc = await graph_provider.get_document(org_id, CollectionNames.ORGS.value)
-            if org_doc and isinstance(org_doc, dict):
-                raw_account_type = str(org_doc.get("accountType", "")).lower()
-                org_info = {
-                    "orgId": org_id,
-                    "accountType": raw_account_type if raw_account_type in ("enterprise", "individual") else "",
-                    "name": org_doc.get("name") or "",
-                }
-    except Exception:
-        logger_.debug("Failed to enrich user/org context for prompt", exc_info=True)
+    user_doc, org_doc = await asyncio.gather(
+        user_doc_task, org_doc_task, return_exceptions=True,
+    )
+    if isinstance(user_doc, BaseException):
+        logger_.debug("Failed to load user doc for prompt enrichment", exc_info=user_doc)
+    elif user_doc and isinstance(user_doc, dict):
+        for field in ("fullName", "firstName", "lastName", "displayName"):
+            if user_doc.get(field):
+                user_info[field] = user_doc[field]
+        # Reused by `_fetch_available_connectors` (chat_modes/bridge.py) so
+        # the same user lookup is not repeated further down the request.
+        user_key = user_doc.get("_key") or user_doc.get("id")
+        if user_key:
+            user_info["userKey"] = user_key
+    if isinstance(org_doc, BaseException):
+        logger_.debug("Failed to load org doc for prompt enrichment", exc_info=org_doc)
+    elif org_doc and isinstance(org_doc, dict):
+        raw_account_type = str(org_doc.get("accountType", "")).lower()
+        org_info = {
+            "orgId": org_id,
+            "accountType": raw_account_type if raw_account_type in ("enterprise", "individual") else "",
+            "name": org_doc.get("name") or "",
+        }
 
     client_name = request.headers.get("client-name")
 

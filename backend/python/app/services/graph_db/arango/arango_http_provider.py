@@ -126,7 +126,10 @@ from app.schema.arango.edges import (
 from app.schema.arango.graph import EDGE_DEFINITIONS
 from app.services.graph_db.arango.arango_http_client import ArangoHTTPClient
 from app.services.graph_db.common.utils import build_connector_stats_response, dedupe_agents_by_id
-from app.services.graph_db.interface.graph_db_provider import IGraphDBProvider
+from app.services.graph_db.interface.graph_db_provider import (
+    IGraphDBProvider,
+    _distinct_connector_types,
+)
 from app.services.graph_db.vector_membership_queries import (
     build_app_needing_vector_membership_backfill_aql,
     build_page_records_for_vector_membership_backfill_aql,
@@ -1655,20 +1658,25 @@ class ArangoHTTPProvider(IGraphDBProvider):
             return []
         coll = CollectionNames.RECORDS.value
         try:
-            # FILTER + UPDATE in one statement; a read-then-write would let the
-            # indexing service advance a record in between and get clobbered.
-            query = """
-            FOR doc IN @@collection
-                FILTER doc._key IN @keys AND doc.indexingStatus == @expected
-                UPDATE doc WITH { indexingStatus: @new_status } IN @@collection
-                RETURN NEW._key
-            """
             bind_vars = {
                 "@collection": coll,
                 "keys": unique_ids,
                 "expected": expected,
                 "new_status": new_status,
             }
+            update_fields = "{ indexingStatus: @new_status }"
+            if new_status == ProgressStatus.QUEUED.value:
+                # AQL rejects a declared-but-unused bind var, so only bind it here.
+                update_fields = "{ indexingStatus: @new_status, queuedAtTimestamp: @now }"
+                bind_vars["now"] = get_epoch_timestamp_in_ms()
+            # FILTER + UPDATE in one statement; a read-then-write would let the
+            # indexing service advance a record in between and get clobbered.
+            query = f"""
+            FOR doc IN @@collection
+                FILTER doc._key IN @keys AND doc.indexingStatus == @expected
+                UPDATE doc WITH {update_fields} IN @@collection
+                RETURN NEW._key
+            """
             updated = await self.http_client.execute_aql(query, bind_vars, transaction)
             updated_keys = [k for k in (updated or []) if isinstance(k, str)]
             self.logger.debug(
@@ -4583,7 +4591,48 @@ class ArangoHTTPProvider(IGraphDBProvider):
                 "❌ Failed to retrieve child records for parent %s %s: %s",
                 connector_id, parent_external_record_id, str(e)
             )
-            return []
+            raise
+
+    async def get_records_by_record_type(
+        self,
+        connector_id: str,
+        record_type: str,
+        transaction: str | None = None,
+    ) -> list[Record]:
+        """Return this connector's records of ``record_type``."""
+        try:
+            self.logger.debug(
+                "Retrieving records of type %s for connector %s",
+                record_type, connector_id,
+            )
+            query = f"""
+            FOR record IN {CollectionNames.RECORDS.value}
+                FILTER record.connectorId == @connector_id
+                    AND record.recordType == @record_type
+                RETURN record
+            """
+            bind_vars = {
+                "connector_id": connector_id,
+                "record_type": record_type,
+            }
+            results = await self.http_client.execute_aql(
+                query, bind_vars, txn_id=transaction
+            )
+            records = [
+                Record.from_arango_base_record(self._translate_node_from_arango(result))
+                for result in results
+            ]
+            self.logger.debug(
+                "Retrieved %d record(s) of type %s for connector %s",
+                len(records), record_type, connector_id,
+            )
+            return records
+        except Exception as e:
+            self.logger.error(
+                "Failed to retrieve records of type %s for connector %s: %s",
+                record_type, connector_id, e,
+            )
+            raise
 
     async def get_record_group_by_external_id(
         self,
@@ -8769,7 +8818,8 @@ class ArangoHTTPProvider(IGraphDBProvider):
                     "deleted_edges_count": deleted_edges,
                     "deleted_isoftype_targets_count": deleted_isoftype,
                     "virtual_record_ids": collected["virtual_record_ids"],
-                    "connector_id": connector_id
+                    "connector_id": connector_id,
+                    "connector_name": connector.get("type"),
                 }
 
             except Exception as tx_error:
@@ -12269,19 +12319,20 @@ class ArangoHTTPProvider(IGraphDBProvider):
         record_ids: list[str],
         connector_id: str,
         transaction: str | None = None,
+        cascade_children: bool = True,
     ) -> dict:
-        """Delete records (files, folders, or any type) and ALL their containment
-        descendants — the single generic recursive delete for KB and connectors.
+        """Delete records and their owned descendants, scoped by connector_id.
 
-        A folder is just a record with PARENT_CHILD children, so there is no folder/file
-        special-casing: each root id is deleted together with its whole containment subtree
-        (reached via PARENT_CHILD + ATTACHMENT edges; reference edges like BLOCKS/RELATED
-        are cleaned but never traversed). Roots are scoped by ``connectorId == @connector_id``
-        (for a KB, connector_id == kb_id). All edges touching the deleted records are swept
-        dynamically (so inheritPermissions/permissions/entityRelations go too), the isOfType
-        type docs are removed from whatever collection they live in, and a ``deleteRecord``
-        event is emitted per record that carries a ``virtualRecordId`` (Qdrant cleanup),
-        with connectorName/origin taken from the record.
+        When *cascade_children* is True (default), traverses both PARENT_CHILD and
+        ATTACHMENT edges — deleting an entire containment subtree.  When False, only
+        ATTACHMENT edges are traversed so child records linked via PARENT_CHILD
+        survive (e.g. stories under a deleted epic). Survivors that still point at a
+        deleted root via ``externalParentId`` have that field cleared to null, but
+        only when they already ``BELONGS_TO`` a RecordGroup (required browse guard).
+
+        All edges touching the deleted nodes are swept regardless of
+        *cascade_children*, type docs removed, and a deleteRecord event emitted per
+        record that carries a virtualRecordId (Qdrant cleanup).
         """
         try:
             if not record_ids:
@@ -12299,6 +12350,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                     write=edge_collections + node_collections,
                 )
             try:
+                traversal_types = "['PARENT_CHILD', 'ATTACHMENT']" if cascade_children else "['ATTACHMENT']"
                 inventory_query = """
                 LET valid_roots = (
                     FOR rid IN @record_ids
@@ -12310,7 +12362,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                 LET all_records = (
                     FOR root IN valid_roots
                         FOR v, e, p IN 0..20 OUTBOUND root._id @@record_relations
-                            FILTER LENGTH(p.edges) == 0 OR p.edges[-1].relationshipType IN ['PARENT_CHILD', 'ATTACHMENT']
+                            FILTER LENGTH(p.edges) == 0 OR p.edges[-1].relationshipType IN """ + traversal_types + """
                             RETURN DISTINCT v
                 )
                 LET records_with_type = (
@@ -12348,6 +12400,46 @@ class ArangoHTTPProvider(IGraphDBProvider):
                     {"record_id": rid, "reason": "Validation failed"}
                     for rid in record_ids if rid not in valid_root_keys
                 ]
+
+                if not cascade_children and valid_root_keys:
+                    valid_root_key_set = set(valid_root_keys)
+                    parent_external_ids: list[str] = []
+                    seen_parent_ids: set[str] = set()
+                    for rt in records_with_type:
+                        rec = rt.get("record") or {}
+                        if rec.get("_key") not in valid_root_key_set:
+                            continue
+                        peid = rec.get("externalRecordId")
+                        if not peid or peid in seen_parent_ids:
+                            continue
+                        seen_parent_ids.add(peid)
+                        parent_external_ids.append(peid)
+                    if parent_external_ids:
+                        clear_orphan_parent_query = f"""
+                        FOR rec IN @@records
+                            FILTER rec.connectorId == @connector_id
+                            FILTER rec.externalParentId != null
+                            FILTER rec.externalParentId IN @parent_external_ids
+                            FILTER rec._key NOT IN @deleted_keys
+                            FILTER LENGTH(
+                                FOR rg IN 1..1 OUTBOUND rec._id @@belongs_to
+                                    FILTER IS_SAME_COLLECTION("{CollectionNames.RECORD_GROUPS.value}", rg)
+                                    LIMIT 1
+                                    RETURN 1
+                            ) > 0
+                            UPDATE rec WITH {{ externalParentId: null }} IN @@records
+                        """
+                        await self.execute_query(
+                            clear_orphan_parent_query,
+                            bind_vars={
+                                "connector_id": connector_id,
+                                "parent_external_ids": parent_external_ids,
+                                "deleted_keys": record_keys,
+                                "@records": CollectionNames.RECORDS.value,
+                                "@belongs_to": CollectionNames.BELONGS_TO.value,
+                            },
+                            transaction=txn_id,
+                        )
 
                 node_ids = [f"records/{k}" for k in record_keys]
                 if node_ids:
@@ -15042,7 +15134,11 @@ class ArangoHTTPProvider(IGraphDBProvider):
                 bind_vars["parent_doc_id"] = parent_doc_id
             elif parent_type == "app":
                 bind_vars["parent_id"] = parent_id
-                bind_vars["parent_doc_id"] = parent_id
+                # @parent_doc_id is only referenced when depth >= 2
+                # (_build_children_intersection_aql). Binding it otherwise is
+                # Arango 1552 (undeclared bind parameter).
+                if depth is not None and depth >= 2:
+                    bind_vars["parent_doc_id"] = parent_id
 
         # Merge filter params
         bind_vars.update(filter_params)
@@ -16133,6 +16229,12 @@ class ArangoHTTPProvider(IGraphDBProvider):
             # Get user's accessible apps and extract connector IDs (_key)
             # Note: _get_user_app_ids accepts external userId and converts to user_key internally
             user_apps_ids = await self._get_user_app_ids(user_id, org_id)
+
+            # Get record to verify it exists before running complex query
+            record_doc = await self.get_document(record_id, CollectionNames.RECORDS.value, transaction)
+            if not record_doc:
+                self.logger.warning(f"⚠️ Record not found: {record_id}")
+                return None
 
             # Build app record filter for connector records
             app_record_filter = 'FILTER record.origin != "CONNECTOR" OR record.connectorId IN @user_apps_ids'
@@ -18548,17 +18650,22 @@ class ArangoHTTPProvider(IGraphDBProvider):
         self,
         record_key: str,
         md5_checksum: str,
+        org_id: str,
         record_type: str | None = None,
         size_in_bytes: int | None = None,
-        transaction: str | None = None
+        transaction: str | None = None,
     ) -> list[dict]:
         """
-        Find duplicate records based on MD5 checksum.
+        Find duplicate records based on MD5 checksum, scoped to a single org.
         This method queries the RECORDS collection and works for all record types.
+
+        Deliberately not filtered by connector — see interface docstring.
+        Always filtered by org — see interface docstring.
 
         Args:
             record_key (str): The key of the current record to exclude from results
             md5_checksum (str): MD5 checksum of the record content
+            org_id (str): Restrict dedup matching to this org only
             record_type (Optional[str]): Optional record type to filter by
             size_in_bytes (Optional[int]): Optional file size in bytes to filter by
             transaction (Optional[str]): Optional transaction ID
@@ -18576,11 +18683,13 @@ class ArangoHTTPProvider(IGraphDBProvider):
             FOR record IN {CollectionNames.RECORDS.value}
                 FILTER record.md5Checksum == @md5_checksum
                 AND record._key != @record_key
+                AND record.orgId == @org_id
             """
 
             bind_vars = {
                 "md5_checksum": md5_checksum,
                 "record_key": record_key,
+                "org_id": org_id,
             }
 
             if record_type:
@@ -18661,6 +18770,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
 
             md5_checksum = ref_record.get("md5Checksum")
             size_in_bytes = ref_record.get("sizeInBytes")
+            org_id = ref_record.get("orgId")
 
             if not md5_checksum:
                 # Expected, not a fault: duplicates are matched by md5Checksum
@@ -18689,6 +18799,14 @@ class ArangoHTTPProvider(IGraphDBProvider):
                 AND record.sizeInBytes == @size_in_bytes
                 """
                 bind_vars["size_in_bytes"] = size_in_bytes
+
+            # Scoped to the reference record's own org: a queued duplicate in
+            # another org must never be silently indexed from this org's event.
+            if org_id:
+                query += """
+                AND record.orgId == @org_id
+                """
+                bind_vars["org_id"] = org_id
 
             query += """
                 LIMIT 1
@@ -19264,6 +19382,33 @@ class ArangoHTTPProvider(IGraphDBProvider):
             self.logger.error(f"Failed to get KB virtual IDs: {e}", exc_info=True)
             return {}
 
+    async def get_accessible_connector_types(
+        self,
+        user_id: str,
+        org_id: str,
+    ) -> list[str]:
+        """See ``IGraphDBProvider.get_accessible_connector_types``.
+
+        Built on ``get_user_apps`` rather than a new AQL query: the app
+        documents already carry ``type``, and reusing the traversal that
+        permission checks depend on keeps one definition of "apps this user can
+        reach" instead of two that can drift apart.
+        """
+        try:
+            user = await self.get_user_by_user_id(user_id)
+            if not user:
+                return []
+            user_key = user.get("_key") or user.get("id")
+            if not user_key:
+                return []
+            apps = await self.get_user_apps(user_key)
+            return _distinct_connector_types(apps)
+        except Exception as e:
+            # Narrowing is an optimization; a failure costs a wider search, not
+            # a wrong one, so it must never fail the query.
+            self.logger.warning("Could not resolve accessible connector types: %s", e)
+            return []
+
     async def get_accessible_virtual_record_ids(
         self,
         user_id: str,
@@ -19319,9 +19464,6 @@ class ArangoHTTPProvider(IGraphDBProvider):
                 if k not in ["kb", "apps"] and v
             }
 
-            has_kb_filter = bool(kb_ids)
-            has_app_filter = bool(connector_ids_filter)
-
             tasks = []
 
             # Fetch app types once to distinguish KB apps (type == "KB") from connector apps
@@ -19344,6 +19486,25 @@ class ArangoHTTPProvider(IGraphDBProvider):
                     kb_app_ids = set(kb_app_keys or [])
                 except Exception as e:
                     self.logger.warning(f"⚠️ Failed to fetch KB app types for filtering, treating all apps as connectors: {e}")
+
+            # Reclassify: move KB app IDs that arrived in the apps filter
+            # to the kb filter. MCP and some clients send all source IDs
+            # (connectors + KB) in a single `apps` array; the backend must
+            # route them to the correct query path.
+            if connector_ids_filter and kb_app_ids:
+                kb_in_apps = [
+                    cid for cid in connector_ids_filter
+                    if cid in kb_app_ids and cid in user_apps_ids
+                ]
+                if kb_in_apps:
+                    self.logger.debug(
+                        f"Reclassifying {len(kb_in_apps)} KB app ID(s) from apps to kb filter: {kb_in_apps}"
+                    )
+                    connector_ids_filter = [cid for cid in connector_ids_filter if cid not in kb_app_ids]
+                    kb_ids = list(dict.fromkeys((kb_ids or []) + kb_in_apps))
+
+            has_kb_filter = bool(kb_ids)
+            has_app_filter = bool(connector_ids_filter)
 
             if has_app_filter and has_kb_filter:
                 connectors_to_query = [
@@ -19492,10 +19653,14 @@ class ArangoHTTPProvider(IGraphDBProvider):
                 "🔍 Finding records with virtualRecordId: %s", virtual_record_id
             )
 
-            # Base query
+            # Base query. Soft-deleted records are excluded: this answers
+            # "does anything still reference this content", and a tombstone
+            # answering yes would keep its vectors alive for ever.
+            # AQL `!= true` is null-safe, so records predating the field pass.
             query = f"""
             FOR record IN {CollectionNames.RECORDS.value}
                 FILTER record.virtualRecordId == @virtual_record_id
+                AND record.isDeleted != true
             """
 
             # Add optional filter for record IDs
@@ -19616,6 +19781,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                 FOR permission IN {CollectionNames.PERMISSION.value}
                 FILTER permission._to == team._id
                 LET user = DOCUMENT(permission._from)
+                FILTER user != null AND user.isActive == true
                 RETURN {{
                     "id": user._key,
                     "userId": user.userId,
@@ -19705,7 +19871,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                 FOR member_permission IN @@permission_collection
                 FILTER member_permission._to == team._id
                 LET member_user = DOCUMENT(member_permission._from)
-                FILTER member_user != null
+                FILTER member_user != null AND member_user.isActive == true
                 RETURN {{
                     "id": member_user._key,
                     "userId": member_user.userId,
@@ -19818,7 +19984,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                 FOR permission IN {CollectionNames.PERMISSION.value}
                 FILTER permission._to == team._id
                 LET user = DOCUMENT(permission._from)
-                FILTER user != null
+                FILTER user != null AND user.isActive == true
                 {search_filter}
                 RETURN {{
                     "id": user._key,
@@ -22068,8 +22234,12 @@ class ArangoHTTPProvider(IGraphDBProvider):
             }
 
             # Soft delete the template using update_node
-            template_path = f"{CollectionNames.AGENT_TEMPLATES.value}/{template_id}"
-            result = await self.update_node(template_path, update_data, transaction=transaction)
+            result = await self.update_node(
+                template_id,
+                CollectionNames.AGENT_TEMPLATES.value,
+                update_data,
+                transaction=transaction,
+            )
 
             if not result:
                 self.logger.error(f"Failed to delete template {template_id}")

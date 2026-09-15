@@ -15,6 +15,7 @@
 #   ./install.sh --print-env-only  # write .env and print compose command, don't launch
 #   ./install.sh --reconfigure   # overwrite an existing .env (re-run wizard)
 #   ./install.sh --upgrade       # pull/rebuild images and recreate containers
+#   ./install.sh --rotate-signing-secrets  # replace JWT/cookie signing secrets (logs everyone out)
 #   ./install.sh --stop          # stop the running stack (data preserved)
 #   ./install.sh --uninstall     # stop the stack and remove all data volumes
 #   ./install.sh --help
@@ -95,6 +96,7 @@ FLAG_STOP=false
 FLAG_UNINSTALL=false
 FLAG_BUILD=false
 FLAG_NO_PULL=false
+FLAG_ROTATE_SIGNING_SECRETS=false
 CLI_VERSION=""
 
 # ── CLI argument parsing ──────────────────────────────────────────────────────
@@ -113,6 +115,12 @@ Options:
       --print-env-only Write .env and print the compose command; do not launch
       --reconfigure    Overwrite an existing .env (re-run the wizard)
       --upgrade        Pull or rebuild images and recreate containers (data preserved)
+      --rotate-signing-secrets
+                       Replace JWT, scoped JWT, and cookie signing secrets.
+                       Every session, refresh token, password-reset link, and
+                       in-flight service token stops working. Requires an
+                       existing .env. Combine with --upgrade to rotate during
+                       an image refresh. Pass --yes to skip the confirm prompt.
       --stop           Stop the running stack (data preserved)
       --uninstall      Stop and remove ALL data volumes (irreversible)
   -h, --help           Show this help
@@ -140,6 +148,7 @@ while [[ $# -gt 0 ]]; do
     --print-env-only)    FLAG_PRINT_ENV_ONLY=true ;;
     --reconfigure)       FLAG_RECONFIGURE=true ;;
     --upgrade)           FLAG_UPGRADE=true ;;
+    --rotate-signing-secrets) FLAG_ROTATE_SIGNING_SECRETS=true ;;
     --stop)              FLAG_STOP=true ;;
     --uninstall)         FLAG_UNINSTALL=true ;;
     -h|--help)           usage; exit 0 ;;
@@ -147,6 +156,13 @@ while [[ $# -gt 0 ]]; do
   esac
   shift
 done
+
+if $FLAG_ROTATE_SIGNING_SECRETS && $FLAG_STOP; then
+  die "--rotate-signing-secrets cannot be combined with --stop."
+fi
+if $FLAG_ROTATE_SIGNING_SECRETS && $FLAG_UNINSTALL; then
+  die "--rotate-signing-secrets cannot be combined with --uninstall."
+fi
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -171,6 +187,59 @@ get_existing_val() {
     val="$(grep -E "^${key}=" "$ENV_FILE" | cut -d'=' -f2-)"
   fi
   printf '%s' "${val:-$default}"
+}
+
+# Render an optional knob for .env: the operator's value when one is set,
+# otherwise a commented hint. .env is rewritten from scratch whenever the wizard
+# runs, so a knob documented only in env.template is invisible after a fresh
+# install and is dropped by --reconfigure. Callers must pass a value already
+# resolved by get_existing_val -- .env is being truncated by the time the
+# here-document that calls this is expanded.
+# Memory the sibling containers (graph DB, vector DB, Mongo, broker) plus the
+# host OS need alongside the app. Sized from what those services actually use
+# at rest -- Neo4j dominates at 1.5-2 GB -- not from their compose limits,
+# which are ceilings none of them reach simultaneously.
+_SIBLING_MEMORY_RESERVE_MB=4096
+# Never derive below this: it is the historical default, and the governor's
+# ceilings need somewhere to grow into.
+_APP_MEMORY_FLOOR_MB=6144
+# Past this the app stops converting RAM into throughput -- the ceilings are
+# CPU-derived and the extra only widens buffers nothing fills.
+_APP_MEMORY_CAP_MB=32768
+# Swap headroom kept above the memory limit, matching the shipped 10G/16G
+# pair. Lets the kernel page out an idle co-located service instead of
+# OOM-killing the container.
+_APP_SWAP_HEADROOM_MB=6144
+
+# Largest APP_MEMORY_LIMIT this machine can give the app container, in MB.
+# Echoes nothing when the available memory cannot be determined, so the caller
+# falls back to the compose default rather than guessing.
+recommended_app_memory_mb() {
+  local available_mb=0 derived
+  # On Docker Desktop the VM is the real ceiling, not host RAM: the host may
+  # have 64 GB while the VM is capped at 8.
+  if $IS_MACOS || $IS_WINDOWS; then
+    available_mb="$(docker_vm_mem_mb)"
+  fi
+  if (( available_mb <= 0 )); then
+    available_mb="${TOTAL_RAM_MB:-0}"
+  fi
+  (( available_mb > 0 )) || return 0
+
+  derived=$(( available_mb - _SIBLING_MEMORY_RESERVE_MB ))
+  (( derived < _APP_MEMORY_FLOOR_MB )) && derived=$_APP_MEMORY_FLOOR_MB
+  (( derived > _APP_MEMORY_CAP_MB )) && derived=$_APP_MEMORY_CAP_MB
+  # Whole gigabytes: the value goes into .env for humans to read and edit.
+  echo $(( derived / 1024 * 1024 ))
+}
+
+optional_env_line() {
+  local key="$1" val="$2" hint="$3"
+  if [[ -n "$val" ]]; then
+    printf '%s=%s' "$key" "$val"
+  else
+    printf '# %s=%s' "$key" "$hint"
+  fi
 }
 
 # Derive the COMPOSE_PROFILES that the *currently configured* services require,
@@ -200,7 +269,9 @@ persist_env_var() {
   [[ -f "$ENV_FILE" ]] || return 0
   tmp="$(mktemp)"
   while IFS= read -r line || [[ -n "$line" ]]; do
-    if [[ "$line" == "${key}="* ]]; then
+    # Also match the commented placeholder form ("# KEY=hint") so turning a
+    # documented knob on replaces its hint instead of leaving both lines.
+    if [[ "$line" == "${key}="* || "$line" == "# ${key}="* ]]; then
       printf '%s=%s\n' "$key" "$val"; found=true
     else
       printf '%s\n' "$line"
@@ -292,6 +363,14 @@ resolve_banner_dirs() {
       fi
     fi
   fi
+}
+
+# Compose --progress tty|plain from a TTY flag. Keep this explicit instead of
+# `--progress auto`: auto is the same split inside Compose, but would re-detect
+# independently of the health-wait spinner. One _is_tty drives both.
+resolve_compose_progress() { # args: is_tty (true|false) -> tty|plain
+  [[ "$1" == true ]] && { echo tty; return; }
+  echo plain
 }
 
 # PIPESHUB_PROJECT wins. Else COMPOSE_PROJECT_NAME in this directory's .env so
@@ -660,9 +739,10 @@ elif [[ -n "$_OTHER_DIRS" ]]; then
 fi
 
 # ==============================================================================
-# 3. RESOURCE CHECKS (skip for --upgrade; resources are already allocated)
+# 3. RESOURCE CHECKS (skip for --upgrade / --rotate-signing-secrets; resources
+# are already allocated)
 # ==============================================================================
-if ! $FLAG_UPGRADE; then
+if ! $FLAG_UPGRADE && ! $FLAG_ROTATE_SIGNING_SECRETS; then
 
   # System RAM — 16 GB-class machine recommended (15000 MB floor; see below)
   TOTAL_RAM_MB=0
@@ -766,7 +846,11 @@ header "Configuration"
 ENV_EXISTS=false
 [[ -f "$ENV_FILE" ]] && ENV_EXISTS=true
 
-# --upgrade always reuses the existing .env
+# --upgrade always reuses the existing .env. --rotate-signing-secrets does too
+# unless --reconfigure was also passed (wizard still runs, then we rotate).
+if $FLAG_ROTATE_SIGNING_SECRETS && ! $ENV_EXISTS; then
+  die ".env not found. Signing-secret rotation requires an existing install."
+fi
 if $FLAG_UPGRADE; then
   $ENV_EXISTS || die ".env not found. Run ./install.sh (without --upgrade) to set up first."
   info "Upgrade mode — reusing existing .env."
@@ -1015,10 +1099,41 @@ if ! ${SKIP_WIZARD:-false}; then
   # Preserve any secrets that already exist in .env so that --reconfigure does
   # not rotate credentials for already-initialised database volumes.
   SECRET_KEY="$(get_existing_val SECRET_KEY "$(gen_secret 32)")"
+  # Kept across --reconfigure so a previous --rotate-signing-secrets id is not
+  # dropped. A new rotate run overwrites it after the wizard writes .env.
+  ROTATE_SIGNING_SECRETS="$(get_existing_val ROTATE_SIGNING_SECRETS "")"
   MONGO_USERNAME="$(get_existing_val MONGO_USERNAME "admin")"
   MONGO_PASSWORD="$(get_existing_val MONGO_PASSWORD "$(gen_secret 16)")"
   REDIS_PASSWORD="$(get_existing_val REDIS_PASSWORD "$(gen_secret 16)")"
   QDRANT_API_KEY="$(get_existing_val QDRANT_API_KEY "$(gen_secret 20)")"
+
+  # Optional MongoDB knobs from env.template. The wizard never asks about these,
+  # but .env is rewritten in full below, so read back anything the operator set
+  # by hand -- otherwise --reconfigure silently reverts their tuning and MongoDB
+  # goes back to the defaults that made them set it in the first place.
+  MONGO_GLIBC_TUNABLES="$(get_existing_val MONGO_GLIBC_TUNABLES "")"
+  MONGO_IMAGE_TAG="$(get_existing_val MONGO_IMAGE_TAG "")"
+  MONGO_CACHE_GB="$(get_existing_val MONGO_CACHE_GB "")"
+  MONGO_MEMORY_LIMIT="$(get_existing_val MONGO_MEMORY_LIMIT "")"
+
+  # App container memory. An explicit APP_MEMORY_LIMIT always wins -- from the
+  # environment for scripted installs, or from an existing .env so
+  # --reconfigure never silently resizes a tuned deployment. Only a fresh
+  # install with neither derives from what this machine actually has, so a
+  # 32 GB host stops being held to the 10 GB default while a small one is not
+  # over-committed into the OOM/thrash the governor then has to brake around.
+  APP_MEMORY_LIMIT="$(get_existing_val APP_MEMORY_LIMIT "${APP_MEMORY_LIMIT:-}")"
+  APP_MEMSWAP_LIMIT="$(get_existing_val APP_MEMSWAP_LIMIT "${APP_MEMSWAP_LIMIT:-}")"
+  if [[ -z "$APP_MEMORY_LIMIT" ]]; then
+    _derived_app_mem_mb="$(recommended_app_memory_mb)"
+    if [[ -n "$_derived_app_mem_mb" ]] && (( _derived_app_mem_mb > 0 )); then
+      APP_MEMORY_LIMIT="$(( _derived_app_mem_mb / 1024 ))G"
+      info "Sizing app container memory: APP_MEMORY_LIMIT=${APP_MEMORY_LIMIT} (reserving $(( _SIBLING_MEMORY_RESERVE_MB / 1024 ))G for the datastores and OS). Override by setting APP_MEMORY_LIMIT before running, or edit .env."
+      if [[ -z "$APP_MEMSWAP_LIMIT" ]]; then
+        APP_MEMSWAP_LIMIT="$(( (_derived_app_mem_mb + _APP_SWAP_HEADROOM_MB) / 1024 ))G"
+      fi
+    fi
+  fi
 
   if [[ "$DATA_STORE" == "arangodb" ]]; then
     ARANGO_PASSWORD="$(get_existing_val ARANGO_PASSWORD "$(gen_secret 16)")"; NEO4J_PASSWORD=""
@@ -1093,6 +1208,9 @@ NODE_ENV=production
 LOG_LEVEL=info
 SECRET_KEY=${SECRET_KEY}
 CSP_FRAME_ANCESTORS=${CSP_FRAME_ANCESTORS:-}
+# One-shot id for ./install.sh --rotate-signing-secrets. Changing it rotates
+# JWT/cookie signing secrets on next app start (logs everyone out).
+ROTATE_SIGNING_SECRETS=${ROTATE_SIGNING_SECRETS}
 
 # Public URL — HTTPS domain for cloud/external deployments (leave blank for localhost)
 # Required for OAuth callbacks, webhook integrations, and browser security.
@@ -1131,6 +1249,26 @@ REDIS_PASSWORD=${REDIS_PASSWORD}
 # ── MongoDB ──────────────────────────────────────────────────────────────────
 MONGO_USERNAME=${MONGO_USERNAME}
 MONGO_PASSWORD=${MONGO_PASSWORD}
+# If MongoDB crash-loops with a segfault (exit 139) on a newer host kernel, try
+# the rseq tunable first so the supported MongoDB version can stay pinned.
+$(optional_env_line MONGO_GLIBC_TUNABLES "$MONGO_GLIBC_TUNABLES" "glibc.pthread.rseq=1")
+# Pin the MongoDB image. The value below is the tag compose already defaults to,
+# so uncommenting it changes nothing on its own -- set an older tag here only to
+# recover from a version-specific bug. MongoDB 8.x data is not readable by 7.x,
+# so wipe the mongo volume before downgrading.
+$(optional_env_line MONGO_IMAGE_TAG "$MONGO_IMAGE_TAG" "8.0.17")
+# WiredTiger cache cap and container memory limit. Raise both together on
+# larger or dedicated hosts; avoid dropping the cache below 1 GB.
+$(optional_env_line MONGO_CACHE_GB "$MONGO_CACHE_GB" "1")
+$(optional_env_line MONGO_MEMORY_LIMIT "$MONGO_MEMORY_LIMIT" "2G")
+
+# App container memory ceiling and its combined memory+swap ceiling. Derived
+# from this machine on a fresh install; set them yourself to pin. The governor
+# sizes indexing/parsing concurrency from whatever APP_MEMORY_LIMIT allows, so
+# raising it raises throughput until CPU becomes the bound. APP_MEMSWAP_LIMIT
+# must stay >= APP_MEMORY_LIMIT.
+$(optional_env_line APP_MEMORY_LIMIT "$APP_MEMORY_LIMIT" "10G")
+$(optional_env_line APP_MEMSWAP_LIMIT "$APP_MEMSWAP_LIMIT" "16G")
 
 # ── Qdrant ───────────────────────────────────────────────────────────────────
 QDRANT_API_KEY=${QDRANT_API_KEY}
@@ -1139,16 +1277,35 @@ QDRANT_API_KEY=${QDRANT_API_KEY}
 # Do not write MAX_CONCURRENT_* / EMBEDDING_*_CONCURRENCY here. Empty values
 # crash Hub slim (int("")); omitting them lets slim use built-in defaults and
 # lets new images size from CPU. Set an integer in .env only to cap.
-# Governor slot ratios (1 / 10 / 100) stay empty.
+# Governor tuning knobs stay empty: each is derived from the container's
+# own CPU/memory limits unless pinned.
+INDEXING_SPLIT_LEASE_POOLS=
 GOVERNOR_HEAVY_PARSE_SLOTS_PER_CPU=
 GOVERNOR_LIGHT_PARSE_SLOTS_PER_CPU=
-GOVERNOR_INDEX_SLOTS_PER_PARSE_SLOT=
+GOVERNOR_LIGHT_PARSE_MAX=
+GOVERNOR_INDEX_HEADROOM=
+GOVERNOR_INDEX_MAX=
+GOVERNOR_INDEX_HEAVY_WORKING_SET_GB=
+GOVERNOR_INDEX_LIGHT_WORKING_SET_GB=
 GOVERNOR_HEAVY_PARSE_WORKING_SET_GB=
+# Uncomment to pin the query worker count. Left unset so WEB_CONCURRENCY,
+# which uvicorn honours by default, still applies if you use it.
+# QUERY_UVICORN_WORKERS=1
+
 INDEXING_UVICORN_WORKERS=1
 PARSING_UVICORN_WORKERS=1
 DOCLING_UVICORN_WORKERS=1
 LOCAL_DOCLING_PARSE_WORKERS=1
 PDF_OCR_DETECTION_WORKERS=1
+
+# Query-service runtime tuning. These defaults reproduce current behaviour.
+# PIPESHUB_AGENT_TRANSPORT: langchain (default) | direct
+PIPESHUB_AGENT_TRANSPORT=langchain
+# Accessible-records cache is ON unless set to a disabled value; leave blank to keep it on.
+PIPESHUB_ACCESSIBLE_RECORDS_CACHE=
+PIPESHUB_ACCESSIBLE_RECORDS_CACHE_TTL=300
+# 0 disables the signed-URL cache. Keep well under the 3600s signing lifetime.
+PIPESHUB_SIGNED_URL_CACHE_SECONDS=0
 
 # ── ML performance ───────────────────────────────────────────────────────────
 # Caps PyTorch / OpenBLAS / MKL thread fan-out per operation.
@@ -1204,10 +1361,10 @@ _parse_mem_mb() {
   [[ "$1" =~ ^([0-9]+)[mM]$ ]] && { echo "${BASH_REMATCH[1]}"; return; }
   return 1
 }
-_app_mem_mb="$(_parse_mem_mb "${APP_MEMORY_LIMIT:-12G}")" || _app_mem_mb=""
+_app_mem_mb="$(_parse_mem_mb "${APP_MEMORY_LIMIT:-10G}")" || _app_mem_mb=""
 _app_memswap_mb="$(_parse_mem_mb "${APP_MEMSWAP_LIMIT:-16G}")" || _app_memswap_mb=""
 if [[ -n "$_app_mem_mb" && -n "$_app_memswap_mb" ]] && (( _app_memswap_mb < _app_mem_mb )); then
-  die "APP_MEMSWAP_LIMIT (${APP_MEMSWAP_LIMIT:-16G}) must be >= APP_MEMORY_LIMIT (${APP_MEMORY_LIMIT:-12G}). Raise APP_MEMSWAP_LIMIT in .env (or raise both together) before launching."
+  die "APP_MEMSWAP_LIMIT (${APP_MEMSWAP_LIMIT:-16G}) must be >= APP_MEMORY_LIMIT (${APP_MEMORY_LIMIT:-10G}). Raise APP_MEMSWAP_LIMIT in .env (or raise both together) before launching."
 fi
 
 # Resolve APP_PORT from .env when wizard was skipped (upgrade / reuse)
@@ -1318,6 +1475,27 @@ if [[ -n "${FRONTEND_PUBLIC_URL:-}" ]]; then
 fi
 printf "\n"
 
+# ==============================================================================
+# 14b. SIGNING-SECRET ROTATION (--rotate-signing-secrets)
+# Writes a new one-shot id into .env. The app replaces jwtSecret / scopedJwtSecret
+# / cookieSecret only when this id differs from the value stored in the KV store.
+# ==============================================================================
+if $FLAG_ROTATE_SIGNING_SECRETS; then
+  header "Rotate signing secrets"
+  warn "This replaces JWT, scoped JWT, and cookie signing secrets."
+  warn "Every signed-in user will be logged out. Refresh tokens, password-reset"
+  warn "links, and in-flight service-to-service tokens will stop working."
+  if ! $FLAG_YES; then
+    printf "\n  ${BOLD}Type ROTATE to confirm:${RESET} "
+    read -r _rotate_confirm
+    [[ "${_rotate_confirm}" == "ROTATE" ]] || { info "Aborted — signing secrets were not changed."; exit 0; }
+  fi
+  ROTATE_SIGNING_SECRETS="$(gen_secret 16)"
+  persist_env_var ROTATE_SIGNING_SECRETS "$ROTATE_SIGNING_SECRETS"
+  set -a; . "$ENV_FILE"; set +a
+  success "Wrote a new ROTATE_SIGNING_SECRETS id. The app will rotate secrets on next start."
+fi
+
 # --print-env-only: show the compose command and exit
 if $FLAG_PRINT_ENV_ONLY; then
   _build_flag=""
@@ -1327,11 +1505,16 @@ if $FLAG_PRINT_ENV_ONLY; then
   printf "\n  ${BOLD}COMPOSE_PROFILES=%s \\\\\n    docker compose -f %s -p %s up -d%s${RESET}\n\n" \
     "${COMPOSE_PROFILES:-}" "$COMPOSE_FILE" "$PROJECT_NAME" "$_build_flag"
   success "Done (--print-env-only mode; not launching)."
+  if $FLAG_ROTATE_SIGNING_SECRETS; then
+    warn "ROTATE_SIGNING_SECRETS is set. Recreate the app container so secrets rotate:"
+    warn "  docker compose -f ${COMPOSE_FILE} -p ${PROJECT_NAME} --env-file ${ENV_FILE} up -d --force-recreate --no-deps pipeshub-ai"
+  fi
   exit 0
 fi
 
-# Confirm before launching (skip for --upgrade which already confirmed intent)
-if ! $FLAG_YES && ! $FLAG_UPGRADE; then
+# Confirm before launching (skip for --upgrade / --rotate-signing-secrets which
+# already confirmed intent)
+if ! $FLAG_YES && ! $FLAG_UPGRADE && ! $FLAG_ROTATE_SIGNING_SECRETS; then
   printf "  ${BOLD}Launch PipesHub with the above configuration? [Y/n]: ${RESET}"
   read -r _launch_reply
   case "${_launch_reply:-Y}" in
@@ -1340,10 +1523,125 @@ if ! $FLAG_YES && ! $FLAG_UPGRADE; then
   esac
 fi
 
+# MongoDB 8.x segfaults (exit 139) on some newer host kernels because of a glibc
+# rseq/TCMalloc interaction. env.template documents MONGO_GLIBC_TUNABLES for
+# exactly this case, but an operator only discovers it after the install has
+# already failed -- and the generic exit-139 advice points at recreating the data
+# volume, which destroys data without addressing this cause.
+#
+# Reacting to the observed crash rather than pre-screening the host kernel keeps
+# rseq=0 -- the faster TCMalloc default that #2677 deliberately preserved -- on
+# every machine that does not need the workaround, and needs no list of affected
+# kernel versions to stay accurate.
+MONGO_RSEQ_HEAL_TRIED=false
+MONGO_HEAL_GRACE_SECS=180
+MONGO_RSEQ_PROBE_SECS=12
+
+# The project's mongodb container ids, one per line.
+mongo_container_ids() {
+  docker ps -aq \
+    --filter "label=com.docker.compose.project=${PROJECT_NAME}" \
+    --filter "label=com.docker.compose.service=mongodb" 2>/dev/null
+}
+
+# The last exit code Docker recorded for this mongodb container, from the
+# daemon's own event log.
+#
+# `docker inspect .State.ExitCode` cannot answer this on its own: it reports 0
+# whenever the container is in one of its up windows, so the true code is only
+# visible while it happens to be `restarting`. A slow flap -- up for ~25s, crash,
+# restart -- hides it from any single sample and from a short probe. The event
+# log records every `die` with its code, and filtering by the current container
+# id means a recreated container starts with a clean history.
+mongo_last_die_code() {
+  local id
+  id="$(mongo_container_ids | head -1)"
+  [[ -n "$id" ]] || return 0
+  docker events --since 1h --until "$(date +%s)" \
+    --filter "container=$id" --filter "event=die" \
+    --format '{{.Actor.Attributes.exitCode}}' 2>/dev/null | tail -1
+}
+
+# True when this project's mongodb is crash-looping on exit 139.
+mongo_rseq_crashed() {
+  local id exit_code restarts elapsed=0
+  # No mongodb container means the failure was something else entirely -- a build
+  # error, a missing image, another service. Do not spend any time on it.
+  if [[ -z "$(mongo_container_ids)" ]]; then return 1; fi
+
+  # Authoritative and race-free: what the daemon recorded when it last died.
+  if [[ "$(mongo_last_die_code)" == "139" ]]; then return 0; fi
+
+  # Fallback for a daemon whose event history is unavailable or trimmed. Only
+  # catches a fast loop, where the container is restarting most of the time.
+  while (( elapsed < MONGO_RSEQ_PROBE_SECS )); do
+    for id in $(mongo_container_ids); do
+      restarts="$(docker inspect "$id" --format '{{.RestartCount}}' 2>/dev/null || echo 0)"
+      exit_code="$(docker inspect "$id" --format '{{.State.ExitCode}}' 2>/dev/null || echo '')"
+      if [[ "$exit_code" == "139" ]] && (( ${restarts:-0} >= 1 )); then return 0; fi
+    done
+    sleep 1
+    elapsed=$(( elapsed + 1 ))
+  done
+  return 1
+}
+
+# Docker's RestartCount is a lifetime counter on the container, so a stack that
+# crash-looped weeks ago and was fixed still reports those restarts on every
+# later run. Snapshot before starting and compare afterwards, so the checks below
+# measure only what happened during this install.
+_MONGO_RESTART_BASELINE=""
+
+snapshot_mongo_restarts() {
+  local id n
+  _MONGO_RESTART_BASELINE=""
+  for id in $(mongo_container_ids); do
+    n="$(docker inspect "$id" --format '{{.RestartCount}}' 2>/dev/null || echo 0)"
+    _MONGO_RESTART_BASELINE="${_MONGO_RESTART_BASELINE}${id} ${n:-0}
+"
+  done
+}
+
+# Restarts accumulated since the snapshot. An id absent from the baseline is a
+# container this run created or recreated, so all of its restarts are ours.
+# Cheap -- one inspect per container, no probing -- so the healthy path can call
+# it on every install.
+mongo_restart_delta() {
+  local id n base total=0
+  for id in $(mongo_container_ids); do
+    n="$(docker inspect "$id" --format '{{.RestartCount}}' 2>/dev/null || echo 0)"
+    base="$(printf '%s' "${_MONGO_RESTART_BASELINE:-}" | awk -v i="$id" '$1==i{print $2; exit}')"
+    total=$(( total + ${n:-0} - ${base:-0} ))
+  done
+  if (( total < 0 )); then total=0; fi
+  printf '%s' "$total"
+}
+
+# Write the documented tunable, once per run, and never over a value the operator
+# chose. Returns 0 when it changed something, so the caller can retry the start.
+apply_mongo_rseq_tunable() {
+  if $MONGO_RSEQ_HEAL_TRIED; then return 1; fi
+  if [[ -n "$(get_existing_val MONGO_GLIBC_TUNABLES "")" ]]; then return 1; fi
+  if ! mongo_rseq_crashed; then return 1; fi
+
+  MONGO_RSEQ_HEAL_TRIED=true
+  warn "MongoDB is crash-looping on exit 139 (segfault)."
+  warn "That is the known glibc rseq/TCMalloc crash on newer host kernels."
+  info "Setting MONGO_GLIBC_TUNABLES=glibc.pthread.rseq=1 in .env and retrying..."
+  persist_env_var MONGO_GLIBC_TUNABLES "glibc.pthread.rseq=1"
+  return 0
+}
+
 # ==============================================================================
 # 15. LAUNCH
 # ==============================================================================
-header "$( $FLAG_UPGRADE && echo 'Upgrading PipesHub' || echo 'Launching PipesHub' )"
+header "$(
+  if $FLAG_ROTATE_SIGNING_SECRETS && $FLAG_UPGRADE; then echo 'Upgrading PipesHub and rotating signing secrets'
+  elif $FLAG_ROTATE_SIGNING_SECRETS; then echo 'Rotating signing secrets'
+  elif $FLAG_UPGRADE; then echo 'Upgrading PipesHub'
+  else echo 'Launching PipesHub'
+  fi
+)"
 
 export COMPOSE_PROFILES="${COMPOSE_PROFILES:-}"
 
@@ -1352,12 +1650,48 @@ export COMPOSE_PROFILES="${COMPOSE_PROFILES:-}"
 _USE_BUILD=false
 [[ "${IMAGE_SOURCE:-prebuilt}" == "local" ]] && _USE_BUILD=true
 
-# Compose's default "tty" progress redraws a single block via cursor-movement
-# escapes. When stdout is captured (terminal logs, `curl | bash`, CI), those
-# escapes don't collapse and every frame is recorded, producing hundreds of
-# duplicated "[+] Running N/17" blocks. Plain progress is append-only and stays
-# readable in every context.
-_PROGRESS=(--progress plain)
+# One TTY check for Compose pull/up progress and the health-wait spinner below.
+# curl | bash pipes stdin only; stdout stays on the terminal, so in-place
+# progress is the majority install path. Forced `--progress plain` on a TTY
+# prints a new line per layer tick and floods the log. Captured stdout (CI,
+# tee, redirect) still gets plain so cursor-escape frames do not explode.
+_is_tty=false; [[ -t 1 ]] && _is_tty=true
+_PROGRESS=(--progress "$(resolve_compose_progress "$_is_tty")")
+
+compose_up()        { docker compose "${_PROGRESS[@]}" -f "$COMPOSE_FILE" -p "$PROJECT_NAME" --env-file "$ENV_FILE" up -d "$@"; }
+compose_logs_tail() { docker compose -f "$COMPOSE_FILE" -p "$PROJECT_NAME" --env-file "$ENV_FILE" logs --tail 30 2>&1 || true; }
+
+# Start the stack, healing a MongoDB rseq segfault once if that is what stopped
+# it. A segfault fails `up` within seconds rather than later: the app's
+# `depends_on: mongodb: condition: service_healthy` is never satisfied, so
+# compose reports "dependency failed to start" and exits non-zero long before the
+# health poll could react.
+#
+# The retry is a full `up -d` so dependents that were created but never started
+# come up too, and it never repeats --build: if the image compiled the first
+# time, it is already built. Callers `die` on a non-zero return; every failure
+# message is emitted here so the prebuilt and build paths cannot drift apart.
+compose_up_with_mongo_heal() {
+  local label="$1"; shift
+  if compose_up "$@"; then return 0; fi
+
+  if apply_mongo_rseq_tunable; then
+    if compose_up; then
+      success "Startup recovered after applying the MongoDB rseq tunable."
+      return 0
+    fi
+    error "docker compose up failed again after applying the MongoDB tunable."
+    compose_logs_tail
+    warn "MongoDB is still not starting, so something else is wrong. Read the logs"
+    warn "above first. Do not recreate the mongo data volume yet — that destroys"
+    warn "your data and will not fix a crash the tunable did not resolve."
+    return 1
+  fi
+
+  error "docker compose ${label} failed. Last 30 lines of container logs:"
+  compose_logs_tail
+  return 1
+}
 
 # Decide whether to refresh the prebuilt image from the registry before starting.
 # Pure decision (no side effects) so it is unit-testable in isolation.
@@ -1376,6 +1710,11 @@ should_pull_image() { # args: use_build flag_no_pull env_no_pull -> "true"|"fals
 }
 
 _DO_PULL="$(should_pull_image "$_USE_BUILD" "$FLAG_NO_PULL" "${PIPESHUB_NO_PULL:-}")"
+# Rotation without --upgrade must not refresh images; the operator asked only
+# to replace signing secrets.
+if $FLAG_ROTATE_SIGNING_SECRETS && ! $FLAG_UPGRADE; then
+  _DO_PULL=false
+fi
 # Pinning a specific tag (--version / PIPESHUB_VERSION) still benefits from the
 # pull: it fetches exactly that immutable tag rather than a moving :latest, so
 # reproducibility is preserved while a stale local copy is corrected.
@@ -1386,18 +1725,16 @@ if project_has_pinned_container_names; then
   warn_pinned_container_rename
 fi
 
+# Baseline before anything starts, so the post-start checks below can tell a
+# crash loop from restarts this run had nothing to do with.
+snapshot_mongo_restarts
+
 if $_USE_BUILD; then
   $FLAG_UPGRADE && info "Rebuilding image from source for tag: ${IMAGE_TAG:-local}..."
   info "Building image from source and starting containers..."
   info "(This may take 10–30+ minutes on first run)"
-  if ! docker compose "${_PROGRESS[@]}" \
-      -f "$COMPOSE_FILE" \
-      -p "$PROJECT_NAME" \
-      --env-file "$ENV_FILE" \
-      up -d --build; then
-    error "docker compose up --build failed. Last 30 lines of container logs:"
-    docker compose -f "$COMPOSE_FILE" -p "$PROJECT_NAME" --env-file "$ENV_FILE" logs --tail 30 2>&1 || true
-    die "Fix the build error above and re-run install.sh."
+  if ! compose_up_with_mongo_heal "up --build" --build; then
+    die "Fix the error above and re-run install.sh."
   fi
 else
   if [[ "$_DO_PULL" == true ]]; then
@@ -1420,17 +1757,28 @@ else
       fi
     fi
   else
-    info "Skipping image refresh; using locally cached images (--no-pull)."
+    if $FLAG_ROTATE_SIGNING_SECRETS && ! $FLAG_UPGRADE; then
+      info "Skipping image refresh; rotating signing secrets only."
+    else
+      info "Skipping image refresh; using locally cached images (--no-pull)."
+    fi
   fi
   info "Starting containers..."
+  if ! compose_up_with_mongo_heal "up"; then
+    die "Fix the error above and re-run install.sh."
+  fi
+fi
+
+# Node loads signing secrets at process start. Force-recreate the app container
+# so a running stack cannot keep the old JWT/cookie keys in memory.
+if $FLAG_ROTATE_SIGNING_SECRETS; then
+  info "Recreating the app container so it applies the new signing secrets..."
   if ! docker compose "${_PROGRESS[@]}" \
       -f "$COMPOSE_FILE" \
       -p "$PROJECT_NAME" \
       --env-file "$ENV_FILE" \
-      up -d; then
-    error "docker compose up failed. Last 30 lines of container logs:"
-    docker compose -f "$COMPOSE_FILE" -p "$PROJECT_NAME" --env-file "$ENV_FILE" logs --tail 30 2>&1 || true
-    die "Fix the error above and re-run install.sh."
+      up -d --force-recreate --no-deps pipeshub-ai; then
+    die "Failed to recreate pipeshub-ai after writing ROTATE_SIGNING_SECRETS. Signing secrets may not have rotated."
   fi
 fi
 
@@ -1495,9 +1843,9 @@ crash_looping_containers() {
   done
 }
 
-# Poll until healthy or the deadline passes. On a TTY, redraw a single spinner
-# line in place (clean, one line); when output is captured (logs, curl | bash,
-# CI) emit a sparse heartbeat instead so transcripts don't fill with frames.
+# Poll until healthy or the deadline passes. Uses _is_tty from launch (same
+# flag as Compose progress). On a TTY, redraw a single spinner line in place;
+# when stdout is captured (CI, tee, redirect) emit a sparse heartbeat instead.
 ELAPSED=0
 CHECK_EVERY=5
 HEARTBEAT_EVERY=30
@@ -1505,7 +1853,6 @@ START_TS=$SECONDS
 _spinner=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
 _spin=0
 _CRASH_REPORT=""
-_is_tty=false; [[ -t 1 ]] && _is_tty=true
 
 while (( ELAPSED < HEALTH_WAIT_SECS )); do
   if (( ELAPSED % CHECK_EVERY == 0 )) && app_is_healthy; then
@@ -1517,6 +1864,22 @@ while (( ELAPSED < HEALTH_WAIT_SECS )); do
   # not recover on its own, so there is no point waiting out the full timeout.
   if (( ELAPSED >= 90 && ELAPSED % 15 == 0 )); then
     _CRASH_REPORT="$(crash_looping_containers)"
+    # A MongoDB rseq segfault has a known one-line fix. Apply it and keep
+    # waiting instead of failing an install that is one restart from working.
+    if [[ -n "$_CRASH_REPORT" ]] && apply_mongo_rseq_tunable; then
+      # Full `up -d`, not `--force-recreate mongodb`: dependents that never
+      # started will not appear just because mongodb was recreated.
+      if compose_up >/dev/null 2>&1; then
+        _CRASH_REPORT=""
+        # Extend the deadline, never shorten it: at t=90 a bare ELAPSED+180
+        # would cut the default 420s wait down to 270.
+        _healed_deadline=$(( ELAPSED + MONGO_HEAL_GRACE_SECS ))
+        if (( _healed_deadline > HEALTH_WAIT_SECS )); then
+          HEALTH_WAIT_SECS=$_healed_deadline
+        fi
+        success "MongoDB restarted with the rseq tunable; waiting for it to settle."
+      fi
+    fi
     [[ -n "$_CRASH_REPORT" ]] && break
   fi
   if $_is_tty; then
@@ -1549,6 +1912,44 @@ if $CONTAINER_HEALTHY; then
     warn "This is usually a port-publish, firewall, or reverse-proxy issue."
     warn "  docker compose -f ${COMPOSE_FILE} -p ${PROJECT_NAME} logs -f pipeshub-ai"
   fi
+
+  # "Healthy" is not the same as "stable". A segfaulting MongoDB is healthy in
+  # the gaps between crashes, and those gaps are long enough to satisfy the app's
+  # depends_on and to pass the poll above -- so the install reports success and
+  # walks away from a database that restarts every ~25s, dropping every
+  # connection each time. Restarts are the signal the health check cannot see.
+  _mongo_restarts="$(mongo_restart_delta)"
+  if (( _mongo_restarts > 0 )); then
+    if apply_mongo_rseq_tunable; then
+      if compose_up >/dev/null 2>&1; then
+        # The restart drops the stack briefly. Do not let the banner claim ready
+        # while it is still coming back.
+        _heal_wait=0
+        while (( _heal_wait < 120 )) && ! app_is_healthy; do
+          sleep 5
+          _heal_wait=$(( _heal_wait + 5 ))
+        done
+        if app_is_healthy; then
+          success "MongoDB restarted ${_mongo_restarts}x on exit 139; applied the tunable and restarted the stack."
+        else
+          CONTAINER_HEALTHY=false
+          warn "Applied the MongoDB tunable and restarted, but the stack has not come back healthy."
+          warn "  docker compose -f ${COMPOSE_FILE} -p ${PROJECT_NAME} logs -f pipeshub-ai"
+        fi
+      else
+        CONTAINER_HEALTHY=false
+        warn "Applied the MongoDB tunable, but restarting the stack failed."
+        warn "  docker compose -f ${COMPOSE_FILE} -p ${PROJECT_NAME} logs mongodb"
+      fi
+    else
+      warn "MongoDB restarted ${_mongo_restarts} time(s) during this install."
+      warn "The stack is healthy right now, but a database that keeps restarting"
+      warn "drops every connection each time it goes. Check why:"
+      warn "  docker compose -f ${COMPOSE_FILE} -p ${PROJECT_NAME} logs --tail 40 mongodb"
+      warn "  exit 139 → set MONGO_GLIBC_TUNABLES=glibc.pthread.rseq=1 in .env"
+      warn "  exit 137 → out of memory; raise MONGO_CACHE_GB and MONGO_MEMORY_LIMIT together"
+    fi
+  fi
 elif [[ -n "${_CRASH_REPORT:-}" ]]; then
   error "A container keeps restarting, so the stack cannot become healthy:"
   printf "%s\n" "$_CRASH_REPORT"
@@ -1570,7 +1971,12 @@ elif [[ -n "${_CRASH_REPORT:-}" ]]; then
   fi
   warn "  • exit 137 / oom=true → out of memory. Free RAM, or switch to the lighter"
   warn "      'slim' profile (Redis broker + KV; drops Kafka/Zookeeper): ./install.sh --reconfigure"
-  warn "  • exit 139            → the service crashed (segfault). Usually a corrupted data"
+  warn "  • exit 139 on mongodb → set MONGO_GLIBC_TUNABLES=glibc.pthread.rseq=1 in .env and"
+  warn "      re-run ./install.sh --upgrade. The installer normally applies this for you; if"
+  warn "      you are seeing this, it was already set or the restart did not take. Try this"
+  warn "      before touching the data volume — recreating the volume destroys your data and"
+  warn "      does not fix this cause."
+  warn "  • exit 139 elsewhere  → the service crashed (segfault). Usually a corrupted data"
   warn "      volume from an earlier hard kill — recreate it and re-run ./install.sh. If it"
   warn "      recurs on a fresh volume, it is an incompatible host kernel/CPU (see docker logs)."
   warn "  • anything else       → read 'docker logs' above for the specific error"
@@ -1672,6 +2078,8 @@ printf "  ${DIM}# Stop (data preserved)${RESET}\n"
 printf "  ./install.sh --stop\n\n"
 printf "  ${DIM}# Upgrade to latest images (or rebuild from source if IMAGE_SOURCE=local)${RESET}\n"
 printf "  ./install.sh --upgrade\n\n"
+printf "  ${DIM}# Rotate JWT/cookie signing secrets (logs everyone out)${RESET}\n"
+printf "  ./install.sh --rotate-signing-secrets\n\n"
 printf "  ${DIM}# Reconfigure (re-run wizard)${RESET}\n"
 printf "  ./install.sh --reconfigure\n\n"
 printf "  ${DIM}# Uninstall and remove all data (irreversible)${RESET}\n"
