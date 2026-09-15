@@ -1,4 +1,5 @@
 import logging
+from typing import TYPE_CHECKING
 
 from app.config.constants.arangodb import (
     CollectionNames,
@@ -23,9 +24,12 @@ from app.telemetry.modules.activity_metrics import record_service_activity
 from app.utils.time_conversion import get_epoch_timestamp_in_ms
 from app.exceptions.indexing_exceptions import IndexingError
 
+if TYPE_CHECKING:
+    from app.config.configuration_service import ConfigurationService
+
 
 class SinkOrchestrator(Transformer):
-    def __init__(self, graphdb: GraphDBTransformer, blob_storage: BlobStorage, vector_store: VectorStore, graph_provider: IGraphDBProvider, logger) -> None:
+    def __init__(self, graphdb: GraphDBTransformer, blob_storage: BlobStorage, vector_store: VectorStore, graph_provider: IGraphDBProvider, logger, config_service: "ConfigurationService") -> None:
         super().__init__()
         self.graphdb = graphdb
         self.logger = logging.getLogger(__name__)
@@ -36,7 +40,7 @@ class SinkOrchestrator(Transformer):
         # Runs before the blob write below, which is the only reason it lives
         # here: a description generated later would never reach the stored
         # record, and the stored record is what `fetch_record` serves.
-        self.image_describer = ImageDescriber(logger, vector_store.config_service)
+        self.image_describer = ImageDescriber(logger, config_service)
 
     # This is not a good long-term solution and should be improved in the future.
     LIMIT_SQL_ROW_BLOCKS_TO = 10
@@ -192,7 +196,7 @@ class SinkOrchestrator(Transformer):
                     record_id=record_id,
                 )
 
-            self.logger.info(f"✅ Vector store indexing succeeded for record {record_id}")
+            self.logger.debug(f"✅ Vector store indexing succeeded for record {record_id}")
             # Per-record indexing success counter (powers the Ingestion dashboard).
             record_service_activity("indexing_service", "document_indexed", connector=connector, status="ok", org=org, kb=kb, mimetype=record.mime_type or "none")
             self.logger.debug(f"Saving reconciliation metadata for record {record_id}")

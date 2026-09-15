@@ -563,142 +563,6 @@ class TestGetToolsetById:
 
 
 # ---------------------------------------------------------------------------
-# _check_user_is_admin
-# ---------------------------------------------------------------------------
-
-class TestCheckUserIsAdmin:
-    @pytest.mark.asyncio
-    @patch("app.api.routes.toolset_resolvers.httpx.AsyncClient")
-    async def test_admin_returns_true(self, mock_client_cls) -> None:
-        from app.api.routes.toolset_resolvers import check_user_is_admin as _check_user_is_admin
-
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-
-        mock_client = AsyncMock()
-        mock_client.get = AsyncMock(return_value=mock_response)
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
-        mock_client_cls.return_value = mock_client
-
-        request = MagicMock()
-        request.headers = {"authorization": "Bearer token123", "cookie": "session=abc"}
-
-        config_service = AsyncMock()
-        config_service.get_config = AsyncMock(return_value={
-            "nodejs": {"endpoint": "http://nodejs:3001"},
-        })
-
-        result = await _check_user_is_admin("user-1", None, request, config_service)
-        assert result is True
-
-    @pytest.mark.asyncio
-    @patch("app.api.routes.toolset_resolvers.httpx.AsyncClient")
-    async def test_non_admin_returns_false(self, mock_client_cls) -> None:
-        from app.api.routes.toolset_resolvers import check_user_is_admin as _check_user_is_admin
-
-        mock_response = MagicMock()
-        mock_response.status_code = 403
-
-        mock_client = AsyncMock()
-        mock_client.get = AsyncMock(return_value=mock_response)
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
-        mock_client_cls.return_value = mock_client
-
-        request = MagicMock()
-        request.headers = {"authorization": "Bearer token123"}
-
-        config_service = AsyncMock()
-        config_service.get_config = AsyncMock(return_value={
-            "nodejs": {"endpoint": "http://nodejs:3001"},
-        })
-
-        result = await _check_user_is_admin("user-1", None, request, config_service)
-        assert result is False
-
-    @pytest.mark.asyncio
-    @patch("app.api.routes.toolset_resolvers.httpx.AsyncClient")
-    async def test_fallback_endpoint_on_config_error(self, mock_client_cls) -> None:
-        from app.api.routes.toolset_resolvers import check_user_is_admin as _check_user_is_admin
-
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-
-        mock_client = AsyncMock()
-        mock_client.get = AsyncMock(return_value=mock_response)
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
-        mock_client_cls.return_value = mock_client
-
-        request = MagicMock()
-        request.headers = {}
-
-        config_service = AsyncMock()
-        config_service.get_config = AsyncMock(side_effect=Exception("etcd down"))
-
-        result = await _check_user_is_admin("user-1", None, request, config_service)
-        assert result is True
-        # Verify the fallback URL is used
-        call_args = mock_client.get.call_args
-        assert "user-1/adminCheck" in call_args[0][0]
-
-    @pytest.mark.asyncio
-    @patch("app.api.routes.toolset_resolvers.httpx.AsyncClient")
-    async def test_exception_returns_false(self, mock_client_cls) -> None:
-        from app.api.routes.toolset_resolvers import check_user_is_admin as _check_user_is_admin
-
-        mock_client = AsyncMock()
-        mock_client.get = AsyncMock(side_effect=Exception("network error"))
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
-        mock_client_cls.return_value = mock_client
-
-        request = MagicMock()
-        request.headers = {}
-
-        config_service = AsyncMock()
-        config_service.get_config = AsyncMock(return_value={})
-
-        result = await _check_user_is_admin("user-1", None, request, config_service)
-        assert result is False
-
-    @pytest.mark.asyncio
-    @patch("app.api.routes.toolset_resolvers.httpx.AsyncClient")
-    async def test_forwards_auth_headers(self, mock_client_cls) -> None:
-        from app.api.routes.toolset_resolvers import check_user_is_admin as _check_user_is_admin
-
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-
-        mock_client = AsyncMock()
-        mock_client.get = AsyncMock(return_value=mock_response)
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
-        mock_client_cls.return_value = mock_client
-
-        request = MagicMock()
-        request.headers = {
-            "authorization": "Bearer abc",
-            "x-organization-id": "org-1",
-            "cookie": "session=xyz",
-            "content-type": "application/json",  # should not be forwarded
-        }
-
-        config_service = AsyncMock()
-        config_service.get_config = AsyncMock(return_value={"nodejs": {"endpoint": "http://test:3001"}})
-
-        await _check_user_is_admin("user-1", None, request, config_service)
-
-        call_kwargs = mock_client.get.call_args
-        forwarded = call_kwargs[1]["headers"]
-        assert forwarded["authorization"] == "Bearer abc"
-        assert forwarded["x-organization-id"] == "org-1"
-        assert forwarded["cookie"] == "session=xyz"
-        assert "content-type" not in forwarded
-
-
-# ---------------------------------------------------------------------------
 # _get_user_context
 # ---------------------------------------------------------------------------
 
@@ -712,14 +576,14 @@ class TestGetUserContext:
         assert ctx["user_id"] == "u1"
         assert ctx["org_id"] == "o1"
 
-    def test_fallback_to_headers(self) -> None:
+    def test_headers_are_ignored(self) -> None:
         from app.api.routes.toolsets import _get_user_context
         request = MagicMock()
         request.state.user = {}
         request.headers = {"X-User-Id": "u2", "X-Organization-Id": "o2"}
-        ctx = _get_user_context(request)
-        assert ctx["user_id"] == "u2"
-        assert ctx["org_id"] == "o2"
+        with pytest.raises(HTTPException) as exc:
+            _get_user_context(request)
+        assert exc.value.status_code == 401
 
     def test_missing_user_id_raises(self) -> None:
         from app.api.routes.toolsets import _get_user_context
@@ -2554,22 +2418,23 @@ class TestGetUserContextDeep:
         assert ctx["user_id"] == "state-user"
         assert ctx["org_id"] == "state-org"
 
-    def test_missing_org_id_does_not_raise(self) -> None:
+    def test_missing_org_id_raises(self) -> None:
         from app.api.routes.toolsets import _get_user_context
         request = MagicMock()
         request.state.user = {"userId": "u1"}
         request.headers = {}
-        ctx = _get_user_context(request)
-        assert ctx["user_id"] == "u1"
-        assert ctx["org_id"] is None or ctx["org_id"] == ""
+        with pytest.raises(HTTPException) as exc:
+            _get_user_context(request)
+        assert exc.value.status_code == 401
 
-    def test_state_attribute_error_falls_back_to_headers(self) -> None:
+    def test_headers_are_ignored(self) -> None:
         from app.api.routes.toolsets import _get_user_context
         request = MagicMock()
         request.state.user = {}
         request.headers = {"X-User-Id": "header-user", "X-Organization-Id": "header-org"}
-        ctx = _get_user_context(request)
-        assert ctx["user_id"] == "header-user"
+        with pytest.raises(HTTPException) as exc:
+            _get_user_context(request)
+        assert exc.value.status_code == 401
 
 
 # ===========================================================================
@@ -4282,13 +4147,14 @@ class TestGetUserContextToolsets:
         ctx = _get_user_context(request)
         assert ctx["user_id"] == "u1"
 
-    def test_from_headers(self) -> None:
+    def test_headers_are_ignored(self) -> None:
         from app.api.routes.toolsets import _get_user_context
         request = MagicMock()
         request.state.user = {}
         request.headers = {"X-User-Id": "u2", "X-Organization-Id": "o2"}
-        ctx = _get_user_context(request)
-        assert ctx["user_id"] == "u2"
+        with pytest.raises(HTTPException) as exc:
+            _get_user_context(request)
+        assert exc.value.status_code == 401
 
     def test_missing_user_id(self) -> None:
         from app.api.routes.toolsets import _get_user_context
@@ -4899,60 +4765,6 @@ class TestEncodeDecodeState:
             _decode_state_with_instance("not-valid-json-base64!!!")
 
 
-class TestCheckUserIsAdmin:
-    """Cover _check_user_is_admin function."""
-
-    @pytest.mark.asyncio
-    async def test_is_admin(self) -> None:
-        from app.api.routes.toolset_resolvers import check_user_is_admin as _check_user_is_admin
-        cs = AsyncMock()
-        cs.get_config = AsyncMock(return_value={"nodejs": {"endpoint": "http://localhost:3001"}})
-        request = MagicMock()
-        request.headers = {"authorization": "Bearer token"}
-
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        mock_client = AsyncMock()
-        mock_client.get = AsyncMock(return_value=mock_resp)
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
-
-        with patch("app.api.routes.toolset_resolvers.httpx.AsyncClient", return_value=mock_client):
-            result = await _check_user_is_admin("u1", None, request, cs)
-        assert result is True
-
-    @pytest.mark.asyncio
-    async def test_not_admin(self) -> None:
-        from app.api.routes.toolset_resolvers import check_user_is_admin as _check_user_is_admin
-        cs = AsyncMock()
-        cs.get_config = AsyncMock(return_value={"nodejs": {"endpoint": "http://localhost:3001"}})
-        request = MagicMock()
-        request.headers = {"authorization": "Bearer token"}
-
-        mock_resp = MagicMock()
-        mock_resp.status_code = 403
-        mock_client = AsyncMock()
-        mock_client.get = AsyncMock(return_value=mock_resp)
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
-
-        with patch("app.api.routes.toolset_resolvers.httpx.AsyncClient", return_value=mock_client):
-            result = await _check_user_is_admin("u1", None, request, cs)
-        assert result is False
-
-    @pytest.mark.asyncio
-    async def test_exception_defaults_false(self) -> None:
-        from app.api.routes.toolset_resolvers import check_user_is_admin as _check_user_is_admin
-        cs = AsyncMock()
-        cs.get_config = AsyncMock(side_effect=Exception("fail"))
-        request = MagicMock()
-        request.headers = {}
-
-        with patch("app.api.routes.toolset_resolvers.httpx.AsyncClient", side_effect=Exception("network")):
-            result = await _check_user_is_admin("u1", None, request, cs)
-        assert result is False
-
-
 class TestDeauthAllInstanceUsersWithExceptions:
     """Cover deauth edge cases with set_config exceptions."""
 
@@ -5052,14 +4864,14 @@ class TestGetUserContext:
         assert result["user_id"] == "u1"
         assert result["org_id"] == "o1"
 
-    def test_extracts_context_from_headers(self) -> None:
+    def test_headers_are_ignored(self) -> None:
         from app.api.routes.toolsets import _get_user_context
         request = MagicMock()
         request.state.user = {}
         request.headers = {"X-User-Id": "u2", "X-Organization-Id": "o2"}
-        result = _get_user_context(request)
-        assert result["user_id"] == "u2"
-        assert result["org_id"] == "o2"
+        with pytest.raises(HTTPException) as exc:
+            _get_user_context(request)
+        assert exc.value.status_code == 401
 
     def test_missing_user_id_raises(self) -> None:
         from app.api.routes.toolsets import _get_user_context
@@ -7040,14 +6852,14 @@ class TestGetUserContextFullCoverage:
         assert ctx["user_id"] == "u1"
         assert ctx["org_id"] == "o1"
 
-    def test_from_headers_fallback(self) -> None:
+    def test_headers_are_ignored(self) -> None:
         from app.api.routes.toolsets import _get_user_context
         request = MagicMock()
         request.state.user = {}
         request.headers = {"X-User-Id": "u2", "X-Organization-Id": "o2"}
-        ctx = _get_user_context(request)
-        assert ctx["user_id"] == "u2"
-        assert ctx["org_id"] == "o2"
+        with pytest.raises(HTTPException) as exc:
+            _get_user_context(request)
+        assert exc.value.status_code == 401
 
     def test_missing_user_id_raises(self) -> None:
         from app.api.routes.toolsets import _get_user_context
@@ -8017,7 +7829,7 @@ class TestGetAuthenticatedToolsets:
         config_service.get_config.return_value = []
         registry = MagicMock()
 
-        result = await get_authenticated_toolsets("u1", "o1", config_service, registry)
+        result, _auth = await get_authenticated_toolsets("u1", "o1", config_service, registry)
         assert result == []
 
     @pytest.mark.asyncio
@@ -8029,7 +7841,7 @@ class TestGetAuthenticatedToolsets:
         config_service.get_config.side_effect = Exception("etcd error")
         registry = MagicMock()
 
-        result = await get_authenticated_toolsets("u1", "o1", config_service, registry)
+        result, _auth = await get_authenticated_toolsets("u1", "o1", config_service, registry)
         assert result == []
 
     @pytest.mark.asyncio
@@ -8061,7 +7873,7 @@ class TestGetAuthenticatedToolsets:
             "tools": []
         }
 
-        result = await get_authenticated_toolsets("u1", "o1", config_service, registry)
+        result, _auth = await get_authenticated_toolsets("u1", "o1", config_service, registry)
         assert len(result) == 1
         assert result[0]["instanceId"] == "inst1"
 
@@ -8096,7 +7908,7 @@ class TestGetAuthenticatedToolsets:
             "tools": []
         }
 
-        result = await get_authenticated_toolsets("u1", "o1", config_service, registry)
+        result, _auth = await get_authenticated_toolsets("u1", "o1", config_service, registry)
         assert len(result) == 2
         instance_ids = [t["instanceId"] for t in result]
         assert "inst1" in instance_ids
@@ -8131,7 +7943,7 @@ class TestGetAuthenticatedToolsets:
             ]
         }
 
-        result = await get_authenticated_toolsets("u1", "o1", config_service, registry)
+        result, _auth = await get_authenticated_toolsets("u1", "o1", config_service, registry)
         assert len(result) == 1
         assert result[0]["toolCount"] == 2
         assert len(result[0]["tools"]) == 2
@@ -8158,7 +7970,7 @@ class TestGetAuthenticatedToolsets:
         registry = MagicMock()
         registry.get_toolset_metadata.return_value = None
 
-        result = await get_authenticated_toolsets("u1", "o1", config_service, registry)
+        result, _auth = await get_authenticated_toolsets("u1", "o1", config_service, registry)
         assert len(result) == 1
         assert result[0]["displayName"] == "unknown"
         assert result[0]["tools"] == []
@@ -8194,7 +8006,7 @@ class TestGetAuthenticatedToolsets:
             "tools": [{"name": "search", "description": "Search"}]
         }
 
-        result = await get_authenticated_toolsets("u1", "o1", config_service, registry)
+        result, _auth = await get_authenticated_toolsets("u1", "o1", config_service, registry)
         assert len(result) == 1
         toolset = result[0]
         assert toolset["instanceId"] == "inst1"

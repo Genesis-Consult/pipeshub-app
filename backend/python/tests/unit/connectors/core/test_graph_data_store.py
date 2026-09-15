@@ -1,5 +1,6 @@
 """Tests for GraphDataStore and GraphTransactionStore."""
 
+import asyncio
 import contextlib
 import logging
 from typing import Never
@@ -97,6 +98,7 @@ def mock_graph_provider():
     provider.get_record_by_conversation_index = AsyncMock(return_value=None)
     provider.get_record_by_weburl = AsyncMock(return_value=None)
     provider.get_records_by_parent = AsyncMock(return_value=[])
+    provider.get_records_by_record_type = AsyncMock(return_value=[])
     provider.get_record_path = AsyncMock(return_value=None)
     provider.get_app_creator_user = AsyncMock(return_value=None)
     provider.get_first_user_with_permission_to_node = AsyncMock(return_value=None)
@@ -275,6 +277,13 @@ class TestGraphTransactionStore:
     async def test_get_records_by_parent(self, tx_store, mock_graph_provider) -> None:
         await tx_store.get_records_by_parent("conn1", "parent1", record_type="file")
         mock_graph_provider.get_records_by_parent.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_get_records_by_record_type(self, tx_store, mock_graph_provider) -> None:
+        await tx_store.get_records_by_record_type("conn1", "DATABASE")
+        mock_graph_provider.get_records_by_record_type.assert_awaited_once_with(
+            "conn1", "DATABASE", transaction="txn-123"
+        )
 
     @pytest.mark.asyncio
     async def test_get_record_path(self, tx_store, mock_graph_provider) -> None:
@@ -634,7 +643,7 @@ class TestGraphTransactionStore:
         """Transaction store forwards recursive deletes to the graph provider."""
         await tx_store.delete_records_recursive(["r1", "r2"], "kb-1")
         mock_graph_provider.delete_records_recursive.assert_awaited_once_with(
-            ["r1", "r2"], "kb-1", transaction="txn-123"
+            ["r1", "r2"], "kb-1", transaction="txn-123", cascade_children=True
         )
 
     @pytest.mark.asyncio
@@ -1101,3 +1110,119 @@ class TestGraphTransactionStoreFindSlackBurst:
             connector_id="conn-1", channel_id="C123", ts="1.0"
         )
         assert result is None
+
+
+class TestTransactionRollsBackOnCancellation:
+    """A cancelled transaction must roll back, or its session leaks.
+
+    `asyncio.CancelledError` is a BaseException, so `except Exception` let a
+    cancellation -- the record-processing timeout, or a lost-lease guard --
+    pass through `transaction()` with neither rollback nor commit. The session
+    stayed in the Neo4j client's `_active_sessions` holding a pooled
+    connection, and nothing sweeps that map until process shutdown. Under
+    load each cancel leaked one of the pool's 100 connections until every
+    query waited out the 60s acquisition timeout -- producing more record
+    timeouts, more cancels, more leaks. Observed live as
+    "failed to obtain a connection from the pool within 60s" ~25 minutes
+    into every run.
+    """
+
+    @pytest.mark.asyncio
+    async def test_cancellation_inside_the_transaction_rolls_back(
+        self, mock_graph_provider
+    ) -> None:
+        store = GraphDataStore(logging.getLogger("test"), mock_graph_provider)
+
+        async def work() -> None:
+            async with store.transaction():
+                await asyncio.sleep(10)  # cancelled here
+
+        task = asyncio.create_task(work())
+        await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        mock_graph_provider.rollback_transaction.assert_awaited_once_with("txn-123")
+        mock_graph_provider.commit_transaction.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_failing_rollback_does_not_mask_the_cancellation(
+        self, mock_graph_provider
+    ) -> None:
+        """The client's abort already tolerates a dead session; if it still
+        raises, the caller must see the cancellation, not the rollback error."""
+        mock_graph_provider.rollback_transaction = AsyncMock(
+            side_effect=RuntimeError("session already gone")
+        )
+        store = GraphDataStore(logging.getLogger("test"), mock_graph_provider)
+
+        async def work() -> None:
+            async with store.transaction():
+                await asyncio.sleep(10)
+
+        task = asyncio.create_task(work())
+        await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        mock_graph_provider.rollback_transaction.assert_awaited_once()
+
+
+class TestExecuteInTransactionRetriesTransientFailures:
+    """Only when the provider says the failed attempt rolled back cleanly."""
+
+    @staticmethod
+    def _store(transient: bool) -> tuple[GraphDataStore, MagicMock]:
+        provider = MagicMock()
+        provider.begin_transaction = AsyncMock(side_effect=[f"txn-{i}" for i in range(10)])
+        provider.commit_transaction = AsyncMock()
+        provider.rollback_transaction = AsyncMock()
+        provider.is_transient_error = MagicMock(return_value=transient)
+        return GraphDataStore(MagicMock(), provider), provider
+
+    @pytest.mark.asyncio
+    async def test_a_transient_failure_is_retried_after_rollback(self, monkeypatch) -> None:
+        store, provider = self._store(transient=True)
+        monkeypatch.setattr("app.connectors.core.base.data_store.graph_data_store.asyncio.sleep", AsyncMock())
+        calls = 0
+
+        async def flaky(tx_store) -> str:
+            nonlocal calls
+            calls += 1
+            if calls < 3:
+                raise RuntimeError("DeadlockDetected")
+            return "done"
+
+        assert await store.execute_in_transaction(flaky) == "done"
+        assert calls == 3
+        assert provider.rollback_transaction.await_count == 2
+        provider.commit_transaction.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_non_transient_failure_is_not_retried(self) -> None:
+        store, provider = self._store(transient=False)
+        calls = 0
+
+        async def failing(tx_store) -> None:
+            nonlocal calls
+            calls += 1
+            raise RuntimeError("constraint violation")
+
+        with pytest.raises(RuntimeError, match="constraint"):
+            await store.execute_in_transaction(failing)
+        assert calls == 1
+        provider.rollback_transaction.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_the_retry_budget_is_bounded(self, monkeypatch) -> None:
+        store, provider = self._store(transient=True)
+        monkeypatch.setattr("app.connectors.core.base.data_store.graph_data_store.asyncio.sleep", AsyncMock())
+
+        async def always_deadlocks(tx_store) -> None:
+            raise RuntimeError("DeadlockDetected")
+
+        with pytest.raises(RuntimeError, match="Deadlock"):
+            await store.execute_in_transaction(always_deadlocks)
+        assert provider.rollback_transaction.await_count == 3

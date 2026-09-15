@@ -239,6 +239,7 @@ class TestAbstractMethodInventory:
         "get_record_by_issue_key",
         "get_record_by_weburl",
         "get_records_by_parent",
+        "get_records_by_record_type",
         "get_records_by_record_group",
         "get_records_by_parent_record",
         # Record group operations
@@ -308,6 +309,8 @@ class TestAbstractMethodInventory:
         "create_record_groups_relation",
         "create_inherit_permissions_relation_record_group",
         "get_accessible_virtual_record_ids",
+        "get_accessible_connector_types",
+        "get_records_by_virtual_record_id",
         "get_records_by_record_ids",
         "batch_upsert_record_permissions",
         "get_file_permissions",

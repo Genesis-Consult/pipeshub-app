@@ -4972,6 +4972,9 @@ class TestOnRecordsDeletedCascade:
 
         await proc.on_records_deleted_cascade(["r1"], "kb-123")
 
+        tx_store.delete_records_recursive.assert_awaited_once_with(
+            ["r1"], "kb-123", cascade_children=True,
+        )
         proc.messaging_producer.send_message.assert_awaited_once()
         assert proc.messaging_producer.send_message.await_args[0][1]["eventType"] == "deleteRecord"
 
@@ -5048,6 +5051,48 @@ class TestOnRecordsDeletedCascade:
 
         assert "vectorCleanupPending" not in result
         assert proc.messaging_producer.send_message.await_count == 2
+
+
+class TestOnRecordsDeletedCascadeAttachmentOnly:
+    """Tests for on_records_deleted_cascade with cascade_children=False."""
+
+    @pytest.mark.asyncio
+    async def test_empty_list(self):
+        proc = _make_processor()
+        result = await proc.on_records_deleted_cascade([], "conn-123", cascade_children=False)
+        assert result["success"] is True
+        assert result["total_requested"] == 0
+        proc.data_store_provider.transaction.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_publishes_delete_events_attachment_only(self):
+        proc = _make_processor()
+        tx_store = _make_tx_store()
+        tx_store.delete_records_recursive = AsyncMock(
+            return_value={
+                "success": True,
+                "eventData": {"payloads": [{"recordId": "r1", "virtualRecordId": "v1"}]},
+            }
+        )
+        proc.data_store_provider.transaction.return_value = _make_ctx(tx_store)
+
+        await proc.on_records_deleted_cascade(["r1"], "conn-123", cascade_children=False)
+
+        tx_store.delete_records_recursive.assert_awaited_once_with(
+            ["r1"], "conn-123", cascade_children=False,
+        )
+        proc.messaging_producer.send_message.assert_awaited_once()
+        assert proc.messaging_producer.send_message.await_args[0][1]["eventType"] == "deleteRecord"
+
+    @pytest.mark.asyncio
+    async def test_no_event_data(self):
+        proc = _make_processor()
+        tx_store = _make_tx_store()
+        tx_store.delete_records_recursive = AsyncMock(return_value={"success": True})
+        proc.data_store_provider.transaction.return_value = _make_ctx(tx_store)
+
+        await proc.on_records_deleted_cascade(["r1"], "conn-123", cascade_children=False)
+        proc.messaging_producer.send_message.assert_not_awaited()
 
 
 class TestOnNewRecordsKbUpload:
@@ -5389,3 +5434,48 @@ class TestPlaceholderFlag:
         assert kwargs["record_group_id"] == "rg-1"
         assert kwargs["is_placeholder"] is True
         assert kwargs["status_filters"] is None
+
+
+class TestOnRecordsMovedPromotesOnlyAckedRecords:
+    """on_records_moved discarded the publish result, so it could never mark a
+    record QUEUED -- and with new records now stored NOT_STARTED (see
+    TestNewRecordsAreStoredNotStarted in test_data_processor.py) that would
+    leave them NOT_STARTED even after a successful publish. It must mirror
+    on_new_records: CAS to QUEUED exactly the records whose event was acked.
+    """
+
+    pytestmark = pytest.mark.anyio
+
+    async def test_acked_new_records_are_swapped_to_queued(self) -> None:
+        tx_store = _make_tx_store()
+        proc = _setup_proc_for_moved(tx_store, old_record=None)
+        proc.messaging_producer.send_messages = AsyncMock(
+            side_effect=lambda topic, messages: [True, False]
+        )
+        moved = [
+            ("/old/a.py", _make_code_record(record_id="a", external_record_id="/new/a.py"), []),
+            ("/old/b.py", _make_code_record(record_id="b", external_record_id="/new/b.py"), []),
+        ]
+
+        await proc.on_records_moved(moved)
+
+        proc.messaging_producer.send_messages.assert_awaited_once()
+        # Only "a" was acked; "b" stays NOT_STARTED for the stranded-record
+        # sweep to re-publish rather than being marked QUEUED with no event.
+        proc.data_store_provider.compare_and_set_indexing_status.assert_awaited_once_with(
+            ["a"],
+            ProgressStatus.NOT_STARTED.value,
+            ProgressStatus.QUEUED.value,
+        )
+
+    async def test_a_wholly_failed_publish_swaps_nothing(self) -> None:
+        tx_store = _make_tx_store()
+        proc = _setup_proc_for_moved(tx_store, old_record=None)
+        proc.messaging_producer.send_messages = AsyncMock(
+            side_effect=lambda topic, messages: [False] * len(messages)
+        )
+
+        await proc.on_records_moved([("/old/a.py", _make_code_record(record_id="a"), [])])
+
+        cas = proc.data_store_provider.compare_and_set_indexing_status
+        assert all(call.args[0] == [] for call in cas.await_args_list)

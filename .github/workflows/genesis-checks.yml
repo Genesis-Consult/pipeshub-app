@@ -26,7 +26,7 @@ jobs:
         working-directory: backend/python
         run: |
           uv pip install --system -e .
-          uv pip install --system pytest pytest-asyncio pytest-timeout
+          uv pip install --system pytest pytest-asyncio pytest-timeout 'fakeredis[lua]'
       - name: Test Genesis integrations and affected shared services
         working-directory: backend/python
         run: >-
@@ -35,6 +35,11 @@ jobs:
           tests/unit/connectors/sources/test_bullhorn_connector.py
           tests/unit/connectors/sources/test_sharepoint*
           tests/unit/sources/client/test_bullhorn_client.py
+          tests/unit/api/routes/test_chatbot_document_attachments.py
+          tests/unit/modules/transformers/test_sink_orchestrator*
+          tests/unit/containers/utils/test_container_utils.py
+          tests/unit/services/messaging
+          tests/unit/services/vector_db
           tests/unit/events/test_processor*
           tests/unit/services/graph_db
           tests/unit/utils/test_docx_preflight.py
@@ -50,9 +55,25 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           cache: npm
           cache-dependency-path: backend/nodejs/apps/package-lock.json
       - run: npm ci
       - run: npm run build
       - run: npm test
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run test:unit
+      - run: npm run build

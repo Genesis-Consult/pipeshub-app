@@ -4,6 +4,7 @@
 # ==============================================================================
 # Covers:
 #   - Syntax validity of both installer scripts (bash -n).
+#   - Syntax validity of bootstrap-first-run.sh (first-run; writes PAT to a file).
 #   - Root wrapper repo mode: delegates to the in-tree installer with args.
 #   - Root wrapper standalone mode: downloads files (via a stubbed curl) into
 #     PIPESHUB_DIR and execs the downloaded installer with args.
@@ -11,7 +12,7 @@
 #     the main fallback all hit the correct download URLs.
 #   - Regression guards on the in-tree installer edits (16 GB-class RAM floor,
 #     host-side reachability check, health-gated "ready" banner, clone vs
-#     standalone command directory, plain compose progress, generous/overridable
+#     standalone command directory, TTY-aware compose progress, generous/overridable
 #     health-wait timeout).
 #   - Compose app healthcheck stays reconciled with the installer's readiness
 #     check (core services only; embedding excluded).
@@ -32,6 +33,7 @@ COMPOSE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_ROOT="$(cd "$COMPOSE_DIR/../.." && pwd)"
 ROOT_INSTALLER="$REPO_ROOT/install.sh"
 INNER_INSTALLER="$COMPOSE_DIR/install.sh"
+BOOTSTRAP="$COMPOSE_DIR/bootstrap-first-run.sh"
 
 TMP_ROOT="$(mktemp -d)"
 trap 'rm -rf "$TMP_ROOT"' EXIT
@@ -98,6 +100,7 @@ EOF
 echo "== Syntax checks =="
 if bash -n "$ROOT_INSTALLER" 2>/dev/null; then pass "root install.sh parses"; else fail "root install.sh parses"; fi
 if bash -n "$INNER_INSTALLER" 2>/dev/null; then pass "inner install.sh parses"; else fail "inner install.sh parses"; fi
+if bash -n "$BOOTSTRAP" 2>/dev/null; then pass "bootstrap-first-run.sh parses"; else fail "bootstrap-first-run.sh parses"; fi
 
 echo "== Root wrapper: repo mode delegates with args =="
 (
@@ -218,10 +221,12 @@ check ".env chmod is guarded" "$inner" '&& ! chmod 600 "$ENV_FILE"; then'
 check ".env chmod failure calls die" "$inner" 'die "Could not restrict permissions on $ENV_FILE"'
 check ".env backup locked to owner-only" "$inner" 'chmod 600 "$_backup"'
 check "crash-loop wait has 90s startup grace" "$inner" "ELAPSED >= 90"
-# Compose animates progress with cursor escapes that explode into hundreds of
-# duplicated frames when output is captured; force append-only plain progress.
-check "plain progress flag defined" "$inner" "_PROGRESS=(--progress plain)"
-check "plain progress applied to compose up/pull" "$inner" 'docker compose "${_PROGRESS[@]}"'
+# Compose progress and the health spinner share one _is_tty. The mapping
+# (true→tty, false→plain) is exercised via extract_fn below — grepping for
+# both strings would stay green if the branches were swapped.
+check "progress flag applied to compose up/pull" "$inner" 'docker compose "${_PROGRESS[@]}"'
+check "progress decision uses the testable helper" "$inner" 'resolve_compose_progress "$_is_tty"'
+check "one TTY flag for progress and health spinner" "$inner" '_is_tty=false; [[ -t 1 ]] && _is_tty=true'
 # First start (embedding model download + cold stack) can edge past 5 min; the
 # default must be generous and overridable so it does not falsely report failure.
 check "health wait default is 420s and overridable" "$inner" 'HEALTH_WAIT_SECS="${HEALTH_WAIT_SECS:-420}"'
@@ -387,6 +392,19 @@ check "stop validates project name from .env" "$stop_block" 'require_valid_proje
 uninstall_block="$(awk '/if \$FLAG_UNINSTALL; then/{g=1} g{print} g&&/^fi/{exit}' "$INNER_INSTALLER")"
 check "uninstall removes orphans" "$uninstall_block" "down -v --remove-orphans"
 
+echo "== In-tree installer: --rotate-signing-secrets =="
+check "rotate flag is parsed" "$inner" "FLAG_ROTATE_SIGNING_SECRETS=true"
+check "rotate flag is in usage" "$inner" "--rotate-signing-secrets"
+check "rotate confirms with ROTATE" "$inner" "Type ROTATE to confirm"
+check "rotate force-recreates app container" "$inner" "--force-recreate --no-deps pipeshub-ai"
+check "rotate rejected with --stop" "$inner" "cannot be combined with --stop"
+check "rotate rejected with --uninstall" "$inner" "cannot be combined with --uninstall"
+check "rotate requires existing .env" "$inner" "Signing-secret rotation requires an existing install"
+check "rotate writes one-shot id" "$inner" "persist_env_var ROTATE_SIGNING_SECRETS"
+check "rotate without upgrade skips image pull" "$inner" "rotating signing secrets only"
+compose_yml="$(cat "$COMPOSE_DIR/docker-compose.yml")"
+check "compose passes ROTATE_SIGNING_SECRETS" "$compose_yml" "ROTATE_SIGNING_SECRETS=\${ROTATE_SIGNING_SECRETS:-}"
+
 echo "== In-tree installer: cross-directory + port helpers (real functions) =="
 eval "$(extract_fn compose_other_working_dirs "$INNER_INSTALLER")"
 eval "$(extract_fn port_owned_by_project "$INNER_INSTALLER")"
@@ -473,6 +491,19 @@ check "pull fallback inspects sandbox image" "$inner" 'docker image inspect "$_S
 check "air-gapped guidance present" "$inner" "air-gapped host, preload the image"
 # Must not have reverted to a blanket pull of every service image on the hot path.
 if [[ "$inner" == *"up -d --pull always"* ]]; then fail "must refresh only the app image, not force-pull all services"; else pass "does not force-pull all service images"; fi
+
+echo "== In-tree installer: compose progress mode (real function) =="
+# Mapping must be tied to the TTY flag. Grepping for both "tty" and "plain"
+# in the script stays green if the branches are swapped.
+eval "$(extract_fn resolve_compose_progress "$INNER_INSTALLER")"
+check "tty terminal gets in-place progress" "$(resolve_compose_progress true)" "tty"
+check "captured stdout gets append-only progress" "$(resolve_compose_progress false)" "plain"
+check "unknown TTY flag defaults to plain" "$(resolve_compose_progress '')" "plain"
+if [[ "$(grep -Fc '_is_tty=false; [[ -t 1 ]] && _is_tty=true' "$INNER_INSTALLER")" -eq 1 ]]; then
+  pass "TTY flag assigned once"
+else
+  fail "TTY flag assigned once"
+fi
 
 echo "== In-tree installer: container outbound connectivity (warn-only) =="
 check "defines outbound probe helper" "$inner" "container_has_outbound_internet()"

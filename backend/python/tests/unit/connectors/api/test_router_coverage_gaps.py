@@ -99,6 +99,10 @@ def _make_stream_connector():
 
     conn = object.__new__(GoogleDriveTeamConnector)
     conn.logger = MagicMock()
+    conn.drive_data_source = MagicMock()
+    conn.drive_data_source.execute = AsyncMock(
+        side_effect=lambda operation: operation()
+    )
     return conn
 
 
@@ -125,7 +129,7 @@ def _mock_record(**overrides):
 def _mock_request(
     *,
     user: dict | None = None,
-    headers: dict | None = None,
+    is_admin: bool = False,
     body: dict | None = None,
     container: Any | None = None,
     connector_registry: Any | None = None,
@@ -133,19 +137,15 @@ def _mock_request(
     query_params: dict | None = None,
 ):
     req = MagicMock()
-    _headers = headers or {}
     user_data = dict(user or {"userId": "user-1", "orgId": "org-1"})
     if "role" not in user_data:
-        admin_hdr = str(
-            _headers.get("X-Is-Admin") or _headers.get("x-is-admin") or ""
-        ).lower()
-        user_data["role"] = "admin" if admin_hdr == "true" else "member"
+        user_data["role"] = "admin" if is_admin else "member"
     req.state = MagicMock()
     req.state.user = MagicMock()
     req.state.user.get = lambda k, default=None: user_data.get(k, default)
 
     req.headers = MagicMock()
-    req.headers.get = lambda k, default=None: _headers.get(k, default)
+    req.headers.get = lambda k, default=None: None
 
     if body is not None:
         req.json = AsyncMock(return_value=body)
@@ -902,7 +902,7 @@ class TestGetConnectorStatsGaps:
         registry.can_user_view_connector = AsyncMock(return_value=True)
         req = _mock_request(graph_provider=gp, connector_registry=registry)
 
-        result = await get_connector_stats_endpoint(req, connector_id="c1", org_id="org-1", graph_provider=gp)
+        result = await get_connector_stats_endpoint(req, connector_id="c1", graph_provider=gp)
         assert result["success"] is True
 
     @pytest.mark.asyncio
@@ -915,7 +915,7 @@ class TestGetConnectorStatsGaps:
         req = _mock_request(graph_provider=gp, connector_registry=registry)
 
         with pytest.raises(HTTPException) as exc_info:
-            await get_connector_stats_endpoint(req, connector_id="c1", org_id="org-1", graph_provider=gp)
+            await get_connector_stats_endpoint(req, connector_id="c1", graph_provider=gp)
         assert exc_info.value.status_code == HttpStatusCode.NOT_FOUND.value
 
     @pytest.mark.asyncio
@@ -929,7 +929,7 @@ class TestGetConnectorStatsGaps:
         req = _mock_request(graph_provider=gp, connector_registry=registry)
 
         with pytest.raises(HTTPException) as exc_info:
-            await get_connector_stats_endpoint(req, connector_id="c1", org_id="org-1", graph_provider=gp)
+            await get_connector_stats_endpoint(req, connector_id="c1", graph_provider=gp)
         assert exc_info.value.status_code == HttpStatusCode.INTERNAL_SERVER_ERROR.value
 
 
@@ -972,17 +972,16 @@ class TestStreamRecordOrgMismatch:
 
 class TestGetRecordByIdGaps:
     @pytest.mark.asyncio
-    async def test_no_access_raises_500_wrapping_404(self):
-        """When has_access is falsy, the inner 404 gets caught by outer except -> 500."""
+    async def test_no_access_raises_404(self):
+        """When has_access is falsy, it raises 404."""
         gp = AsyncMock()
         gp.check_record_access_with_details = AsyncMock(return_value=None)
         req = _mock_request()
 
         with pytest.raises(HTTPException) as exc_info:
             await get_record_by_id("rec-1", req, graph_provider=gp)
-        # The function raises 404 inside try, but the outer except Exception catches it
-        # and re-wraps as 500. This is a known pattern in the codebase.
-        assert exc_info.value.status_code == 500
+        assert exc_info.value.status_code == 404
+        assert exc_info.value.detail == "You do not have access to this record"
 
     @pytest.mark.asyncio
     async def test_exception_raises_500(self):
@@ -1495,7 +1494,6 @@ class TestUpdateConnectorInstanceNameGaps:
         req = _mock_request(
             connector_registry=registry,
             body={"instanceName": "New Name"},
-            headers={"X-Is-Admin": "false"},
         )
 
         with patch(f"{_ROUTER}.check_beta_connector_access", new_callable=AsyncMock):
@@ -1517,7 +1515,7 @@ class TestUpdateConnectorInstanceNameGaps:
         req = _mock_request(
             connector_registry=registry,
             body={"instanceName": "New Name"},
-            headers={"X-Is-Admin": "true"},
+            is_admin=True,
         )
 
         with patch(f"{_ROUTER}.check_beta_connector_access", new_callable=AsyncMock):
@@ -1781,7 +1779,7 @@ class TestGetValidatedConnectorInstanceGaps:
         })
         req = _mock_request(
             connector_registry=registry,
-            headers={"X-Is-Admin": "true"},
+            is_admin=True,
         )
 
         with patch(f"{_ROUTER}.check_beta_connector_access", new_callable=AsyncMock):
@@ -1861,7 +1859,7 @@ class TestCreateConnectorInstanceBetaGaps:
                 "instanceName": "Beta Conn",
                 "scope": "team",
             },
-            headers={"X-Is-Admin": "true"},
+            is_admin=True,
         )
 
         with pytest.raises(HTTPException) as exc_info:
@@ -1896,7 +1894,7 @@ class TestCreateConnectorInstanceBetaGaps:
                 "instanceName": "My Drive",
                 "scope": "team",
             },
-            headers={"X-Is-Admin": "true"},
+            is_admin=True,
         )
 
         with patch(f"{_ROUTER}.check_beta_connector_access", new_callable=AsyncMock):
@@ -1948,7 +1946,7 @@ class TestCreateConnectorInstanceConfigAuthMissing:
                 "oauthConfigId": "oid-1",
                 "authType": "OAUTH",
             },
-            headers={"X-Is-Admin": "true"},
+            is_admin=True,
         )
 
         with patch(f"{_ROUTER}.check_beta_connector_access", new_callable=AsyncMock):
@@ -2315,21 +2313,38 @@ class TestGetConfigPathForInstance:
 
 
 class TestValidateConnectorDeletionPermissions:
-    def test_team_non_admin_raises(self):
+    def test_team_creator_passes(self):
+        """Deletion is admin-or-creator: whoever set it up may remove it."""
+        from app.connectors.api.router import _validate_connector_deletion_permissions
+        _validate_connector_deletion_permissions(
+            {"scope": ConnectorScope.TEAM.value, "createdBy": "u1"},
+            "u1", is_admin=False, logger=logging.getLogger("test")
+        )
+
+    def test_team_non_admin_non_creator_raises(self):
         from app.connectors.api.router import _validate_connector_deletion_permissions
         with pytest.raises(HTTPException) as exc_info:
             _validate_connector_deletion_permissions(
                 {"scope": ConnectorScope.TEAM.value, "createdBy": "u1"},
-                "u1", is_admin=False, logger=logging.getLogger("test")
+                "someone-else", is_admin=False, logger=logging.getLogger("test")
             )
         assert exc_info.value.status_code == HttpStatusCode.FORBIDDEN.value
 
-    def test_personal_non_creator_raises(self):
+    def test_personal_admin_passes(self):
+        """An administrator can remove a personal connector whose creator is
+        gone; reading or altering it stays blocked by _can_access_connector."""
+        from app.connectors.api.router import _validate_connector_deletion_permissions
+        _validate_connector_deletion_permissions(
+            {"scope": ConnectorScope.PERSONAL.value, "createdBy": "other"},
+            "u1", is_admin=True, logger=logging.getLogger("test")
+        )
+
+    def test_personal_non_creator_non_admin_raises(self):
         from app.connectors.api.router import _validate_connector_deletion_permissions
         with pytest.raises(HTTPException) as exc_info:
             _validate_connector_deletion_permissions(
                 {"scope": ConnectorScope.PERSONAL.value, "createdBy": "other"},
-                "u1", is_admin=True, logger=logging.getLogger("test")
+                "u1", is_admin=False, logger=logging.getLogger("test")
             )
         assert exc_info.value.status_code == HttpStatusCode.FORBIDDEN.value
 
@@ -2424,7 +2439,7 @@ class TestFormatConnectorInUseDetail:
 class TestGetUserContext:
     def test_valid_user(self):
         from app.connectors.api.router import _get_user_context
-        req = _mock_request(headers={"X-Is-Admin": "true"})
+        req = _mock_request(is_admin=True)
         ctx = _get_user_context(req)
         assert ctx["user_id"] == "user-1"
         assert ctx["org_id"] == "org-1"
@@ -2628,7 +2643,7 @@ class TestGetValidatedConnectorInstanceAdditional:
             "scope": ConnectorScope.TEAM.value,
             "createdBy": "user-1",
         })
-        req = _mock_request(connector_registry=registry, headers={"X-Is-Admin": "false"})
+        req = _mock_request(connector_registry=registry)
 
         with patch(f"{_ROUTER}.check_beta_connector_access", new_callable=AsyncMock):
             with pytest.raises(HTTPException) as exc_info:
@@ -2643,7 +2658,7 @@ class TestGetValidatedConnectorInstanceAdditional:
             "scope": "custom",
             "createdBy": "other-user",
         })
-        req = _mock_request(connector_registry=registry, headers={"X-Is-Admin": "false"})
+        req = _mock_request(connector_registry=registry)
 
         with patch(f"{_ROUTER}.check_beta_connector_access", new_callable=AsyncMock):
             with pytest.raises(HTTPException) as exc_info:
@@ -2659,7 +2674,7 @@ class TestGetValidatedConnectorInstanceAdditional:
             "createdBy": "user-1",
         }
         registry.get_connector_instance = AsyncMock(return_value=instance)
-        req = _mock_request(connector_registry=registry, headers={"X-Is-Admin": "false"})
+        req = _mock_request(connector_registry=registry)
 
         with patch(f"{_ROUTER}.check_beta_connector_access", new_callable=AsyncMock):
             result = await get_validated_connector_instance("c1", req)
