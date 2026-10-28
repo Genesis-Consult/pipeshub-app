@@ -3,9 +3,11 @@
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from fastapi import HTTPException
 
 from app.config.constants.arangodb import MimeTypes, ProgressStatus
 from app.connectors.core.registry.filters import FilterCollection
@@ -19,11 +21,9 @@ from app.models.entities import AppUser, AppUserGroup, RecordGroupType, RecordTy
 from app.models.permission import EntityType, Permission, PermissionType
 import asyncio
 from app.connectors.core.registry.filters import (
-    FilterCollection,
     FilterOperator,
     SyncFilterKey,
 )
-from app.models.entities import AppUser, RecordGroupType, RecordType
 
 
 # ---------------------------------------------------------------------------
@@ -111,46 +111,6 @@ def mock_data_entities_processor():
     proc.remove_user_access_to_record = AsyncMock()
     proc.reindex_existing_records = AsyncMock()
     return proc
-
-
-@pytest.fixture()
-def mock_data_store_provider():
-    return _make_mock_data_store_provider()
-
-
-@pytest.fixture()
-def mock_config_service():
-    svc = AsyncMock()
-    svc.get_config = AsyncMock(return_value={
-        "auth": {
-            "clientId": "box-client-id",
-            "clientSecret": "box-client-secret",
-            "enterpriseId": "box-ent-123",
-        },
-    })
-    return svc
-
-
-@pytest.fixture()
-def box_connector(mock_logger, mock_data_entities_processor,
-                  mock_data_store_provider, mock_config_service):
-    with patch("app.connectors.sources.box.connector.BoxApp"):
-        connector = BoxConnector(
-            logger=mock_logger,
-            data_entities_processor=mock_data_entities_processor,
-            data_store_provider=mock_data_store_provider,
-            config_service=mock_config_service,
-            connector_id="box-conn-1",
-            scope="team",
-            created_by="test-user",
-        )
-    connector.sync_filters = FilterCollection()
-    connector.indexing_filters = FilterCollection()
-    connector.data_source = AsyncMock()
-    connector.box_cursor_sync_point = AsyncMock()
-    connector.box_cursor_sync_point.read_sync_point = AsyncMock(return_value={})
-    connector.box_cursor_sync_point.update_sync_point = AsyncMock()
-    return connector
 
 
 # ===========================================================================
@@ -344,25 +304,36 @@ class TestProcessBoxEntry:
     async def test_shared_link_company_adds_org_permission(self, box_connector):
         entry = _make_box_entry(shared_link={"access": "company", "url": "https://box.com/s/123"})
         box_connector.data_source.collaborations_get_file_collaborations = AsyncMock(
-            return_value=MagicMock(success=False, error="None")
+            return_value=MagicMock(success=True, data={"entries": []})
         )
         result = await box_connector._process_box_entry(
             entry, user_id="u1", user_email="user@test.com", record_group_id="rg1"
         )
-        org_perms = [p for p in result.new_permissions if "ORG_" in (p.external_id or "")]
-        assert len(org_perms) == 1
-        assert org_perms[0].entity_type == EntityType.GROUP
+        org_id = box_connector.data_entities_processor.org_id
+        assert [(p.external_id, p.entity_type, p.type) for p in result.new_permissions] == [
+            (org_id, EntityType.ORG, PermissionType.READ)
+        ]
 
-    async def test_shared_link_open_adds_public_permission(self, box_connector):
-        entry = _make_box_entry(shared_link={"access": "open", "url": "https://box.com/s/public"})
+    async def test_shared_link_company_is_not_applied_when_collaborators_are_unreadable(self, box_connector) -> None:
+        entry = _make_box_entry(shared_link={"access": "company", "url": "https://box.com/s/123"})
         box_connector.data_source.collaborations_get_file_collaborations = AsyncMock(
             return_value=MagicMock(success=False, error="None")
         )
         result = await box_connector._process_box_entry(
             entry, user_id="u1", user_email="user@test.com", record_group_id="rg1"
         )
-        public_perms = [p for p in result.new_permissions if p.external_id == "PUBLIC"]
-        assert len(public_perms) == 1
+        assert result.new_permissions == []
+        assert result.permissions_changed is False
+
+    async def test_shared_link_open_writes_no_grant(self, box_connector):
+        entry = _make_box_entry(shared_link={"access": "open", "url": "https://box.com/s/public"})
+        box_connector.data_source.collaborations_get_file_collaborations = AsyncMock(
+            return_value=MagicMock(success=True, data={"entries": []})
+        )
+        result = await box_connector._process_box_entry(
+            entry, user_id="u1", user_email="user@test.com", record_group_id="rg1"
+        )
+        assert result.new_permissions == []
 
     async def test_shared_with_me_detected(self, box_connector):
         entry = _make_box_entry(owned_by={"id": "other-user"})
@@ -458,19 +429,21 @@ class TestBoxGetPermissions:
         assert len(perms) == 1
         assert perms[0].type == PermissionType.WRITE
 
-    async def test_failed_response_returns_empty(self, box_connector):
+    async def test_failed_response_returns_none(self, box_connector):
+        # None, not []: an unread list must not be applied as "no collaborators".
         box_connector.data_source.collaborations_get_file_collaborations = AsyncMock(
-            return_value=MagicMock(success=False, error="Access denied")
+            return_value=MagicMock(success=False, error="503 Service Unavailable")
         )
         perms = await box_connector._get_permissions("f1", "file")
-        assert perms == []
+        assert perms is None
 
-    async def test_404_returns_empty(self, box_connector):
+    async def test_404_keeps_stored_access_without_a_retry(self, box_connector):
         box_connector.data_source.collaborations_get_file_collaborations = AsyncMock(
             return_value=MagicMock(success=False, error="404 not found")
         )
         perms = await box_connector._get_permissions("f1", "file")
-        assert perms == []
+        assert perms is None
+        assert box_connector._read_complete is True
 
     async def test_skips_entries_without_id(self, box_connector):
         collab_data = {
@@ -484,12 +457,12 @@ class TestBoxGetPermissions:
         perms = await box_connector._get_permissions("f1", "file")
         assert perms == []
 
-    async def test_exception_returns_empty(self, box_connector):
+    async def test_exception_returns_none(self, box_connector):
         box_connector.data_source.collaborations_get_file_collaborations = AsyncMock(
             side_effect=Exception("API error")
         )
         perms = await box_connector._get_permissions("f1", "file")
-        assert perms == []
+        assert perms is None
 
 
 # ===========================================================================
@@ -818,7 +791,7 @@ class TestBoxRunSync:
             new_callable=AsyncMock,
             return_value=(MagicMock(), MagicMock()),
         ):
-            # It should still proceed past read_sync_point failure
+            # An unreadable cursor stops the run; a full sync would re-anchor at "now" and drop events.
             box_connector.data_source.events_get_events = AsyncMock(
                 return_value=MagicMock(success=False, data={})
             )
@@ -828,7 +801,10 @@ class TestBoxRunSync:
             box_connector._sync_user_groups = AsyncMock()
             box_connector._sync_record_groups = AsyncMock()
             box_connector._process_users_in_batches = AsyncMock()
-            await box_connector.run_sync()
+            with pytest.raises(Exception, match="read fail"):
+                await box_connector.run_sync()
+            box_connector._sync_users.assert_not_awaited()
+            box_connector.data_source.events_get_events.assert_not_awaited()
 
 
 class TestBoxSyncFolderRecursively:
@@ -1825,8 +1801,10 @@ class TestBoxExecuteDeletions:
 class TestBoxGetSignedUrl:
     async def test_no_data_source(self, box_connector):
         box_connector.data_source = None
-        result = await box_connector.get_signed_url(MagicMock())
-        assert result is None
+        # Not "file missing" - the connector itself is not connected.
+        with pytest.raises(HTTPException) as exc_info:
+            await box_connector.get_signed_url(MagicMock())
+        assert exc_info.value.status_code == 409
 
     async def test_success(self, box_connector):
         record = MagicMock()
@@ -1853,8 +1831,29 @@ class TestBoxGetSignedUrl:
         box_connector.data_source.downloads_get_download_file_url = AsyncMock(
             return_value=MagicMock(success=False, error="denied")
         )
-        result = await box_connector.get_signed_url(record)
-        assert result is None
+        with pytest.raises(HTTPException) as exc_info:
+            await box_connector.get_signed_url(record)
+        # No status to map, so a generic failure - never an invented 404.
+        assert exc_info.value.status_code == 500
+
+    async def test_expired_token_is_not_reported_as_deleted(self, box_connector):
+        record = MagicMock()
+        record.external_record_id = "f1"
+        record.external_record_group_id = "u1"
+        record.record_name = "doc.pdf"
+        record.id = "r1"
+
+        class _BoxAPIError(Exception):
+            response_info = SimpleNamespace(status_code=401)
+
+        box_connector.data_source.set_as_user_context = AsyncMock()
+        box_connector.data_source.clear_as_user_context = AsyncMock()
+        box_connector.data_source.downloads_get_download_file_url = AsyncMock(
+            side_effect=_BoxAPIError("token expired")
+        )
+        with pytest.raises(HTTPException) as exc_info:
+            await box_connector.get_signed_url(record)
+        assert exc_info.value.status_code == 409
 
     async def test_exception(self, box_connector):
         record = MagicMock()
@@ -1865,8 +1864,10 @@ class TestBoxGetSignedUrl:
             side_effect=Exception("error")
         )
         box_connector.data_source.clear_as_user_context = AsyncMock()
-        result = await box_connector.get_signed_url(record)
-        assert result is None
+        # The SDK failure must propagate, not collapse into None -> 404.
+        with pytest.raises(HTTPException) as exc_info:
+            await box_connector.get_signed_url(record)
+        assert exc_info.value.status_code == 500
 
     async def test_no_context_user_id(self, box_connector):
         record = MagicMock()

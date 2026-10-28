@@ -64,8 +64,12 @@ export const ProfileApi = {
   },
 
   /** PUT /api/v1/users/{userId} */
-  async updateUser(userId: string, payload: UpdateUserPayload): Promise<void> {
-    await apiClient.put(`${USERS_URL}/${userId}`, payload);
+  async updateUser(
+    userId: string,
+    payload: UpdateUserPayload,
+    config?: { suppressErrorToast?: boolean },
+  ): Promise<void> {
+    await apiClient.put(`${USERS_URL}/${userId}`, payload, config);
   },
 
   /** GET /api/v1/users/dp — download current user's avatar (resolved from JWT) */
@@ -108,6 +112,17 @@ export const ProfileApi = {
   // ─────────────────────────────────────────────────────────────────────────
   // Change Password — used by the profile change-password UI flow
   // ─────────────────────────────────────────────────────────────────────────
+
+  /** GET /api/v1/userAccount/password/status */
+  async getPasswordStatus(): Promise<{ hasPassword: boolean }> {
+    const { data } = await apiClient.get<{ hasPassword: boolean }>(`${AUTH_URL}/password/status`);
+    return data;
+  },
+
+  /** POST /api/v1/userAccount/password/setup/email — mails the link for a first password */
+  async sendPasswordSetupEmail(): Promise<void> {
+    await apiClient.post(`${AUTH_URL}/password/setup/email`);
+  },
 
   /** POST /api/v1/userAccount/password/reset */
   async changePassword(payload: ChangePasswordPayload): Promise<void> {

@@ -9,10 +9,13 @@ describe('OIDCProviderController', () => {
   let mockOAuthTokenService: any
   let mockScopeValidatorService: any
   let mockAppConfig: any
+  let mockFirstPartyDeviceAppService: any
   let mockRes: any
   let mockNext: any
 
   beforeEach(() => {
+    delete process.env.PIPESHUB_ENABLE_DCR
+    delete process.env.PIPESHUB_ENABLE_DEVICE_GRANT
     mockOAuthTokenService = {
       getAlgorithm: sinon.stub().returns('HS256'),
       getPublicKey: sinon.stub().returns(undefined),
@@ -28,16 +31,27 @@ describe('OIDCProviderController', () => {
       oauthIssuer: 'http://localhost:3000',
       mcpScopes: ['org:read'],
     }
+    mockFirstPartyDeviceAppService = {
+      getOrCreate: sinon.stub().resolves('pipeshub-agent'),
+    }
+    // Built as the Enterprise edition does, so the shared discovery logic is
+    // exercised; the Community answer has its own test below.
     controller = new OIDCProviderController(
       mockOAuthTokenService,
       mockScopeValidatorService,
       mockAppConfig,
+      mockFirstPartyDeviceAppService,
+      true,
     )
     mockRes = { json: sinon.stub(), status: sinon.stub().returnsThis(), setHeader: sinon.stub() }
     mockNext = sinon.stub()
   })
 
-  afterEach(() => { sinon.restore() })
+  afterEach(() => {
+    sinon.restore()
+    delete process.env.PIPESHUB_ENABLE_DCR
+    delete process.env.PIPESHUB_ENABLE_DEVICE_GRANT
+  })
 
   describe('openidConfiguration', () => {
     it('should return valid OIDC configuration', async () => {
@@ -49,7 +63,80 @@ describe('OIDCProviderController', () => {
       expect(config.userinfo_endpoint).to.include('/userinfo')
       expect(config.response_types_supported).to.deep.equal(['code'])
       expect(config.grant_types_supported).to.include('authorization_code')
-      expect(config.code_challenge_methods_supported).to.deep.equal(['S256', 'plain'])
+      // Advertised where delegation exists.
+      expect(config.grant_types_supported).to.include(
+        'urn:ietf:params:oauth:grant-type:token-exchange',
+      )
+      expect(config.grant_types_supported).to.include(
+        'urn:ietf:params:oauth:grant-type:device_code',
+      )
+      expect(config.registration_endpoint).to.equal(undefined)
+      expect(config.device_authorization_endpoint).to.include(
+        '/device_authorization',
+      )
+      expect(config.token_endpoint_auth_methods_supported).to.include('none')
+    })
+
+    it('does not advertise delegation where the edition does not offer it', async () => {
+      const community = new OIDCProviderController(
+        mockOAuthTokenService,
+        mockScopeValidatorService,
+        mockAppConfig,
+        mockFirstPartyDeviceAppService,
+        false,
+      )
+
+      await community.openidConfiguration({} as any, mockRes, mockNext)
+      const config = mockRes.json.firstCall.args[0]
+
+      // Listing a grant the token endpoint will always refuse would send an
+      // integrator down a road that ends in an error.
+      expect(config.grant_types_supported).to.not.include(
+        'urn:ietf:params:oauth:grant-type:token-exchange',
+      )
+      // The rest of discovery is unchanged.
+      expect(config.grant_types_supported).to.include('authorization_code')
+      expect(config.code_challenge_methods_supported).to.deep.equal(['S256'])
+      expect(config.pipeshub_device_client_id).to.equal('pipeshub-agent')
+    })
+
+    it('should omit pipeshub_device_client_id when the instance has no org yet', async () => {
+      mockFirstPartyDeviceAppService.getOrCreate.resolves(null)
+      await controller.openidConfiguration({} as any, mockRes, mockNext)
+      const config = mockRes.json.firstCall.args[0]
+      expect(config.pipeshub_device_client_id).to.equal(undefined)
+      expect(config.device_authorization_endpoint).to.include(
+        '/device_authorization',
+      )
+    })
+
+    it('should advertise registration_endpoint only when DCR is enabled', async () => {
+      process.env.PIPESHUB_ENABLE_DCR = 'true'
+      await controller.openidConfiguration({} as any, mockRes, mockNext)
+      const config = mockRes.json.firstCall.args[0]
+      expect(config.registration_endpoint).to.include('/register')
+    })
+
+    it('should omit device grant metadata when the device grant is disabled', async () => {
+      process.env.PIPESHUB_ENABLE_DEVICE_GRANT = 'false'
+      await controller.openidConfiguration({} as any, mockRes, mockNext)
+      const config = mockRes.json.firstCall.args[0]
+      expect(config.device_authorization_endpoint).to.equal(undefined)
+      expect(config.grant_types_supported).to.not.include(
+        'urn:ietf:params:oauth:grant-type:device_code',
+      )
+      expect(config.pipeshub_device_client_id).to.equal(undefined)
+      expect(mockFirstPartyDeviceAppService.getOrCreate.called).to.be.false
+    })
+
+    it('should not advertise registration_endpoint for truthy values other than true', async () => {
+      for (const value of ['TRUE', '1', 'yes', 'on']) {
+        process.env.PIPESHUB_ENABLE_DCR = value
+        mockRes.json.resetHistory()
+        await controller.openidConfiguration({} as any, mockRes, mockNext)
+        const config = mockRes.json.firstCall.args[0]
+        expect(config.registration_endpoint, value).to.equal(undefined)
+      }
     })
   })
 
@@ -60,6 +147,22 @@ describe('OIDCProviderController', () => {
       expect(meta.resource).to.include('/mcp')
       expect(meta.authorization_servers).to.deep.equal(['http://localhost:3000'])
       expect(meta.bearer_methods_supported).to.deep.equal(['header'])
+      expect(meta.pipeshub_device_client_id).to.equal('pipeshub-agent')
+    })
+
+    it('should list only the MCP_SCOPES the MCP tools use', async () => {
+      mockAppConfig.mcpScopes = ['openid', 'email', 'offline_access', 'semantic:write', 'conversation:write', 'kb:read']
+      await controller.oauthProtectedResource({} as any, mockRes, mockNext)
+      const meta = mockRes.json.firstCall.args[0]
+      expect(meta.scopes_supported).to.deep.equal(['offline_access', 'semantic:write', 'kb:read'])
+    })
+
+    it('should omit pipeshub_device_client_id when the device grant is disabled', async () => {
+      process.env.PIPESHUB_ENABLE_DEVICE_GRANT = 'false'
+      await controller.oauthProtectedResource({} as any, mockRes, mockNext)
+      const meta = mockRes.json.firstCall.args[0]
+      expect(meta.pipeshub_device_client_id).to.equal(undefined)
+      expect(mockFirstPartyDeviceAppService.getOrCreate.called).to.be.false
     })
   })
 

@@ -19,6 +19,52 @@ class SyncDataPointType(Enum):
 def generate_record_sync_point_key(record_type: str, entity_name: str, entity_id: str) -> str:
     return f"{record_type}/{entity_name}/{entity_id}"
 
+
+class FailedItems:
+    """Items a listing failed to process, so its checkpoint stays before them.
+
+    An incremental sync lists only items modified after the saved time. Saving
+    the newest time seen would skip a failed item forever; saving just before
+    the earliest failure retries it next run without re-listing everything.
+    """
+
+    def __init__(self) -> None:
+        self.count = 0
+        self._earliest_ms: Optional[int] = None
+
+    def add(self, cutoff_ms: Optional[int]) -> None:
+        """Count a failure. Pass its modified time only if the date cutoff can skip it.
+
+        Folders and items without a time pass the cutoff every run, so they are
+        retried anyway; holding the checkpoint for them would only re-list newer items.
+        """
+        self.count += 1
+        if cutoff_ms is not None and (self._earliest_ms is None or cutoff_ms < self._earliest_ms):
+            self._earliest_ms = cutoff_ms
+
+    def checkpoint(self, max_timestamp: int) -> int:
+        """The time to save as the next run's cutoff."""
+        if self._earliest_ms is None:
+            return max_timestamp
+        return min(max_timestamp, self._earliest_ms - 1)
+
+
+# S3, MinIO, GCS and Azure refuse requests from a clock more than 15 minutes off, so store times trail ours by less.
+LISTING_CLOCK_SKEW_MS = 15 * 60 * 1000
+
+
+def listing_checkpoint(checkpoint: int, listing_started_at: Optional[int]) -> Optional[int]:
+    """The time to save after a listing by name reached its end; None keeps the saved one.
+
+    A key changed during the listing, behind the point it had reached, is dated
+    after the listing started but can be older than the newest time it saw.
+    ``listing_started_at`` is None for a run resumed from a token saved before
+    the start was recorded.
+    """
+    if listing_started_at is None:
+        return None
+    return min(checkpoint, listing_started_at - LISTING_CLOCK_SKEW_MS)
+
 class SyncPoint(ISyncPoint):
     connector_id: str
     org_id: str
@@ -108,7 +154,14 @@ class SyncPoint(ISyncPoint):
     async def read_sync_point(self, sync_point_key: str) -> Dict[str, Any]:
         async with self.data_store_provider.transaction() as tx_store:
             full_sync_point_key = self._get_full_sync_point_key(sync_point_key)
-            sync_point = await tx_store.get_sync_point(full_sync_point_key)
+            # Raising: every connector reads an empty result here as "this has
+            # never synced" and falls back to a first-sync window -- 30 days for
+            # Slack. A checkpoint older than that window would then be skipped
+            # over, and the sync that follows writes a fresh checkpoint on top,
+            # so the gap is sealed and never fetched again.
+            sync_point = await tx_store.get_sync_point(
+                full_sync_point_key, raise_on_error=True
+            )
 
             if not sync_point:
                 return {}

@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any
+from typing import Any, Never
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.agent_loop_lib.events.base import AgentEvent, EventType, RunContext, ToolCallStatus
+from app.agents.agent_loop.error_classification import _USER_MESSAGES
 from app.agents.agent_loop.sse_emitter import SSEEventEmitter
 from app.agents.agent_loop.stream_bridge import (
     QueueEventSink,
@@ -229,6 +230,33 @@ class TestQueueEventSinkCoalescing:
         assert flushed_snapshot == answer_delta
         assert await queue.get() == artifact_add
 
+    async def test_the_snapshot_marking_a_discard_never_merges_into_the_next(self) -> None:
+        """The client drops answer snapshots after `message_discarded` until it
+        sees the one marked `/discarded`; merged away, the marker is lost and
+        the error answer or retry that follows would be dropped too."""
+        queue: asyncio.Queue = asyncio.Queue(maxsize=1)
+        sink = QueueEventSink(queue)
+        await self._fill_queue(queue)
+
+        cleared = {"event": "STATE_DELTA", "data": {"delta": [
+            {"op": "replace", "path": "/normalizedAnswer", "value": ""},
+            {"op": "replace", "path": "/discarded", "value": True},
+        ]}}
+        error = {"event": "STATE_DELTA", "data": {"delta": [
+            {"op": "replace", "path": "/normalizedAnswer", "value": "The call failed."},
+        ]}}
+        cleared_write = asyncio.ensure_future(sink.write(cleared))
+        await asyncio.sleep(0)
+        assert not cleared_write.done(), "a marked snapshot waits for a slot instead of pending"
+
+        await queue.get()
+        await asyncio.wait_for(cleared_write, timeout=1)
+        await sink.write(error)
+
+        assert await queue.get() == cleared
+        await sink.flush()
+        assert await queue.get() == error
+
     async def test_state_delta_two_adjacent_add_ops_never_merge(self) -> None:
         """Two artifacts registered back-to-back must both survive even
         though they share the same `(STATE_DELTA, "")` coalesce key an
@@ -344,6 +372,22 @@ class TestSSEEventEmitterTranslation:
 
         sink.write.assert_awaited_once_with(
             {"event": "tool_result", "data": {"tool": "jira_search", "result": "blocked after 3 failures", "status": "error"}}
+        )
+
+    async def test_a_call_awaiting_approval_is_an_unrun_call_for_legacy_clients(self) -> None:
+        sink = MagicMock()
+        sink.write = AsyncMock(return_value=True)
+        emitter = SSEEventEmitter(sink)
+
+        await emitter.emit(
+            _event(EventType.TOOL_CALL_END, {
+                "tool": "mcp_jira_create_issue", "reason": "Waiting for your approval.",
+                "status": ToolCallStatus.AWAITING_APPROVAL,
+            })
+        )
+
+        sink.write.assert_awaited_once_with(
+            {"event": "tool_result", "data": {"tool": "mcp_jira_create_issue", "result": "Waiting for your approval.", "status": "error"}}
         )
 
     async def test_unmapped_event_types_are_silently_dropped(self) -> None:
@@ -507,6 +551,23 @@ class TestSSEEventEmitterChildVisibility:
         )
 
 
+# 2026-07-27 03:00:00 UTC, a Monday; Sunday 8:00 PM in California.
+_MON_0300_UTC = 1785121200000
+
+
+def _record_header_created_at() -> str:
+    """The `Created At:` line a tool renders for a record, as the model sees it."""
+    from app.config.constants.arangodb import Connectors, OriginTypes
+    from app.models.entities import Record, RecordType
+
+    record = Record(
+        record_name="r", record_type=RecordType.FILE, external_record_id="e", version=1,
+        origin=OriginTypes.CONNECTOR, connector_name=Connectors.GOOGLE_DRIVE, connector_id="c",
+        source_created_at=_MON_0300_UTC,
+    )
+    return next(line for line in record.to_llm_context().splitlines() if line.startswith("Created At:"))
+
+
 class TestRunAgentLoopStream:
     @staticmethod
     def _base_kwargs() -> dict[str, Any]:
@@ -552,7 +613,7 @@ class TestRunAgentLoopStream:
             agent = _stream_agent(MagicMock(success=True, error=None))
             return agent, MagicMock(), MagicMock(), []
 
-        async def _fake_finalizer_run(self, *, agent_success, agent_error, event_sink, agent_output=None, streamed_answer="", reasoning_turns=None, agent_confidence=None):
+        async def _fake_finalizer_run(self, *, agent_success, agent_error, event_sink, agent_output=None, streamed_answer="", reasoning_turns=None, agent_confidence=None, agent_cancelled=False, agent_needs_input=None):
             await event_sink.write({"event": "complete", "data": {"answer": "42"}})
             return {"answer": "42"}
 
@@ -585,6 +646,87 @@ class TestRunAgentLoopStream:
         assert events[1].startswith("event: complete\n")
         assert json.loads(events[1].split("data: ", 1)[1].strip()) == {"answer": "42"}
 
+    async def test_record_dates_in_the_run_use_the_users_time_zone(self) -> None:
+        """Tools run inside the run's task render record dates in the user's
+        zone, weekday included; nothing outside the run is affected."""
+        seen: dict[str, str] = {}
+
+        async def _fake_create(self, context, llm, chat_mode, *, query, model_name="", session_id=None, model_key=None) -> tuple[Any, Any, Any, list[Any]]:
+            seen["header"] = await asyncio.create_task(asyncio.to_thread(_record_header_created_at))
+            return _stream_agent(MagicMock(success=True, error=None)), MagicMock(), MagicMock(), []
+
+        async def _fake_finalizer_run(self, **kwargs) -> dict[str, str]:
+            return {"answer": "ok"}
+
+        with (
+            patch(
+                "app.modules.agents.qna.chat_state.build_initial_state",
+                return_value={
+                    "org_id": "org-1", "user_id": "user-1", "query": "hello",
+                    "timezone": "America/Los_Angeles",
+                },
+            ),
+            patch(
+                "app.agents.agent_loop.stream_bridge.PipesHubAgentFactory.create",
+                new=_fake_create,
+            ),
+            patch(
+                "app.agents.agent_loop.stream_bridge.AnswerFinalizer.run",
+                new=_fake_finalizer_run,
+            ),
+        ):
+            [chunk async for chunk in run_agent_loop_stream(**self._base_kwargs())]
+
+        assert seen["header"] == "Created At: 2026-07-27 03:00:00 UTC (Sun, Jul 26, 2026, 8:00 PM PDT)"
+        assert _record_header_created_at().endswith("(Mon, Jul 27, 2026, 3:00 AM UTC)")
+
+    async def test_sql_allowlist_is_agent_knowledge_intersected_with_user_connectors(self) -> None:
+        """Only a SQL connector that is both attached to the agent AND visible
+        to this user (in this org) may be queried by `execute_sql_query`."""
+        captured: dict[str, Any] = {}
+
+        async def _fake_create(self, context, llm, chat_mode, *, query, model_name="", session_id=None, model_key=None):
+            captured["allowed"] = context.tool_state.get("allowed_sql_connector_ids")
+            return _stream_agent(MagicMock(success=True, error=None)), MagicMock(), MagicMock(), []
+
+        async def _fake_finalizer_run(self, **kwargs):
+            return {"answer": "ok"}
+
+        user_instances = [
+            {"_key": "pg-attached", "type": "POSTGRESQL", "isConfigured": True, "orgId": "org-1"},
+            {"_key": "pg-not-attached", "type": "POSTGRESQL", "isConfigured": True, "orgId": "org-1"},
+            {"_key": "pg-other-org", "type": "POSTGRESQL", "isConfigured": True, "orgId": "org-2"},
+        ]
+        agent_knowledge = [
+            {"connectorId": "pg-attached", "type": "POSTGRESQL"},
+            {"connectorId": "pg-other-org", "type": "POSTGRESQL"},
+            {"connectorId": "pg-user-cannot-see", "type": "POSTGRESQL"},
+        ]
+        with (
+            patch(
+                "app.utils.connector_instances.fetch_user_connector_instances",
+                new=AsyncMock(return_value=user_instances),
+            ),
+            patch(
+                "app.modules.agents.qna.chat_state.build_initial_state",
+                return_value={
+                    "org_id": "org-1", "user_id": "user-1", "query": "hello",
+                    "agent_knowledge": agent_knowledge,
+                },
+            ),
+            patch(
+                "app.agents.agent_loop.stream_bridge.PipesHubAgentFactory.create",
+                new=_fake_create,
+            ),
+            patch(
+                "app.agents.agent_loop.stream_bridge.AnswerFinalizer.run",
+                new=_fake_finalizer_run,
+            ),
+        ):
+            [chunk async for chunk in run_agent_loop_stream(**self._base_kwargs())]
+
+        assert captured["allowed"] == {"pg-attached"}
+
     async def test_terminal_answer_streamed_live_before_finalizer_runs(self) -> None:
         """`_produce()` must drive the agent via `agent.stream(goal)` and
         feed every yielded event through `TerminalAnswerStreamer` — a
@@ -605,7 +747,7 @@ class TestRunAgentLoopStream:
             )
             return agent, MagicMock(), MagicMock(), []
 
-        async def _fake_finalizer_run(self, *, agent_success, agent_error, event_sink, agent_output=None, streamed_answer="", reasoning_turns=None, agent_confidence=None):
+        async def _fake_finalizer_run(self, *, agent_success, agent_error, event_sink, agent_output=None, streamed_answer="", reasoning_turns=None, agent_confidence=None, agent_cancelled=False, agent_needs_input=None):
             captured_streamed_answer["value"] = streamed_answer
             await event_sink.write({"event": "complete", "data": {"answer": agent_output}})
             return {"answer": agent_output}
@@ -664,7 +806,7 @@ class TestRunAgentLoopStream:
             )
             return agent, MagicMock(), MagicMock(), []
 
-        async def _fake_finalizer_run(self, *, agent_success, agent_error, event_sink, agent_output=None, streamed_answer="", reasoning_turns=None, agent_confidence=None):
+        async def _fake_finalizer_run(self, *, agent_success, agent_error, event_sink, agent_output=None, streamed_answer="", reasoning_turns=None, agent_confidence=None, agent_cancelled=False, agent_needs_input=None):
             captured_streamed_answer["value"] = streamed_answer
             await event_sink.write({"event": "complete", "data": {"answer": agent_output}})
             return {"answer": agent_output}
@@ -818,7 +960,7 @@ class TestRunAgentLoopStream:
         assert len(events) == 1
         payload = json.loads(events[0].split("data: ", 1)[1].strip())
         assert payload["type"] == "rate_limit"
-        assert payload["message"] == "The AI service is currently rate limited. Please try again in a moment."
+        assert payload["message"] == _USER_MESSAGES["rate_limit"]
 
     async def test_agent_run_failure_surfaces_invalid_request_provider_message(self) -> None:
         async def _fake_create(self, context, llm, chat_mode, *, query, model_name="", session_id=None, model_key=None):
@@ -852,7 +994,7 @@ class TestRunAgentLoopStream:
         payload = json.loads(events[0].split("data: ", 1)[1].strip())
         assert payload["type"] == "invalid_request"
         assert payload["message"] == (
-            "The AI service rejected this request: invalid Qwen3.8 reasoning_effort"
+            "The AI model rejected this request: invalid Qwen3.8 reasoning_effort"
         )
 
     async def test_sandbox_manager_destroyed_on_successful_completion(self) -> None:
@@ -868,7 +1010,7 @@ class TestRunAgentLoopStream:
             agent = _stream_agent(MagicMock(success=True, error=None))
             return agent, MagicMock(), MagicMock(), []
 
-        async def _fake_finalizer_run(self, *, agent_success, agent_error, event_sink, agent_output=None, streamed_answer="", reasoning_turns=None, agent_confidence=None):
+        async def _fake_finalizer_run(self, *, agent_success, agent_error, event_sink, agent_output=None, streamed_answer="", reasoning_turns=None, agent_confidence=None, agent_cancelled=False, agent_needs_input=None):
             await event_sink.write({"event": "complete", "data": {"answer": "42"}})
             return {"answer": "42"}
 
@@ -942,7 +1084,7 @@ class TestRunAgentLoopStream:
             agent = _stream_agent(MagicMock(success=True, error=None))
             return agent, MagicMock(), MagicMock(), []
 
-        async def _fake_finalizer_run(self, *, agent_success, agent_error, event_sink, agent_output=None, streamed_answer="", reasoning_turns=None, agent_confidence=None):
+        async def _fake_finalizer_run(self, *, agent_success, agent_error, event_sink, agent_output=None, streamed_answer="", reasoning_turns=None, agent_confidence=None, agent_cancelled=False, agent_needs_input=None):
             await event_sink.write({"event": "complete", "data": {"answer": "42"}})
             return {"answer": "42"}
 
@@ -1021,7 +1163,7 @@ class TestRunAgentLoopStream:
             await pending_started.wait()
             return agent, MagicMock(), MagicMock(), []
 
-        async def _fake_finalizer_run(self, *, agent_success, agent_error, event_sink, agent_output=None, streamed_answer="", reasoning_turns=None, agent_confidence=None):
+        async def _fake_finalizer_run(self, *, agent_success, agent_error, event_sink, agent_output=None, streamed_answer="", reasoning_turns=None, agent_confidence=None, agent_cancelled=False, agent_needs_input=None):
             await event_sink.write({"event": "complete", "data": {"answer": "42"}})
             return {"answer": "42"}
 
@@ -1073,7 +1215,7 @@ class TestRunAgentLoopStream:
             agent = _stream_agent(MagicMock(success=True, error=None))
             return agent, MagicMock(), MagicMock(), []
 
-        async def _fake_finalizer_run(self, *, agent_success, agent_error, event_sink, agent_output=None, streamed_answer="", reasoning_turns=None, agent_confidence=None):
+        async def _fake_finalizer_run(self, *, agent_success, agent_error, event_sink, agent_output=None, streamed_answer="", reasoning_turns=None, agent_confidence=None, agent_cancelled=False, agent_needs_input=None):
             await event_sink.write({"event": "complete", "data": {"answer": "42"}})
             return {"answer": "42"}
 
@@ -1130,7 +1272,7 @@ class TestHeartbeat:
             agent = _stream_agent(MagicMock(success=True, error=None))
             return agent, MagicMock(), MagicMock(), []
 
-        async def _fake_finalizer_run(self, *, agent_success, agent_error, event_sink, agent_output=None, streamed_answer="", reasoning_turns=None, agent_confidence=None):
+        async def _fake_finalizer_run(self, *, agent_success, agent_error, event_sink, agent_output=None, streamed_answer="", reasoning_turns=None, agent_confidence=None, agent_cancelled=False, agent_needs_input=None):
             await event_sink.write({"event": "complete", "data": {"answer": "42"}})
             return {"answer": "42"}
 
@@ -1177,7 +1319,7 @@ class TestHeartbeat:
             agent = _slow_stream_agent(MagicMock(success=True, error=None, output="done"), delay=0.05)
             return agent, MagicMock(), MagicMock(), []
 
-        async def _fake_finalizer_run(self, *, agent_success, agent_error, event_sink, agent_output=None, streamed_answer="", reasoning_turns=None, agent_confidence=None):
+        async def _fake_finalizer_run(self, *, agent_success, agent_error, event_sink, agent_output=None, streamed_answer="", reasoning_turns=None, agent_confidence=None, agent_cancelled=False, agent_needs_input=None):
             await event_sink.write({"event": "complete", "data": {"answer": "42"}})
             return {"answer": "42"}
 
@@ -1225,7 +1367,7 @@ class TestHeartbeat:
             agent = _stream_agent(MagicMock(success=True, error=None))
             return agent, MagicMock(), MagicMock(), []
 
-        async def _fake_finalizer_run(self, *, agent_success, agent_error, event_sink, agent_output=None, streamed_answer="", reasoning_turns=None, agent_confidence=None):
+        async def _fake_finalizer_run(self, *, agent_success, agent_error, event_sink, agent_output=None, streamed_answer="", reasoning_turns=None, agent_confidence=None, agent_cancelled=False, agent_needs_input=None):
             await event_sink.write({"event": "complete", "data": {"answer": "42"}})
             return {"answer": "42"}
 
@@ -1266,3 +1408,60 @@ class TestHeartbeat:
         # running by the time the comprehension above finishes.
         leaked_tasks = tasks_after - tasks_before
         assert all(task.done() for task in leaked_tasks)
+
+
+class TestConnectorFlagsReachChatState:
+    """The agent-loop half of the same wiring `chat_modes/bridge.py` carries.
+
+    `has_code_connector` is keyword-only on `build_initial_state` with a
+    `False` default; neither stream entry point passed it, so
+    `tool_loader`'s `has_code_connector and has_code_knowledge` gate could
+    never open and the code-graph toolset was absent from every request. Both
+    bridges need this pinned, or fixing one leaves the other silently broken.
+    """
+
+    @staticmethod
+    def _kwargs() -> dict[str, Any]:
+        return {
+            "query_info": {"query": "hello", "chatMode": "react"},
+            "user_info": {"userId": "user-1", "orgId": "org-1"},
+            "llm": MagicMock(),
+            "log": MagicMock(),
+            "retrieval_service": MagicMock(),
+            "graph_provider": MagicMock(),
+            "reranker_service": MagicMock(),
+            "config_service": MagicMock(),
+        }
+
+    async def _captured_kwargs(self, instances: list[dict[str, Any]]) -> dict[str, Any]:
+        seen: dict[str, Any] = {}
+
+        def _capture(*args, **kwargs) -> Never:
+            seen.update(kwargs)
+            raise RuntimeError("stop here — the call is what is under test")
+
+        # `stream_bridge` imports the fetch inside the function, so the patch
+        # has to land on the defining module rather than on the bridge.
+        with (
+            patch("app.modules.agents.qna.chat_state.build_initial_state", new=_capture),
+            patch(
+                "app.utils.connector_instances.fetch_user_connector_instances",
+                new=AsyncMock(return_value=instances),
+            ),
+        ):
+            [_ async for _ in run_agent_loop_stream(**self._kwargs())]
+        return seen
+
+    async def test_a_configured_repo_connector_reaches_build_initial_state(self) -> None:
+        seen = await self._captured_kwargs([{"type": "GitLab", "isConfigured": True}])
+        assert seen["has_code_connector"] is True
+
+    async def test_an_unconfigured_repo_connector_leaves_the_flag_off(self) -> None:
+        """Present but never set up — the tools would load and find nothing."""
+        seen = await self._captured_kwargs([{"type": "GitLab", "isConfigured": False}])
+        assert seen["has_code_connector"] is False
+
+    async def test_a_non_repo_connector_does_not_open_the_gate(self) -> None:
+        seen = await self._captured_kwargs([{"type": "SLACK", "isConfigured": True}])
+        assert seen["has_code_connector"] is False
+        assert seen["has_slack_connector"] is True, "the other flags still work"

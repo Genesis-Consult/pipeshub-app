@@ -3,16 +3,26 @@
 import { useState, type ReactNode } from 'react';
 import { usePathname } from 'next/navigation';
 import { useTranslation } from 'react-i18next';
-import { Flex } from '@radix-ui/themes';
+import { Flex, Text } from '@radix-ui/themes';
 import { SidebarBase } from '@/app/components/sidebar';
 import { MaterialIcon } from '@/app/components/ui/MaterialIcon';
 import { ICON_SIZE_DEFAULT } from '@/app/components/sidebar';
 import { WorkspaceSidebarItem } from './sidebar-item';
 import { SectionHeader } from './section-header';
 import { CollapsibleSection } from './collapsible-section';
+import { SidebarHeaderActions } from '@/app/(main)/chat/sidebar/header';
 import { useUserStore, selectIsAdmin } from '@/lib/store/user-store';
-import { useFeatureFlagsStore, selectMcpEnabled, selectActionsEnabled } from '@/lib/store/feature-flags-store';
+import {
+  useFeatureFlagsStore,
+  selectMcpEnabled,
+  selectActionsEnabled,
+  selectSkillsEnabled,
+  type FeatureFlagGate,
+} from '@/lib/store/feature-flags-store';
 import { YourConnectorsIcon } from '@/app/components/ui/your-connectors-icon';
+import { BetaBadge } from '@/app/components/ui/beta-badge';
+import { useIsMobile } from '@/lib/hooks/use-is-mobile';
+import { useMobileSidebarStore } from '@/lib/store/mobile-sidebar-store';
 
 // ========================================
 // Route constants (labels resolved at render via i18n)
@@ -25,7 +35,9 @@ interface NavItem {
   adminOnly?: boolean;
   customIcon?: ReactNode;
   /** Only rendered when the named feature flag is enabled. */
-  requiresFlag?: 'mcp' | 'actions';
+  requiresFlag?: FeatureFlagGate;
+  /** Renders a Beta badge as the item's rightSlot. */
+  beta?: boolean;
 }
 
 const OVERVIEW_ITEMS: NavItem[] = [
@@ -60,6 +72,7 @@ const WORKSPACE_ITEMS: NavItem[] = [
   { icon: 'bolt', labelKey: 'workspace.sidebar.nav.actions', route: '/workspace/actions/team', adminOnly: true, requiresFlag: 'actions' },
   { icon: 'support_agent', labelKey: 'workspace.sidebar.nav.bots', route: '/workspace/bots', adminOnly: true },
   { icon: 'manage_accounts', labelKey: 'workspace.sidebar.nav.services', route: '/workspace/services', adminOnly: true },
+  { icon: 'precision_manufacturing', labelKey: 'workspace.sidebar.nav.serviceAccounts', route: '/workspace/service-accounts', adminOnly: true },
   { icon: 'smart_toy', labelKey: 'workspace.sidebar.nav.aiModels', route: '/workspace/ai-models', adminOnly: true },
   { icon: 'mail', labelKey: 'workspace.sidebar.nav.mail', route: '/workspace/mail', adminOnly: true },
   { icon: 'edit_note', labelKey: 'workspace.sidebar.nav.prompts', route: '/workspace/prompts', adminOnly: true },
@@ -71,6 +84,7 @@ const PERSONAL_ITEMS: NavItem[] = [
   { icon: '', labelKey: 'workspace.sidebar.nav.yourConnectors', route: '/workspace/connectors/personal', customIcon: <YourConnectorsIcon size={ICON_SIZE_DEFAULT} color="var(--slate-11)" /> },
   { icon: 'bolt', labelKey: 'workspace.sidebar.nav.yourActions', route: '/workspace/actions/personal', requiresFlag: 'actions' },
   { icon: 'device_hub', labelKey: 'workspace.sidebar.nav.yourMcpServers', route: '/workspace/mcp-servers/personal', requiresFlag: 'mcp' },
+  { icon: 'psychology', labelKey: 'workspace.sidebar.nav.yourSkills', route: '/workspace/skills/personal', requiresFlag: 'skills', beta: true },
   { icon: 'archive', labelKey: 'workspace.sidebar.nav.archivedChats', route: '/workspace/archived-chats' },
 ];
 
@@ -92,6 +106,10 @@ export default function WorkspaceSidebar() {
   const isAdmin = useUserStore(selectIsAdmin);
   const mcpEnabled = useFeatureFlagsStore(selectMcpEnabled);
   const actionsEnabled = useFeatureFlagsStore(selectActionsEnabled);
+  const skillsEnabled = useFeatureFlagsStore(selectSkillsEnabled);
+  const isMobile = useIsMobile();
+  const isMobileOpen = useMobileSidebarStore((s) => s.isOpen);
+  const closeMobileSidebar = useMobileSidebarStore((s) => s.close);
 
   // Normalize trailing slash (trailingSlash: true in next.config)
   const pathname = rawPathname.endsWith('/') && rawPathname !== '/'
@@ -102,10 +120,14 @@ export default function WorkspaceSidebar() {
     PEOPLE_ROUTES.some((route) => pathname.startsWith(route))
   );
 
+  const flagEnabled: Record<FeatureFlagGate, boolean> = {
+    mcp: mcpEnabled,
+    actions: actionsEnabled,
+    skills: skillsEnabled,
+  };
   const isNavItemVisible = (item: NavItem) =>
     (isAdmin || !item.adminOnly) &&
-    (item.requiresFlag !== 'mcp' || mcpEnabled) &&
-    (item.requiresFlag !== 'actions' || actionsEnabled);
+    (item.requiresFlag === undefined || flagEnabled[item.requiresFlag]);
 
   const allRoutes = [
     ...OVERVIEW_ITEMS.map((item) => item.route),
@@ -136,8 +158,20 @@ export default function WorkspaceSidebar() {
   const visiblePersonalItems = PERSONAL_ITEMS.filter(isNavItemVisible);
 
   return (
-    <SidebarBase>
-      <Flex direction="column" gap="4">
+    <SidebarBase
+      header={isMobile ? <WorkspaceSidebarMobileHeader title={t('workspace.sidebar.sections.workspace')} /> : undefined}
+      isMobile={isMobile}
+      mobileOpen={isMobileOpen}
+      onMobileClose={closeMobileSidebar}
+    >
+      {/* On mobile any link tap closes the drawer, even to the page already shown. */}
+      <Flex
+        direction="column"
+        gap="4"
+        onClick={(e) => {
+          if (isMobile && (e.target as HTMLElement).closest('a')) closeMobileSidebar();
+        }}
+      >
         {/* ── Back to app ── */}
         <WorkspaceSidebarItem
           icon={<MaterialIcon name="arrow_back" size={ICON_SIZE_DEFAULT} color="var(--slate-11)" />}
@@ -227,10 +261,23 @@ export default function WorkspaceSidebar() {
               label={t(item.labelKey)}
               href={`${item.route}/`}
               isActive={isActive(item.route)}
+              rightSlot={item.beta ? <BetaBadge /> : undefined}
             />
           ))}
         </Flex>
       </Flex>
     </SidebarBase>
+  );
+}
+
+/** Title row with inbox and collapse; on the mobile drawer SidebarBase adds the close button beside it. */
+export function WorkspaceSidebarMobileHeader({ title }: { title: string }) {
+  return (
+    <Flex align="center" justify="between" gap="2" style={{ height: '100%', padding: '0 var(--space-4)' }}>
+      <Text size="3" weight="medium" style={{ color: 'var(--slate-12)' }}>
+        {title}
+      </Text>
+      <SidebarHeaderActions />
+    </Flex>
   );
 }

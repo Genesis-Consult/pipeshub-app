@@ -1,16 +1,19 @@
 """Unit tests for app.utils.libreoffice_convert.convert_with_libreoffice."""
-
 from __future__ import annotations
 
 import asyncio
-import os
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from app.exceptions.indexing_exceptions import DocumentProcessingError
-from app.utils.libreoffice_convert import convert_with_libreoffice
+from app.services.parsing.interface import ParseError, ParseErrorCode
+from app.utils.libreoffice_convert import (
+    LibreOfficeCouldNotReadFileError,
+    convert_with_libreoffice,
+    unreadable_file_as_parse_error,
+)
 
 
 def _fake_proc(returncode: int = 0, stderr: bytes = b"") -> MagicMock:
@@ -49,13 +52,10 @@ async def test_raises_on_timeout() -> None:
     which_proc = _fake_proc(returncode=0)
     convert_proc = _fake_proc(returncode=0)
 
-    with (
-        patch(
-            "asyncio.create_subprocess_exec",
-            AsyncMock(side_effect=[which_proc, convert_proc]),
-        ),
-        patch("asyncio.wait_for", AsyncMock(side_effect=asyncio.TimeoutError())),
-    ):
+    with patch(
+        "asyncio.create_subprocess_exec",
+        AsyncMock(side_effect=[which_proc, convert_proc]),
+    ), patch("asyncio.wait_for", AsyncMock(side_effect=asyncio.TimeoutError())):
         with pytest.raises(DocumentProcessingError, match="timed out"):
             await convert_with_libreoffice(b"doc data", "doc", "docx")
 
@@ -67,13 +67,10 @@ async def test_raises_when_output_file_missing() -> None:
     which_proc = _fake_proc(returncode=0)
     convert_proc = _fake_proc(returncode=0)
 
-    with (
-        patch(
-            "asyncio.create_subprocess_exec",
-            AsyncMock(side_effect=[which_proc, convert_proc]),
-        ),
-        patch("os.path.exists", return_value=False),
-    ):
+    with patch(
+        "asyncio.create_subprocess_exec",
+        AsyncMock(side_effect=[which_proc, convert_proc]),
+    ), patch("os.path.exists", return_value=False):
         with pytest.raises(DocumentProcessingError, match="output file not found"):
             await convert_with_libreoffice(b"doc data", "doc", "docx")
 
@@ -98,27 +95,23 @@ async def test_success_returns_output_bytes() -> None:
     assert result == fake_output
 
 
-@pytest.mark.asyncio
-async def test_conversion_uses_an_isolated_libreoffice_profile() -> None:
-    which_proc = _fake_proc(returncode=0)
-    convert_proc = _fake_proc(returncode=0)
-    conversion_args: tuple[object, ...] = ()
-    conversion_kwargs: dict[str, object] = {}
+def test_unreadable_file_is_reported_as_parse_error() -> None:
+    original = LibreOfficeCouldNotReadFileError("nope", details={"reason": "bad"})
 
-    async def _fake_exec(*args: object, **kwargs: object):
-        nonlocal conversion_args, conversion_kwargs
-        if args[:2] == ("which", "libreoffice"):
-            return which_proc
-        conversion_args = args
-        conversion_kwargs = kwargs
-        outdir = args[args.index("--outdir") + 1]
-        (Path(outdir) / "input.pdf").write_bytes(b"pdf")
-        return convert_proc
+    with pytest.raises(ParseError) as exc_info:
+        with unreadable_file_as_parse_error("docx"):
+            raise original
 
-    with patch("asyncio.create_subprocess_exec", _fake_exec):
-        await convert_with_libreoffice(b"docx data", "docx", "pdf")
+    parse_error = exc_info.value
+    assert parse_error.code == ParseErrorCode.PARSE_FAILED
+    assert ".docx" in parse_error.message
+    assert parse_error.details == {"reason": "bad"}
+    assert parse_error.__cause__ is original
 
-    assert any(
-        str(arg).startswith("-env:UserInstallation=file:") for arg in conversion_args
-    )
-    assert conversion_kwargs["start_new_session"] is (os.name != "nt")
+
+def test_other_errors_propagate_unchanged() -> None:
+    with pytest.raises(RuntimeError, match="not installed") as exc_info:
+        with unreadable_file_as_parse_error("docx"):
+            raise RuntimeError("not installed")
+
+    assert not isinstance(exc_info.value, ParseError)

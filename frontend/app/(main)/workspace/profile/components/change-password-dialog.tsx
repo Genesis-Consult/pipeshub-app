@@ -1,5 +1,6 @@
 'use client';
 
+import { overlayWidth } from '@/app/components/ui/responsive';
 import React from 'react';
 import { useTranslation } from 'react-i18next';
 import {
@@ -93,8 +94,7 @@ export function ChangePasswordDialog({
 
       <Dialog.Content
         style={{
-          width: '37.5rem',
-          minWidth: 480,
+          width: overlayWidth(600),
           padding: 'var(--space-5)',
           background: 'var(--slate-2)',
           borderRadius: 'var(--radius-5)',
@@ -145,10 +145,11 @@ export function ChangePasswordDialog({
                 {t('workspace.profile.changePassword.newPassword')}
               </Text>
               <Text size="1" style={{ color: 'var(--gray-10)', fontWeight: 300 }}>
-                {t('workspace.profile.changePassword.passwordRequirement')}
+                {t('validation.password.rules')}
               </Text>
               <TextField.Root
                 type={showNewPassword ? 'text' : 'password'}
+                autoComplete="new-password"
                 placeholder={t('workspace.profile.changePassword.newPasswordPlaceholder')}
                 value={form.newPassword}
                 onChange={(e) => {
@@ -156,14 +157,14 @@ export function ChangePasswordDialog({
                   setForm((f) => ({ ...f, newPassword: value }));
                   // Inline strength validation
                   const pwError = value ? validatePassword(value) : null;
-                  setErrors((prev) => ({ ...prev, newPassword: pwError ?? undefined }));
+                  setErrors((prev) => ({ ...prev, newPassword: pwError ? t(`validation.password.${pwError}`) : undefined }));
                   // Re-check confirm match if already filled
                   if (form.confirmPassword) {
                     setErrors((prev) => ({
                       ...prev,
                       confirmPassword:
                         form.confirmPassword !== value
-                          ? t('workspace.profile.changePassword.mismatchError')
+                          ? t('validation.password.mismatch')
                           : undefined,
                     }));
                   }
@@ -201,6 +202,7 @@ export function ChangePasswordDialog({
               </Text>
               <TextField.Root
                 type={showConfirmPassword ? 'text' : 'password'}
+                autoComplete="new-password"
                 placeholder={t('workspace.profile.changePassword.confirmPasswordPlaceholder')}
                 value={form.confirmPassword}
                 onChange={(e) => {
@@ -210,7 +212,7 @@ export function ChangePasswordDialog({
                   if (value && value !== form.newPassword) {
                     setErrors((prev) => ({
                       ...prev,
-                      confirmPassword: t('workspace.profile.changePassword.mismatchError'),
+                      confirmPassword: t('validation.password.mismatch'),
                     }));
                   } else {
                     setErrors((prev) => ({ ...prev, confirmPassword: undefined }));

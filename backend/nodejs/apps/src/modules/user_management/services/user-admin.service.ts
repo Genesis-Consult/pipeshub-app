@@ -6,6 +6,17 @@ import { UserAdminRepository } from '../repositories/user-admin.repository';
 const LAST_ADMIN_DEMOTION_MESSAGE =
   'Cannot demote the last admin. Promote another user to admin first.';
 
+export const MAX_ORG_ADMINS = 5;
+
+export const ADMIN_ACCESS_REQUIRED_MESSAGE =
+  'You need admin access to do this. Ask an admin in your organisation.';
+
+export const OWN_ADMIN_CHECK_ONLY_MESSAGE =
+  'You can only check your own admin access.';
+
+export const MAX_ORG_ADMINS_MESSAGE =
+  'An organization can have at most 5 admins.';
+
 /** Normalize API/UI role labels to the stored enum. */
 export function normalizeUserRole(role: string | undefined | null): UserRole | null {
   if (!role) return null;
@@ -60,6 +71,20 @@ export const getActiveUserOrgRole = async (
   if (!user) {
     return null;
   }
+  // A service account is a member whatever its record says.
+  //
+  // The schema refuses it the admin role on every write path, so today this
+  // cannot differ. It is here because the two sibling queries in the
+  // repository already exclude service accounts and this one could not, and
+  // three queries in one file disagreeing about the same rule is what gets
+  // lost in a refactor. It also matches the auth middleware, which clamps the
+  // role on a token rather than trusting the record.
+  //
+  // Clamped rather than refused: this answers "what is this caller", and the
+  // caller may legitimately be a service account.
+  if (user.kind === 'service') {
+    return 'member';
+  }
   return user.role === 'admin' ? 'admin' : 'member';
 };
 
@@ -104,6 +129,24 @@ export const assertCanDemoteAdmin = async (
 };
 
 /**
+ * Pre-write check: reject promoting when this would take the org past MAX_ORG_ADMINS.
+ * `additionalAdmins` is how many users would newly become admins (not already counted).
+ */
+export const assertCanPromoteAdmin = async (
+  orgId: string,
+  additionalAdmins: number = 1,
+  session?: ClientSession | null,
+): Promise<void> => {
+  if (additionalAdmins <= 0) {
+    return;
+  }
+  const adminCount = await UserAdminRepository.countActiveAdmins(orgId, session);
+  if (adminCount + additionalAdmins > MAX_ORG_ADMINS) {
+    throw new BadRequestError(MAX_ORG_ADMINS_MESSAGE);
+  }
+};
+
+/**
  * Persist a user update that may demote an admin.
  * - Replica set: touch Org (serialize concurrent demotions) + check + save in one txn.
  * - Non-RS: check, save, then verify; restore admin if the org was left with zero.
@@ -132,6 +175,41 @@ export const saveUserEnsuringOrgRetainsAdmin = async (
     await session.withTransaction(async () => {
       await UserAdminRepository.touchOrgAdminGuard(orgId, session);
       await assertCanDemoteAdmin(orgId, session);
+      await user.save({ session });
+    });
+  } finally {
+    await session.endSession();
+  }
+};
+
+/**
+ * Persist a user update that may promote a member to admin.
+ * Same replica-set vs non-RS pattern as last-admin demotion.
+ */
+export const saveUserEnsuringAdminCap = async (
+  user: User,
+  rsAvailable: boolean,
+): Promise<void> => {
+  const orgId = String(user.orgId);
+  const userId = String(user._id);
+
+  if (!rsAvailable) {
+    await assertCanPromoteAdmin(orgId);
+    await user.save();
+    const adminCount = await UserAdminRepository.countActiveAdmins(orgId);
+    if (adminCount > MAX_ORG_ADMINS) {
+      await UserAdminRepository.restoreMemberRole(userId, orgId);
+      user.role = 'member';
+      throw new BadRequestError(MAX_ORG_ADMINS_MESSAGE);
+    }
+    return;
+  }
+
+  const session = await mongoose.startSession();
+  try {
+    await session.withTransaction(async () => {
+      await UserAdminRepository.touchOrgAdminGuard(orgId, session);
+      await assertCanPromoteAdmin(orgId, 1, session);
       await user.save({ session });
     });
   } finally {

@@ -32,17 +32,15 @@ Covers methods and branches not exercised by existing test suites:
 - CountryToRegionMapper edge cases
 """
 
-import asyncio
 import logging
 import os
 import uuid
-from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from app.config.constants.arangodb import MimeTypes, OriginTypes, ProgressStatus
+from app.config.constants.arangodb import ProgressStatus
 from app.connectors.core.registry.filters import (
     FilterCollection,
     FilterOperator,
@@ -52,23 +50,12 @@ from app.connectors.sources.microsoft.sharepoint_online.connector import (
     CountryToRegionMapper,
     MicrosoftRegion,
     SharePointConnector,
-    SharePointCredentials,
-    SharePointRecordType,
     SharePointSubscriptionManager,
-    SiteMetadata,
 )
 from app.models.entities import (
-    FileRecord,
-    Record,
-    RecordGroup,
-    RecordGroupType,
     RecordType,
-    SharePointListItemRecord,
-    SharePointListRecord,
-    SharePointPageRecord,
 )
-from app.models.permission import EntityType, Permission, PermissionType
-
+from app.models.permission import PermissionType
 
 # ===========================================================================
 # Helpers
@@ -90,6 +77,7 @@ def _make_connector():
     dep.get_all_active_users = AsyncMock(return_value=[])
     dep.reindex_existing_records = AsyncMock()
     dep.get_record_by_external_id = AsyncMock(return_value=None)
+    dep.inheritance_when_unreadable = AsyncMock(return_value=False)
 
     dsp = MagicMock()
     # Set up transaction context manager
@@ -729,8 +717,12 @@ class TestHandleRecordUpdates:
         update.is_deleted = True
         update.external_record_id = "ext-1"
         update.is_updated = False
+        c.data_entities_processor.get_record_by_external_id = AsyncMock(return_value=MagicMock(id="rec-1"))
+        c.data_entities_processor.on_records_deleted_cascade = AsyncMock(return_value={"success": True})
         await c._handle_record_updates(update)
-        c.data_entities_processor.on_record_deleted.assert_called_once()
+        c.data_entities_processor.on_records_deleted_cascade.assert_called_once_with(
+            ["rec-1"], "conn-sp-ext", cascade_children=True, include_trashed_roots=True
+        )
 
     @pytest.mark.asyncio
     async def test_metadata_changed(self):
@@ -884,7 +876,7 @@ class TestSafeApiCallExtended:
         c = _make_connector()
         async def fail():
             raise Exception("400 badrequest invalid hostname")
-        result = await c._safe_api_call(fail(), max_retries=0, retry_delay=0.01)
+        result = await c._safe_api_call(fail, max_retries=0, retry_delay=0.01)
         assert result is None
 
     @pytest.mark.asyncio
@@ -897,20 +889,17 @@ class TestSafeApiCallExtended:
             if call_count == 1:
                 raise Exception("429 throttle")
             return "ok"
-        # Can't retry an already-awaited coroutine directly,
-        # but _safe_api_call accepts a coroutine. We test the pattern:
-        result = await c._safe_api_call(throttle_then_ok(), max_retries=1, retry_delay=0.01)
-        # First call fails with throttle, but retry also calls the same coroutine
-        # The actual implementation awaits api_call directly, so retry won't help for coroutines.
-        # This tests the error path:
-        assert result is None
+        with patch("asyncio.sleep", new=AsyncMock()):
+            result = await c._safe_api_call(throttle_then_ok, max_retries=1, retry_delay=0.01)
+        assert result == "ok"
+        assert call_count == 2
 
     @pytest.mark.asyncio
     async def test_generic_error_exhausts_retries(self):
         c = _make_connector()
         async def fail():
             raise Exception("something weird")
-        result = await c._safe_api_call(fail(), max_retries=1, retry_delay=0.01)
+        result = await c._safe_api_call(fail, max_retries=1, retry_delay=0.01)
         assert result is None
 
 
@@ -949,6 +938,8 @@ class TestGetSignedUrl:
 
     @pytest.mark.asyncio
     async def test_missing_drive_id(self):
+        from fastapi import HTTPException
+
         c = _make_connector()
         c._reinitialize_credential_if_needed = AsyncMock()
 
@@ -957,8 +948,10 @@ class TestGetSignedUrl:
         record.external_record_group_id = None
         record.id = "record-1"
 
-        result = await c.get_signed_url(record)
-        assert result is None
+        # A local metadata gap, not a file deleted in SharePoint.
+        with pytest.raises(HTTPException) as exc_info:
+            await c.get_signed_url(record)
+        assert exc_info.value.status_code == 422
 
 
 # ===========================================================================
@@ -1176,11 +1169,15 @@ class TestProcessDriveItem:
         c.msgraph_client = MagicMock()
         c.msgraph_client.get_signed_url = AsyncMock(return_value="https://signed.com")
         c._get_item_permissions = AsyncMock(return_value=[])
+        c._drive_item_has_unique_permissions = AsyncMock(return_value=None)
         item = _make_drive_item(name="new.pdf")
         result = await c._process_drive_item(item, "site-1", "drive-1", [])
+        # A new item whose permissions can't be read is not stored this run.
         assert result is not None
         assert result.is_new is True
-        assert result.record is not None
+        assert result.record is None
+        assert result.permissions_known is False
+        c.data_entities_processor.inheritance_when_unreadable.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_updated_file(self):
@@ -1188,6 +1185,7 @@ class TestProcessDriveItem:
         c.msgraph_client = MagicMock()
         c.msgraph_client.get_signed_url = AsyncMock(return_value="https://signed.com")
         c._get_item_permissions = AsyncMock(return_value=[])
+        c._drive_item_has_unique_permissions = AsyncMock(return_value=False)
 
         existing = MagicMock()
         existing.id = "existing-id"
@@ -1197,6 +1195,7 @@ class TestProcessDriveItem:
         existing.version = 1
 
         c.data_entities_processor.get_record_by_external_id = AsyncMock(return_value=existing)
+        c.data_entities_processor.get_file_record_by_id = AsyncMock(return_value=existing)
 
         item = _make_drive_item(name="updated.pdf", e_tag="new-etag")
         result = await c._process_drive_item(item, "site-1", "drive-1", [])
@@ -1234,9 +1233,9 @@ class TestHandleWebhookNotification:
         c.rate_limiter.__aexit__ = AsyncMock()
         c.client = MagicMock()
         c._safe_api_call = AsyncMock(return_value=MagicMock())
-        c._sync_site_content = AsyncMock()
+        c.run_sync = AsyncMock()
         await c.handle_webhook_notification({"resource": "sites/site-1/stuff"})
-        c._sync_site_content.assert_called_once()
+        c.run_sync.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_without_site_resource(self):
@@ -1259,10 +1258,15 @@ class TestHandleWebhookNotification:
 
 class TestTestConnectionAndAccess:
     @pytest.mark.asyncio
-    async def test_always_returns_true(self):
+    async def test_returns_false_when_sites_unreadable(self):
         c = _make_connector()
+        c.client = MagicMock()
+        root_site = MagicMock()
+        root_site.web_url = "https://contoso.sharepoint.com"
+        c.client.sites.by_site_id.return_value.get = AsyncMock(return_value=root_site)
+        c.client.sites.get = AsyncMock(side_effect=Exception("403 Forbidden"))
         result = await c.test_connection_and_access()
-        assert result is True
+        assert result is False
 
 
 # ===========================================================================
@@ -1287,7 +1291,8 @@ class TestGetSubsites:
 
         result_mock = MagicMock()
         result_mock.value = [subsite]
-        c._safe_api_call = AsyncMock(return_value=result_mock)
+        result_mock.odata_next_link = None
+        c._graph_read = AsyncMock(return_value=result_mock)
         c.client = MagicMock()
 
         result = await c._get_subsites("site-1")
@@ -1300,7 +1305,7 @@ class TestGetSubsites:
         c.rate_limiter = AsyncMock()
         c.rate_limiter.__aenter__ = AsyncMock()
         c.rate_limiter.__aexit__ = AsyncMock()
-        c._safe_api_call = AsyncMock(return_value=None)
+        c._graph_read = AsyncMock(return_value=None)
         c.client = MagicMock()
         result = await c._get_subsites("site-1")
         assert result == []
@@ -1311,7 +1316,7 @@ class TestGetSubsites:
         c.rate_limiter = AsyncMock()
         c.rate_limiter.__aenter__ = AsyncMock()
         c.rate_limiter.__aexit__ = AsyncMock()
-        c._safe_api_call = AsyncMock(side_effect=Exception("fail"))
+        c._graph_read = AsyncMock(side_effect=Exception("fail"))
         c.client = MagicMock()
         result = await c._get_subsites("site-1")
-        assert result == []
+        assert result is None

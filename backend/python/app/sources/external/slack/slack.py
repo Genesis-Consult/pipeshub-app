@@ -1,10 +1,92 @@
+import asyncio
+import functools
 import logging
+from collections.abc import Callable
+from concurrent.futures import Executor
 from typing import Any, Optional, Union
 
 from app.sources.client.slack.slack import SlackClient, SlackResponse
 
 # Set up logger
 logger = logging.getLogger(__name__)
+
+# Human-readable explanations for the codes worth explaining. Iteration order is
+# the match precedence for the substring fallback below.
+_SLACK_ERROR_MESSAGES: dict[str, str] = {
+    "not_allowed_token_type": (
+        "Slack token type not allowed for this operation. Please ensure you're using a bot "
+        "token (xoxb-) with the required scopes. For search operations, you need the "
+        "'search:read' scope."
+    ),
+    "invalid_auth": "Invalid Slack token. Please check your token configuration.",
+    "missing_scope": (
+        "Missing required Slack scope. Please add the necessary scopes to your Slack app's token."
+    ),
+    "account_inactive": "Slack account is inactive. Please check your workspace status.",
+    "token_revoked": "Slack token has been revoked. Please generate a new token.",
+    "channel_not_found": (
+        "Channel not found. The channel may not exist, be private, or the bot may not have "
+        "access to it."
+    ),
+    "not_in_channel": (
+        "Bot is not a member of this channel. Please invite the bot to the channel first."
+    ),
+}
+
+
+def _slack_error_details(error: Exception) -> tuple[Optional[str], Optional[int], Optional[str]]:
+    """Read the raw code, HTTP status and Retry-After off a ``SlackApiError``.
+
+    The raw code is the only thing that tells a deleted file apart from a
+    revoked token, and ``str(error)`` is too coarse to recover it reliably.
+    """
+    response = getattr(error, "response", None)
+    if response is None:
+        return None, None, None
+
+    data = getattr(response, "data", None)
+    code = data.get("error") if isinstance(data, dict) else None
+
+    status = getattr(response, "status_code", None)
+    if not isinstance(status, int) or isinstance(status, bool):
+        status = None
+
+    retry_after = None
+    headers = getattr(response, "headers", None)
+    if headers is not None:
+        try:
+            retry_after = headers.get("retry-after") or headers.get("Retry-After")
+        except Exception:
+            retry_after = None
+    if isinstance(retry_after, (list, tuple)):
+        retry_after = retry_after[0] if retry_after else None
+
+    return (
+        code if isinstance(code, str) and code else None,
+        status,
+        str(retry_after) if retry_after is not None else None,
+    )
+
+
+def _granted_scopes(response: Any) -> list[str] | None:  # noqa: ANN401 - slack_sdk response
+    """The token's scopes from Slack's ``X-OAuth-Scopes`` header, or None if absent.
+
+    ``slack_sdk`` hands headers over as a plain dict, so the name's case is whatever
+    the transport produced.
+    """
+    headers = getattr(response, "headers", None)
+    if not isinstance(headers, dict):
+        return None
+    value = next(
+        (v for k, v in headers.items() if isinstance(k, str) and k.lower() == "x-oauth-scopes"),
+        None,
+    )
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else None
+    if not isinstance(value, str):
+        return None
+    return [scope.strip() for scope in value.split(",") if scope.strip()]
+
 
 class SlackDataSource:
     """Auto-generated Slack Web API client wrapper.
@@ -13,8 +95,19 @@ class SlackDataSource:
     - **No fallback** to `api_call`: if SDK alias missing, returns SlackResponse with error
     - All responses wrapped in standardized SlackResponse format
     """
-    def __init__(self, client: SlackClient) -> None:
+    def __init__(self, client: SlackClient, executor: Executor | None = None) -> None:
         self.client = client.get_web_client()
+        self._executor = executor
+
+    async def _call(self, method: Callable[..., Any], **kwargs: Any) -> Any:  # noqa: ANN401 - slack_sdk response
+        """Run a blocking ``slack_sdk`` call in ``executor`` (the loop's default when None).
+
+        The SDK client is synchronous; called on the event loop, every Slack request
+        would stall the whole service for as long as Slack takes to answer.
+        """
+        return await asyncio.get_running_loop().run_in_executor(
+            getattr(self, "_executor", None), functools.partial(method, **kwargs)
+        )
 
     async def _handle_slack_response(self, response: Any) -> SlackResponse:  # noqa: ANN401
         """Handle Slack API response and convert to standardized format"""
@@ -62,58 +155,36 @@ class SlackDataSource:
         error_msg = str(error)
         logger.error(f"Slack API error: {error_msg}")
 
-        # Provide more specific error messages for common token issues
-        if "not_allowed_token_type" in error_msg:
-            return SlackResponse(
-                success=False,
-                error="not_allowed_token_type",
-                message="Slack token type not allowed for this operation. Please ensure you're using a bot token (xoxb-) with the required scopes. For search operations, you need the 'search:read' scope."
-            )
-        elif "invalid_auth" in error_msg:
-            return SlackResponse(
-                success=False,
-                error="invalid_auth",
-                message="Invalid Slack token. Please check your token configuration."
-            )
-        elif "missing_scope" in error_msg:
-            return SlackResponse(
-                success=False,
-                error="missing_scope",
-                message="Missing required Slack scope. Please add the necessary scopes to your bot token."
-            )
-        elif "account_inactive" in error_msg:
-            return SlackResponse(
-                success=False,
-                error="account_inactive",
-                message="Slack account is inactive. Please check your workspace status."
-            )
-        elif "token_revoked" in error_msg:
-            return SlackResponse(
-                success=False,
-                error="token_revoked",
-                message="Slack token has been revoked. Please generate a new token."
-            )
-        elif "channel_not_found" in error_msg:
-            return SlackResponse(
-                success=False,
-                error="channel_not_found",
-                message="Channel not found. The channel may not exist, be private, or the bot may not have access to it."
-            )
-        elif "not_in_channel" in error_msg:
-            return SlackResponse(
-                success=False,
-                error="not_in_channel",
-                message="Bot is not a member of this channel. Please invite the bot to the channel first."
-            )
+        raw_code, status_code, retry_after = _slack_error_details(error)
 
-        return SlackResponse(success=False,error="unknown_error", message=error_msg)
+        code = next(
+            (known for known in _SLACK_ERROR_MESSAGES if known in error_msg),
+            raw_code or "unknown_error",
+        )
+        message = _SLACK_ERROR_MESSAGES.get(code, error_msg)
+        # Slack names the scope a missing_scope call needed; without it an admin
+        # cannot tell which one to add.
+        data = getattr(getattr(error, "response", None), "data", None)
+        needed = data.get("needed") if isinstance(data, dict) else None
+        if code == "missing_scope" and isinstance(needed, str) and needed:
+            message = f"{message} Needed scope: {needed}."
+        return SlackResponse(
+            success=False,
+            error=code,
+            message=message,
+            status_code=status_code,
+            retry_after=retry_after,
+        )
 
     async def check_token_scopes(self) -> SlackResponse:
-        """Check what scopes the current token has access to"""
+        """auth.test, with the token's granted scopes under ``data["scopes"]`` when Slack sends them."""
         try:
-            # Use auth.test to get token info
-            response = getattr(self.client, 'auth_test')()
-            return await self._handle_slack_response(response)
+            response = await self._call(getattr(self.client, 'auth_test'))
+            result = await self._handle_slack_response(response)
+            scopes = _granted_scopes(response)
+            if result.success and scopes is not None:
+                result.data = {**(result.data or {}), "scopes": scopes}
+            return result
         except Exception as e:
             return await self._handle_slack_error(e)
 
@@ -158,7 +229,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_apps_approve')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_apps_approve'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -205,7 +276,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_apps_approved_list')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_apps_approved_list'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -249,7 +320,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_apps_requests_list')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_apps_requests_list'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -294,7 +365,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_apps_restrict')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_apps_restrict'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -343,7 +414,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_apps_restricted_list')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_apps_restricted_list'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -380,7 +451,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_conversations_archive')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_conversations_archive'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -417,7 +488,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_conversations_convertToPrivate')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_conversations_convertToPrivate'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -471,7 +542,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_conversations_create')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_conversations_create'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -509,7 +580,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_conversations_delete')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_conversations_delete'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -551,7 +622,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_conversations_disconnectShared')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_conversations_disconnectShared'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -601,7 +672,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_conversations_ekm_listOriginalConnectedChannelInfo')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_conversations_ekm_listOriginalConnectedChannelInfo'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -638,7 +709,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_conversations_getConversationPrefs')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_conversations_getConversationPrefs'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -684,7 +755,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_conversations_getTeams')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_conversations_getTeams'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -725,7 +796,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_conversations_invite')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_conversations_invite'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -766,7 +837,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_conversations_rename')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_conversations_rename'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -812,7 +883,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_conversations_restrictAccess_addGroup')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_conversations_restrictAccess_addGroup'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -854,7 +925,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_conversations_restrictAccess_listGroups')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_conversations_restrictAccess_listGroups'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -901,7 +972,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_conversations_restrictAccess_removeGroup')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_conversations_restrictAccess_removeGroup'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -964,7 +1035,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_conversations_search')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_conversations_search'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -1007,7 +1078,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_conversations_setConversationPrefs')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_conversations_setConversationPrefs'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -1058,7 +1129,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_conversations_setTeams')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_conversations_setTeams'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -1097,7 +1168,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_conversations_unarchive')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_conversations_unarchive'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -1140,7 +1211,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_emoji_add')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_emoji_add'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -1182,7 +1253,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_emoji_addAlias')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_emoji_addAlias'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -1225,7 +1296,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_emoji_list')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_emoji_list'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -1264,7 +1335,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_emoji_remove')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_emoji_remove'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -1307,7 +1378,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_emoji_rename')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_emoji_rename'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -1349,7 +1420,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_inviteRequests_approve')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_inviteRequests_approve'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -1396,7 +1467,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_inviteRequests_approved_list')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_inviteRequests_approved_list'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -1443,7 +1514,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_inviteRequests_denied_list')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_inviteRequests_denied_list'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -1486,7 +1557,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_inviteRequests_deny')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_inviteRequests_deny'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -1533,7 +1604,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_inviteRequests_list')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_inviteRequests_list'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -1579,7 +1650,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_teams_admins_list')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_teams_admins_list'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -1630,7 +1701,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_teams_create')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_teams_create'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -1673,7 +1744,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_teams_list')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_teams_list'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -1720,7 +1791,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_teams_owners_list')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_teams_owners_list'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -1758,7 +1829,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_teams_settings_info')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_teams_settings_info'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -1801,7 +1872,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_teams_settings_setDefaultChannels')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_teams_settings_setDefaultChannels'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -1844,7 +1915,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_teams_settings_setDescription')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_teams_settings_setDescription'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -1887,7 +1958,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_teams_settings_setDiscoverability')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_teams_settings_setDiscoverability'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -1930,7 +2001,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_teams_settings_setIcon')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_teams_settings_setIcon'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -1973,7 +2044,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_teams_settings_setName')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_teams_settings_setName'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -2020,7 +2091,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_usergroups_addChannels')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_usergroups_addChannels'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -2067,7 +2138,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_usergroups_addTeams')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_usergroups_addTeams'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -2114,7 +2185,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_usergroups_listChannels')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_usergroups_listChannels'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -2157,7 +2228,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_usergroups_removeChannels')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_usergroups_removeChannels'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -2211,7 +2282,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_users_assign')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_users_assign'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -2282,7 +2353,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_users_invite')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_users_invite'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -2328,7 +2399,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_users_list')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_users_list'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -2370,7 +2441,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_users_remove')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_users_remove'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -2411,7 +2482,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_users_session_invalidate')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_users_session_invalidate'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -2458,7 +2529,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_users_session_reset')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_users_session_reset'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -2501,7 +2572,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_users_setAdmin')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_users_setAdmin'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -2548,7 +2619,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_users_setExpiration')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_users_setExpiration'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -2591,7 +2662,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_users_setOwner')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_users_setOwner'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -2633,7 +2704,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'admin_users_setRegular')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'admin_users_setRegular'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -2674,7 +2745,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'api_test')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'api_test'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -2720,7 +2791,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'apps_event_authorizations_list')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'apps_event_authorizations_list'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -2752,7 +2823,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'apps_permissions_info')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'apps_permissions_info'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -2795,7 +2866,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'apps_permissions_request')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'apps_permissions_request'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -2838,7 +2909,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'apps_permissions_resources_list')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'apps_permissions_resources_list'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -2870,7 +2941,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'apps_permissions_scopes_list')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'apps_permissions_scopes_list'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -2913,7 +2984,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'apps_permissions_users_list')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'apps_permissions_users_list'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -2960,7 +3031,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'apps_permissions_users_request')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'apps_permissions_users_request'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -3003,7 +3074,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'apps_uninstall')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'apps_uninstall'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -3042,7 +3113,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'auth_revoke')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'auth_revoke'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -3072,7 +3143,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'auth_test')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'auth_test'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -3110,7 +3181,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'bots_info')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'bots_info'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -3176,7 +3247,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'calls_add')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'calls_add'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -3218,7 +3289,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'calls_end')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'calls_end'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -3256,7 +3327,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'calls_info')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'calls_info'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -3298,7 +3369,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'calls_participants_add')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'calls_participants_add'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -3340,7 +3411,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'calls_participants_remove')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'calls_participants_remove'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -3389,7 +3460,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'calls_update')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'calls_update'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -3434,7 +3505,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'chat_delete')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'chat_delete'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -3480,7 +3551,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'chat_deleteScheduledMessage')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'chat_deleteScheduledMessage'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -3523,7 +3594,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'chat_getPermalink')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'chat_getPermalink'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -3565,7 +3636,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'chat_meMessage')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'chat_meMessage'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -3647,7 +3718,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'chat_postEphemeral')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'chat_postEphemeral'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -3741,7 +3812,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'chat_postMessage')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'chat_postMessage'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -3823,7 +3894,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'chat_scheduleMessage')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'chat_scheduleMessage'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -3877,7 +3948,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'chat_scheduledMessages_list')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'chat_scheduledMessages_list'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -3935,7 +4006,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'chat_unfurl')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'chat_unfurl'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -4001,7 +4072,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'chat_update')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'chat_update'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -4039,7 +4110,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'conversations_archive')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'conversations_archive'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -4077,7 +4148,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'conversations_close')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'conversations_close'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -4120,7 +4191,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'conversations_create')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'conversations_create'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -4178,7 +4249,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'conversations_history')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'conversations_history'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -4224,7 +4295,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'conversations_info')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'conversations_info'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -4266,7 +4337,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'conversations_invite')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'conversations_invite'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -4304,7 +4375,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'conversations_join')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'conversations_join'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -4345,7 +4416,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'conversations_kick')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'conversations_kick'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -4383,7 +4454,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'conversations_leave')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'conversations_leave'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -4433,7 +4504,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'conversations_list')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'conversations_list'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -4474,7 +4545,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'conversations_mark')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'conversations_mark'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -4521,7 +4592,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'conversations_members')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'conversations_members'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -4567,7 +4638,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'conversations_open')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'conversations_open'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -4610,7 +4681,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'conversations_rename')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'conversations_rename'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -4672,7 +4743,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'conversations_replies')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'conversations_replies'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -4714,7 +4785,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'conversations_setPurpose')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'conversations_setPurpose'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -4757,7 +4828,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'conversations_setTopic')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'conversations_setTopic'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -4796,7 +4867,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'conversations_unarchive')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'conversations_unarchive'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -4839,7 +4910,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'dialog_open')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'dialog_open'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -4868,7 +4939,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'dnd_endDnd')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'dnd_endDnd'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -4897,7 +4968,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'dnd_endSnooze')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'dnd_endSnooze'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -4934,7 +5005,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'dnd_info')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'dnd_info'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -4971,7 +5042,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'dnd_setSnooze')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'dnd_setSnooze'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -5008,7 +5079,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'dnd_teamInfo')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'dnd_teamInfo'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -5037,7 +5108,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'emoji_list')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'emoji_list'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -5078,7 +5149,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'files_comments_delete')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'files_comments_delete'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -5115,7 +5186,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'files_delete')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'files_delete'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -5168,7 +5239,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'files_info')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'files_info'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -5233,7 +5304,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'files_list')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'files_list'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -5290,7 +5361,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'files_remote_add')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'files_remote_add'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -5331,7 +5402,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'files_remote_info')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'files_remote_info'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -5384,7 +5455,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'files_remote_list')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'files_remote_list'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -5425,7 +5496,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'files_remote_remove')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'files_remote_remove'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -5470,7 +5541,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'files_remote_share')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'files_remote_share'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -5531,7 +5602,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'files_remote_update')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'files_remote_update'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -5568,7 +5639,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'files_revokePublicURL')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'files_revokePublicURL'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -5605,7 +5676,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'files_sharedPublicURL')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'files_sharedPublicURL'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -5670,7 +5741,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'files_upload')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'files_upload'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -5750,7 +5821,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'files_upload_v2')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'files_upload_v2'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -5795,7 +5866,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'migration_exchange')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'migration_exchange'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -5848,7 +5919,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'oauth_access')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'oauth_access'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -5901,7 +5972,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'oauth_token')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'oauth_token'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -5950,7 +6021,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'oauth_v2_access')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'oauth_v2_access'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -5991,7 +6062,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'pins_add')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'pins_add'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -6028,7 +6099,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'pins_list')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'pins_list'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -6069,7 +6140,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'pins_remove')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'pins_remove'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -6115,7 +6186,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'reactions_add')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'reactions_add'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -6169,7 +6240,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'reactions_get')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'reactions_get'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -6226,7 +6297,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'reactions_list')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'reactions_list'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -6279,7 +6350,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'reactions_remove')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'reactions_remove'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -6324,7 +6395,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'reminders_add')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'reminders_add'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -6361,7 +6432,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'reminders_complete')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'reminders_complete'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -6398,7 +6469,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'reminders_delete')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'reminders_delete'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -6435,7 +6506,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'reminders_info')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'reminders_info'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -6465,7 +6536,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'reminders_list')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'reminders_list'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -6506,7 +6577,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'rtm_connect')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'rtm_connect'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -6562,7 +6633,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'search_messages')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'search_messages'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -6612,7 +6683,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'stars_add')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'stars_add'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -6661,7 +6732,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'stars_list')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'stars_list'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -6710,7 +6781,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'stars_remove')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'stars_remove'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -6755,7 +6826,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'team_accessLogs')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'team_accessLogs'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -6793,7 +6864,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'team_billableInfo')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'team_billableInfo'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -6831,7 +6902,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'team_info')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'team_info'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -6889,7 +6960,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'team_integrationLogs')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'team_integrationLogs'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -6927,7 +6998,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'team_profile_get')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'team_profile_get'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -6981,7 +7052,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'usergroups_create')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'usergroups_create'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -7022,7 +7093,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'usergroups_disable')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'usergroups_disable'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -7064,7 +7135,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'usergroups_enable')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'usergroups_enable'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -7110,7 +7181,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'usergroups_list')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'usergroups_list'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -7168,7 +7239,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'usergroups_update')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'usergroups_update'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -7210,7 +7281,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'usergroups_users_list')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'usergroups_users_list'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -7256,7 +7327,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'usergroups_users_update')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'usergroups_users_update'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -7309,7 +7380,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'users_conversations')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'users_conversations'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -7338,7 +7409,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'users_deletePhoto')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'users_deletePhoto'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -7376,7 +7447,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'users_getPresence')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'users_getPresence'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -7406,7 +7477,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'users_identity')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'users_identity'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -7447,7 +7518,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'users_info')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'users_info'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -7492,7 +7563,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'users_list')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'users_list'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -7529,7 +7600,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'users_lookupByEmail')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'users_lookupByEmail'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -7570,7 +7641,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'users_profile_get')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'users_profile_get'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -7619,7 +7690,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'users_profile_set')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'users_profile_set'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -7647,7 +7718,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'users_setActive')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'users_setActive'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -7696,7 +7767,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'users_setPhoto')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'users_setPhoto'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -7733,7 +7804,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'users_setPresence')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'users_setPresence'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -7774,7 +7845,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'views_open')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'views_open'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -7819,7 +7890,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'views_publish')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'views_publish'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -7860,7 +7931,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'views_push')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'views_push'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -7909,7 +7980,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'views_update')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'views_update'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -7950,7 +8021,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'workflows_stepCompleted')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'workflows_stepCompleted'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -7991,7 +8062,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'workflows_stepFailed')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'workflows_stepFailed'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)
@@ -8044,7 +8115,7 @@ class SlackDataSource:
             )
 
         try:
-            response = getattr(self.client, 'workflows_updateStep')(**kwargs_api)
+            response = await self._call(getattr(self.client, 'workflows_updateStep'), **kwargs_api)
             return await self._handle_slack_response(response)
         except Exception as e:
             return await self._handle_slack_error(e)

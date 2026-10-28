@@ -4,312 +4,151 @@ import sinon from 'sinon'
 import { DesktopProxySocketGateway } from '../../../../src/modules/desktop_proxy/socket/desktop-proxy.gateway'
 
 describe('DesktopProxySocketGateway', () => {
-  const getPort = () => 3001
-  const makeGateway = () => {
-    const authTokenService = {
-      verifyToken: sinon.stub(),
-    }
-    return {
-      gateway: new DesktopProxySocketGateway(authTokenService as never, getPort),
-      verifyTokenStub: authTokenService.verifyToken,
-    }
-  }
+  afterEach(() => {
+    sinon.restore()
+  })
 
-  const makeSocket = (token?: unknown) =>
-    ({
-      handshake: { auth: { token } },
-      data: {},
-      emit: sinon.stub(),
-    }) as never
+  describe('extractToken', () => {
+    const makeGateway = () =>
+      new DesktopProxySocketGateway({ verifyToken: sinon.stub() } as never)
+
+    it('returns the token from a well-formed Bearer value', () => {
+      expect((makeGateway() as any).extractToken('Bearer token-123')).to.equal('token-123')
+    })
+
+    it('returns null for a missing, bare, or empty-Bearer token', () => {
+      const gateway = makeGateway() as any
+      expect(gateway.extractToken('')).to.equal(null)
+      expect(gateway.extractToken('not-a-bearer-token')).to.equal(null)
+      expect(gateway.extractToken('Bearer ')).to.equal(null)
+    })
+  })
+
+  describe('getHandshakeToken', () => {
+    it('reads the handshake auth token and defaults to empty string', () => {
+      const gateway = new DesktopProxySocketGateway(
+        { verifyToken: sinon.stub() } as never,
+      ) as any
+      const socketWith = { handshake: { auth: { token: 'Bearer t' } } }
+      const socketWithout = { handshake: { auth: {} } }
+
+      expect(gateway.getHandshakeToken(socketWith)).to.equal('Bearer t')
+      expect(gateway.getHandshakeToken(socketWithout)).to.equal('')
+    })
+  })
+})
+
+describe('DesktopProxySocketGateway.isLocalFsDeviceOnline', () => {
+  it('returns null before the namespace is attached', () => {
+    const authTokenService = { verifyToken: sinon.stub() }
+    const gateway = new DesktopProxySocketGateway(authTokenService as never)
+    expect(gateway.isReady()).to.equal(false)
+    expect(gateway.isLocalFsDeviceOnline('org-1', 'user-1', 'dev-a')).to.equal(null)
+    expect(gateway.isDesktopConnected('org-1', 'user-1')).to.equal(null)
+  })
+})
+
+describe('DesktopProxySocketGateway session checks', () => {
+  const USER = '64b000000000000000000001'
+  const OTHER = '64b000000000000000000002'
+  const ORG = '64b0000000000000000000aa'
 
   afterEach(() => {
     sinon.restore()
   })
 
-  it('returns BAD_REQUEST when request id is empty (invalid RPC envelope)', async () => {
-    const { gateway } = makeGateway()
-    const res = await (gateway as any).handleRequest(
-      {
-        type: 'request',
-        op: 'restProxy',
-        id: '',
-        payload: { method: 'GET', path: '/api/v1/connectors' },
-      },
-      makeSocket('Bearer token'),
-    )
-    expect(res.ok).to.equal(false)
-    expect(res.error.code).to.equal('BAD_REQUEST')
+  const makeSocket = (data: Record<string, unknown> = {}) => ({
+    handshake: { auth: { token: 'Bearer t' } },
+    data: { ...data },
+    disconnect: sinon.stub(),
   })
 
-  it('returns BAD_REQUEST when request id is blank after trim', async () => {
-    const { gateway } = makeGateway()
-    const res = await (gateway as any).handleRequest(
-      {
-        type: 'request',
-        op: 'restProxy',
-        id: '   ',
-        payload: { method: 'GET', path: '/api/v1/connectors' },
-      },
-      makeSocket('Bearer token'),
-    )
-    expect(res.ok).to.equal(false)
-    expect(res.id).to.equal('unknown')
-    expect(res.error.code).to.equal('BAD_REQUEST')
+  const makeGateway = (sessions: Record<string, sinon.SinonStub>) =>
+    new DesktopProxySocketGateway(
+      { verifyToken: sinon.stub().resolves({ userId: USER, orgId: ORG, role: 'member', iat: 1_000, email: 'old@x.com' }) } as never,
+      sessions as never,
+    ) as any
+
+  describe('authenticateHandshake', () => {
+    it('refuses a revoked session with a message the desktop client treats as auth', async () => {
+      const gateway = makeGateway({
+        findSessionRefusal: sinon.stub().resolves('User not found, please login again'),
+      })
+      const socket = makeSocket()
+
+      const error = await gateway.authenticateHandshake(socket)
+
+      expect(error).to.be.instanceOf(Error)
+      expect(error.message).to.match(/auth/i)
+      expect(error.message).to.contain('User not found')
+      expect(socket.data.userId).to.equal(undefined)
+    })
+
+    it('accepts a live session and records the token issue time and email', async () => {
+      const findSessionRefusal = sinon.stub().resolves(null)
+      const gateway = makeGateway({ findSessionRefusal })
+      const socket = makeSocket()
+
+      expect(await gateway.authenticateHandshake(socket)).to.equal(undefined)
+      expect(socket.data).to.deep.equal({
+        userId: USER,
+        orgId: ORG,
+        issuedAt: 1_000,
+        email: 'old@x.com',
+      })
+      expect(findSessionRefusal.firstCall.args[0]).to.include({ userId: USER, orgId: ORG })
+    })
+
+    // A user revoked before a database outage must not get in during it.
+    it('refuses with a retryable, non-auth message when the session check fails', async () => {
+      const gateway = makeGateway({
+        findSessionRefusal: sinon.stub().rejects(new Error('mongo down')),
+      })
+      const socket = makeSocket()
+
+      const error = await gateway.authenticateHandshake(socket)
+
+      expect(error).to.be.instanceOf(Error)
+      // The desktop client stops retrying on messages matching this pattern.
+      expect(error.message).not.to.match(/token|auth|unauthor|expired/i)
+      expect(socket.data.userId).to.equal(undefined)
+    })
   })
 
-  it('returns METHOD_NOT_ALLOWED when method is not whitelisted', async () => {
-    const { gateway } = makeGateway()
-    const res = await (gateway as any).handleRequest(
-      {
-        type: 'request',
-        op: 'restProxy',
-        id: '1',
-        payload: { method: 'TRACE', path: '/api/v1/connectors' },
-      },
-      makeSocket('Bearer token'),
-    )
-    expect(res.ok).to.equal(false)
-    expect(res.error.code).to.equal('METHOD_NOT_ALLOWED')
-  })
+  describe('disconnectRevokedSessions', () => {
+    const withSockets = (gateway: any, sockets: ReturnType<typeof makeSocket>[]) => {
+      gateway.namespace = { sockets: new Map(sockets.map((s, i) => [String(i), s])) }
+      return gateway
+    }
 
-  it('defaults blank method to GET', async () => {
-    const { gateway, verifyTokenStub } = makeGateway()
-    verifyTokenStub.resolves({ userId: 'u1', orgId: 'o1' })
-    const fetchStub = sinon.stub(globalThis as any, 'fetch').resolves({
-      status: 200,
-      text: async () => '{}',
-    } as Response)
+    it('disconnects only the sockets whose session no longer holds', async () => {
+      // The token's email, not the account's current one, is what gets re-checked.
+      const revoked = makeSocket({ userId: USER, orgId: ORG, issuedAt: 1_000, email: 'old@x.com' })
+      const live = makeSocket({ userId: OTHER, orgId: ORG, issuedAt: 1_000 })
+      const findSessionRefusals = sinon.stub().resolves(['This account is disabled', null])
+      const gateway = withSockets(makeGateway({ findSessionRefusals }), [revoked, live])
 
-    const res = await (gateway as any).handleRequest(
-      {
-        type: 'request',
-        op: 'restProxy',
-        id: 'm1',
-        payload: { method: '   ', path: '/api/v1/connectors' },
-      },
-      makeSocket('Bearer token'),
-    )
-    expect(res.ok).to.equal(true)
-    const [, calledInit] = fetchStub.firstCall.args as [string, RequestInit]
-    expect(calledInit.method).to.equal('GET')
-  })
+      await gateway.disconnectRevokedSessions()
 
-  it('returns UNAUTHORIZED when handshake token is missing', async () => {
-    const { gateway } = makeGateway()
-    const res = await (gateway as any).handleRequest(
-      {
-        type: 'request',
-        op: 'restProxy',
-        id: '2',
-        payload: { method: 'GET', path: '/api/v1/connectors' },
-      },
-      makeSocket(undefined),
-    )
-    expect(res.ok).to.equal(false)
-    expect(res.error.code).to.equal('UNAUTHORIZED')
-    expect(res.error.message).to.equal('Authentication token missing')
-    expect(res.error.status).to.equal(401)
-  })
+      expect(findSessionRefusals.firstCall.args[0]).to.deep.equal([
+        { userId: USER, orgId: ORG, iat: 1_000, email: 'old@x.com' },
+        { userId: OTHER, orgId: ORG, iat: 1_000, email: undefined },
+      ])
+      expect(revoked.disconnect.calledOnceWith(true)).to.equal(true)
+      expect(live.disconnect.called).to.equal(false)
+    })
 
-  it('returns UNAUTHORIZED when handshake value is not Bearer token', async () => {
-    const { gateway } = makeGateway()
-    const res = await (gateway as any).handleRequest(
-      {
-        type: 'request',
-        op: 'restProxy',
-        id: '2b',
-        payload: { method: 'GET', path: '/api/v1/connectors' },
-      },
-      makeSocket('not-a-bearer-token'),
-    )
-    expect(res.ok).to.equal(false)
-    expect(res.error.code).to.equal('UNAUTHORIZED')
-  })
+    it('leaves every socket up when the re-check fails', async () => {
+      const socket = makeSocket({ userId: USER, orgId: ORG, issuedAt: 1_000 })
+      const gateway = withSockets(
+        makeGateway({ findSessionRefusals: sinon.stub().rejects(new Error('mongo down')) }),
+        [socket],
+      )
 
-  it('returns UNAUTHORIZED when Bearer scheme has empty token', async () => {
-    const { gateway } = makeGateway()
-    const res = await (gateway as any).handleRequest(
-      {
-        type: 'request',
-        op: 'restProxy',
-        id: '2c',
-        payload: { method: 'GET', path: '/api/v1/connectors' },
-      },
-      makeSocket('Bearer '),
-    )
-    expect(res.ok).to.equal(false)
-    expect(res.error.code).to.equal('UNAUTHORIZED')
-  })
+      await gateway.disconnectRevokedSessions()
 
-  it('returns TOKEN_EXPIRED when token verification fails', async () => {
-    const { gateway, verifyTokenStub } = makeGateway()
-    verifyTokenStub.rejects(new Error('expired'))
-    const res = await (gateway as any).handleRequest(
-      {
-        type: 'request',
-        op: 'restProxy',
-        id: '3',
-        payload: { method: 'GET', path: '/api/v1/connectors' },
-      },
-      makeSocket('Bearer bad-token'),
-    )
-    expect(res.ok).to.equal(false)
-    expect(res.error.code).to.equal('TOKEN_EXPIRED')
-    expect(res.error.message).to.equal('Authentication token expired or invalid')
-    expect(res.error.status).to.equal(401)
-  })
-
-  it('returns PATH_NOT_ALLOWED when path fails allowlist', async () => {
-    const { gateway, verifyTokenStub } = makeGateway()
-    verifyTokenStub.resolves({ userId: 'u1', orgId: 'o1' })
-    const res = await (gateway as any).handleRequest(
-      {
-        type: 'request',
-        op: 'restProxy',
-        id: '4',
-        payload: { method: 'GET', path: '/internal/admin' },
-      },
-      makeSocket('Bearer token'),
-    )
-    expect(res.ok).to.equal(false)
-    expect(res.error.code).to.equal('PATH_NOT_ALLOWED')
-    expect(res.error.message).to.equal('Path is not allowed for REST proxy')
-  })
-
-  it('proxies request and parses json response body', async () => {
-    const { gateway, verifyTokenStub } = makeGateway()
-    verifyTokenStub.resolves({ userId: 'u1', orgId: 'o1' })
-
-    const fetchStub = sinon.stub(globalThis as any, 'fetch').resolves({
-      status: 201,
-      text: async () => '{"ok":true,"count":2}',
-    } as Response)
-
-    const res = await (gateway as any).handleRequest(
-      {
-        type: 'request',
-        op: 'restProxy',
-        id: '5',
-        payload: {
-          method: 'POST',
-          path: '/api/v1/connectors',
-          query: { page: 2, active: true, skip: null },
-          body: { hello: 'world' },
-        },
-      },
-      makeSocket('Bearer token-123'),
-    )
-
-    expect(res.ok).to.equal(true)
-    expect(res.result.status).to.equal(201)
-    expect(res.result.body).to.deep.equal({ ok: true, count: 2 })
-    expect(fetchStub.calledOnce).to.equal(true)
-    const [calledUrl, calledInit] = fetchStub.firstCall.args as [string, RequestInit]
-    expect(calledUrl).to.contain('http://127.0.0.1:3001/api/v1/connectors')
-    expect(calledUrl).to.contain('page=2')
-    expect(calledUrl).to.contain('active=true')
-    expect(calledUrl).to.not.contain('skip=')
-    const headers = calledInit.headers as Record<string, string>
-    expect(headers.Authorization).to.equal('Bearer token-123')
-    expect(headers.Accept).to.equal('application/json')
-    expect(headers['Content-Type']).to.equal('application/json')
-    expect(calledInit.body).to.equal(JSON.stringify({ hello: 'world' }))
-  })
-
-  it('allows knowledgeBase and crawlingManager allowlisted roots', async () => {
-    const { gateway, verifyTokenStub } = makeGateway()
-    verifyTokenStub.resolves({ userId: 'u1', orgId: 'o1' })
-    const fetchStub = sinon.stub(globalThis as any, 'fetch').resolves({
-      status: 200,
-      text: async () => '{"x":1}',
-    } as Response)
-
-    const kb = await (gateway as any).handleRequest(
-      {
-        type: 'request',
-        op: 'restProxy',
-        id: 'kb1',
-        payload: { method: 'GET', path: '/api/v1/knowledgeBase/items' },
-      },
-      makeSocket('Bearer t'),
-    )
-    expect(kb.ok).to.equal(true)
-    expect(fetchStub.firstCall.args[0] as string).to.match(/\/api\/v1\/knowledgeBase\/items$/)
-
-    const cm = await (gateway as any).handleRequest(
-      {
-        type: 'request',
-        op: 'restProxy',
-        id: 'cm1',
-        payload: { method: 'GET', path: '/api/v1/crawlingManager/jobs' },
-      },
-      makeSocket('Bearer t'),
-    )
-    expect(cm.ok).to.equal(true)
-    expect(fetchStub.secondCall.args[0] as string).to.match(/\/api\/v1\/crawlingManager\/jobs$/)
-  })
-
-  it('returns text body when upstream payload is not json', async () => {
-    const { gateway, verifyTokenStub } = makeGateway()
-    verifyTokenStub.resolves({ userId: 'u1', orgId: 'o1' })
-    sinon.stub(globalThis as any, 'fetch').resolves({
-      status: 200,
-      text: async () => 'plain-text',
-    } as Response)
-
-    const res = await (gateway as any).handleRequest(
-      {
-        type: 'request',
-        op: 'restProxy',
-        id: '6',
-        payload: { method: 'GET', path: '/api/v1/connectors' },
-      },
-      makeSocket('Bearer token'),
-    )
-
-    expect(res.ok).to.equal(true)
-    expect(res.result.body).to.equal('plain-text')
-  })
-
-  it('returns null body when upstream response is empty whitespace', async () => {
-    const { gateway, verifyTokenStub } = makeGateway()
-    verifyTokenStub.resolves({ userId: 'u1', orgId: 'o1' })
-    sinon.stub(globalThis as any, 'fetch').resolves({
-      status: 204,
-      text: async () => '  \n  ',
-    } as Response)
-
-    const res = await (gateway as any).handleRequest(
-      {
-        type: 'request',
-        op: 'restProxy',
-        id: '6b',
-        payload: { method: 'GET', path: '/api/v1/connectors' },
-      },
-      makeSocket('Bearer token'),
-    )
-
-    expect(res.ok).to.equal(true)
-    expect(res.result.body).to.equal(null)
-  })
-
-  it('returns UPSTREAM_ERROR when fetch throws', async () => {
-    const { gateway, verifyTokenStub } = makeGateway()
-    verifyTokenStub.resolves({ userId: 'u1', orgId: 'o1' })
-    sinon.stub(globalThis as any, 'fetch').rejects(new Error('network down'))
-
-    const res = await (gateway as any).handleRequest(
-      {
-        type: 'request',
-        op: 'restProxy',
-        id: '7',
-        payload: { method: 'GET', path: '/api/v1/connectors' },
-      },
-      makeSocket('Bearer token'),
-    )
-
-    expect(res.ok).to.equal(false)
-    expect(res.error.code).to.equal('UPSTREAM_ERROR')
-    expect(res.error.message).to.equal('network down')
+      expect(socket.disconnect.called).to.equal(false)
+      expect(gateway.sessionRecheckRunning).to.equal(false)
+    })
   })
 })

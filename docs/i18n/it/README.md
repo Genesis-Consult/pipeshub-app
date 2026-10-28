@@ -1,6 +1,6 @@
 <div align="center">
 
-**Translations:** [English](../../../README.md) · [Français](../fr/README.md) · [Deutsch](../de/README.md) · [简体中文](../zh-CN/README.md) · [日本語](../ja/README.md) · [Русский](../ru/README.md) · [עברית](../he/README.md) · [한국어](../ko/README.md) · [Español](../es/README.md) · [Português](../pt/README.md) · [Türkçe](../tr/README.md) · [Tiếng Việt](../vi/README.md) · **Italiano**
+**Translations:** [English](../../../README.md) · [Français](../fr/README.md) · [Deutsch](../de/README.md) · [简体中文](../zh-CN/README.md) · [日本語](../ja/README.md) · [Русский](../ru/README.md) · [עברית](../he/README.md) · [한국어](../ko/README.md) · [Español](../es/README.md) · [Português](../pt/README.md) · [Türkçe](../tr/README.md) · [Tiếng Việt](../vi/README.md) · **Italiano** · [Čeština](../cs/README.md)
 
 </div>
 
@@ -210,16 +210,12 @@ PDF (incluse le scansioni), Microsoft Office (Word, Excel, PowerPoint), Google D
 ### Come si distribuisce PipesHub?
 
 ```bash
-# Clone the repository
-git clone https://github.com/pipeshub-ai/pipeshub-ai.git
-cd pipeshub-ai/deployment/docker-compose
-
-# Set Environment Variables (refer to env.template)
-# Start production deployment
-docker compose -f docker-compose.prod.yml -p pipeshub-ai up -d
+curl -fsSL https://get.pipeshub.com/install | bash
 ```
 
-Nota: Usa HTTPS per i deployment sul cloud. L'HTTP può causare blocchi di sicurezza nel frontend.
+Questo scrive i file di Compose in `./pipeshub` e avvia l'installer interattivo. Apri **http://localhost:3000** quando finisce. Usa HTTPS per i deployment sul cloud — l'HTTP può causare blocchi di sicurezza nel frontend.
+
+Gli sviluppatori che compilano dai sorgenti dovrebbero clonare il repository ed eseguire `./install.sh` (o `./install.sh --build`) dalla radice del repository. Vedi la [Guida al Deployment](#-guida-al-deployment).
 
 ### Quali provider di LLM supporta PipesHub?
 

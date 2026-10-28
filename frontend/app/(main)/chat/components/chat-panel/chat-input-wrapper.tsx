@@ -1,11 +1,13 @@
 'use client';
 
 import { useCallback, useEffect } from 'react';
-import { useThreadRuntime } from '@assistant-ui/react';
+import { useAui } from '@assistant-ui/react';
 import { ChatInput } from '../chat-input';
+import type { MentionNode } from '@/chat/utils/node-mentions';
 import { useChatStore, ctxKeyFromAgent } from '@/chat/store';
 import { useEffectiveAgentId } from '@/chat/hooks/use-effective-agent-id';
 import { fetchModelsForContext } from '@/chat/utils/fetch-models-for-context';
+import { showRemoteRunInProgressToast } from '@/chat/utils/remote-run-toast';
 import { ChatApi } from '@/chat/api';
 import {
   buildAssistantApiFilters,
@@ -30,7 +32,7 @@ let lastEffectiveAgentIdForQueryMode: string | null = null;
  * Must be used inside AssistantRuntimeProvider.
  */
 export function ChatInputWrapper() {
-  const threadRuntime = useThreadRuntime();
+  const aui = useAui();
   const effectiveAgentId = useEffectiveAgentId();
   const isAgentChat = Boolean(effectiveAgentId);
 
@@ -78,29 +80,33 @@ export function ChatInputWrapper() {
     currentSearchAbort = searchController;
 
     store.setIsSearching(true);
-    store.setSearchError(null);
+    // The query first, so the heading shows while loading and a closed search can be told apart.
+    store.setSearchResults([], null, query);
 
-    const streamFilters = buildAssistantApiFilters(store.settings.filters);
     const request: SearchRequest = {
       query,
       limit: 10,
-      filters: {
-        apps: streamFilters.apps,
-        kb: streamFilters.kb,
-      },
+      filters: buildAssistantApiFilters(store.settings.filters),
     };
+
+    // Closing search (clearSearchResults) or a newer search makes this answer stale.
+    const isStale = () =>
+      myGeneration !== searchSubmitGeneration || useChatStore.getState().searchQuery !== query;
 
     try {
       const response = await ChatApi.search(request, searchController.signal);
+      if (isStale()) return;
       store.setSearchResults(
         response.searchResponse.searchResults,
         response.searchId,
-        query
+        query,
+        response,
       );
     } catch (error: unknown) {
-      if (isRequestCancelledError(error)) return;
+      if (isRequestCancelledError(error) || isStale()) return;
       if (isSearchNoAccessibleDocumentsNotFound(error)) {
-        store.setSearchResults([], null, query);
+        // Keep the server's reason ("No documents are available…") for the empty state.
+        store.setSearchResults([], null, query, { message: (error as Error).message });
         return;
       }
       store.setSearchError((error as Error)?.message || 'Search failed');
@@ -130,7 +136,7 @@ export function ChatInputWrapper() {
         signal,
       });
       const ref = refs[0];
-      if (!ref) throw new Error('Upload returned no attachment ref');
+      if (!ref) throw new Error("The upload didn't finish. Please attach the file again.");
       return ref;
     },
     [effectiveAgentId],
@@ -146,7 +152,7 @@ export function ChatInputWrapper() {
     [effectiveAgentId],
   );
 
-  const handleSend = async (message: string, attachments?: AttachmentRef[]) => {
+  const handleSend = async (message: string, attachments?: AttachmentRef[], mentions?: MentionNode[]) => {
     if (!message.trim() && (!attachments || attachments.length === 0)) return;
 
     const store = useChatStore.getState();
@@ -159,7 +165,15 @@ export function ChatInputWrapper() {
     }
 
     // ── Chat mode ──
-    if (store.activeSlotId && store.slots[store.activeSlotId]?.isStreaming) {
+    // Block a second send while a run is in flight, but allow Enter after
+    // Stop (`stopping`) so a follow-up can start with a new runId before
+    // the old run's grace timer fires.
+    const active = store.activeSlotId ? store.slots[store.activeSlotId] : undefined;
+    if (active?.isStreaming && !active.stopping) {
+      return;
+    }
+    if (active?.remoteRunInProgress) {
+      showRemoteRunInProgressToast();
       return;
     }
 
@@ -168,10 +182,9 @@ export function ChatInputWrapper() {
     if (!activeSlotId) {
       activeSlotId = store.createSlot(null);
       store.setActiveSlot(activeSlotId);
-      const rawAgentId =
-        typeof window !== 'undefined'
-          ? new URLSearchParams(window.location.search).get('agentId')
-          : null;
+      const urlParams =
+        typeof window !== 'undefined' ? new URLSearchParams(window.location.search) : null;
+      const rawAgentId = urlParams?.get('agentId');
       const agentIdFromUrl = rawAgentId?.trim() ? rawAgentId : null;
       if (agentIdFromUrl) {
         store.updateSlot(activeSlotId, {
@@ -179,6 +192,13 @@ export function ChatInputWrapper() {
           agentStreamTools:
             store.agentStreamTools === null ? null : [...store.agentStreamTools],
         });
+      } else {
+        // A thread can't be scoped to both an agent and a project.
+        const rawProjectId = urlParams?.get('projectId');
+        const projectIdFromUrl = rawProjectId?.trim() ? rawProjectId : null;
+        if (projectIdFromUrl) {
+          store.updateSlot(activeSlotId, { projectId: projectIdFromUrl });
+        }
       }
     }
 
@@ -209,13 +229,14 @@ export function ChatInputWrapper() {
     // Attachments were uploaded the moment they were added to the composer,
     // so by the time we reach here every ref is already server-assigned.
     // Forward verbatim to the runtime; no upload step at send time.
-    threadRuntime.append({
+    aui.thread().append({
       role: 'user',
       content: [{ type: 'text', text: message }],
       metadata: {
         custom: {
           collections: collectionsAtSendTime.length > 0 ? collectionsAtSendTime : undefined,
           attachments: attachments && attachments.length > 0 ? attachments : undefined,
+          mentionIds: mentions && mentions.length > 0 ? mentions.map((node) => node.id) : undefined,
         },
       },
       startRun: true,
@@ -229,6 +250,7 @@ export function ChatInputWrapper() {
       onDeleteFile={handleDeleteFile}
       isAgentChat={isAgentChat}
       agentId={effectiveAgentId}
+      persistDraft
     />
   );
 }

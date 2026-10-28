@@ -20,6 +20,7 @@ except ImportError:
     )
 
 from app.config.configuration_service import ConfigurationService
+from app.sources.client.http.address_guard import check_url_allowed
 from app.sources.client.iclient import IClient
 
 
@@ -30,6 +31,10 @@ class GCSResponse:
     data: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
     message: Optional[str] = None
+    # The GCS error text embeds the bucket and object key, so it cannot be
+    # substring-matched to classify a failure without the key's own contents
+    # ("permission", "404", ...) deciding the answer.
+    status_code: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization"""
@@ -64,6 +69,9 @@ class GCSRESTClientViaServiceAccount:
     def _get_credentials(self) -> service_account.Credentials:
         """Get or create service account credentials."""
         if self._credentials is None:
+            # google-auth sends the signed token request to the key file's own token_uri.
+            if self.service_account_info.get("token_uri"):
+                check_url_allowed(str(self.service_account_info["token_uri"]))
             self._credentials = service_account.Credentials.from_service_account_info(
                 self.service_account_info
             )

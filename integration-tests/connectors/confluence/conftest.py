@@ -9,6 +9,8 @@ from typing import Any, AsyncGenerator, Dict
 
 import pytest
 import pytest_asyncio
+
+from helper.source_credentials import source_unavailable
 from app.sources.client.confluence.confluence import (  # type: ignore[import-not-found]
     ConfluenceClient,
     ConfluenceApiKeyConfig,
@@ -19,6 +21,7 @@ from helper.assertions import ConnectorAssertions  # type: ignore[import-not-fou
 from helper.graph_provider import (
     GraphProviderProtocol,  # type: ignore[import-not-found]
 )
+from connectors.confluence.constants import connector_base_url  # type: ignore[import-not-found]
 from connectors.confluence.confluence_v1_test_utils import (  # type: ignore[import-not-found]
     assert_api_content_matches_graph,
     fetch_space_content_snapshot,
@@ -40,9 +43,9 @@ async def confluence_datasource():
     api_token = os.getenv("CONFLUENCE_TEST_API_TOKEN")
 
     if not base_url or not email or not api_token:
-        pytest.skip(
-            "Confluence credentials not set "
-            "(CONFLUENCE_TEST_BASE_URL, CONFLUENCE_TEST_EMAIL, CONFLUENCE_TEST_API_TOKEN)"
+        source_unavailable(
+            "The Confluence site this suite syncs from is not configured.",
+            secrets=["CONFLUENCE_TEST_BASE_URL", "CONFLUENCE_TEST_EMAIL", "CONFLUENCE_TEST_API_TOKEN"],
         )
 
     config = ConfluenceApiKeyConfig(base_url=base_url, email=email, api_key=api_token)
@@ -138,7 +141,7 @@ async def confluence_connector(
     config = {
         "auth": {
             "authType": "API_TOKEN",
-            "baseUrl": base_url,
+            "baseUrl": connector_base_url(),
             "email": email,
             "apiToken": api_token,
         },

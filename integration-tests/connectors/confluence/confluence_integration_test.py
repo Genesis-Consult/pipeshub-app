@@ -12,12 +12,12 @@ Execution order:
   1) Full sync + graph validation
   2) Entity validation (TC-CF-*)
   3) Knowledge Hub ACL (TC-CF-005/006/007)
-  4) Filters
+  4) Filters (TC-CF-036 filters the test space out, then restores it)
   5) Reindex
   6) Stream
 
 Active test cases:
-  TC-SYNC-001, TC-CF-001/002/003/004/005/006/007/008/036/046/052
+  TC-SYNC-001, TC-CF-001/002/003/004/005/006/007/008/036/046/052, TC-CF-AUTH-001
 
 Mutation/resync cases live in ``confluence_mutation_cases.py`` (not collected by pytest).
 """
@@ -42,31 +42,44 @@ from app.models.entities import (  # type: ignore[import-not-found]  # noqa: E40
 from app.sources.external.confluence.confluence import (  # type: ignore[import-not-found]  # noqa: E402
     ConfluenceDataSource,
 )
-from app.config.constants.arangodb import PermissionModel  # noqa: E402
+from app.config.constants.arangodb import MimeTypes, PermissionModel  # noqa: E402
 from helper.assertions import (  # noqa: E402
     ConnectorAssertions,
     RecordAssertion,
     assert_permission_model,
 )
+from connectors.confluence.constants import connector_site_origin  # noqa: E402
 from connectors.confluence.confluence_v1_test_utils import (  # noqa: E402
     FOLDER_MIME_TYPE,
     assert_api_content_matches_graph,
     assert_confluence_page_in_v1_space_content_search,
+    count_run_records,
 )
 from connectors.confluence.confluence_knowledge_hub_test_utils import (  # noqa: E402
+    KH_CHILDREN_LIMIT,
     assert_kh_folder_from_snapshot,
     assert_kh_snapshot_content,
     assert_kh_space_visible_for_user,
+    find_kh_item,
 )
+from helper.authenticated_identity import assert_authenticated_identity_link  # noqa: E402
 from helper.graph_provider import GraphProviderProtocol  # noqa: E402
 from helper.graph_provider_utils import (  # noqa: E402
-    wait_for_sync_completion,
+    apply_filter_full_sync,
 )
 from pipeshub_client import (  # type: ignore[import-not-found]  # noqa: E402
     PipeshubClient,
 )
 
 logger = logging.getLogger("confluence-lifecycle-test")
+
+# A validly shaped space key that no real space uses, so the space lookup finds nothing.
+_NO_SUCH_SPACE_KEY = "PIPESHUBITNOSUCHSPACE"
+
+
+def _space_filter(operator: str, keys: list[str]) -> Dict[str, Any]:
+    """The ``config.filters`` payload the connector reads: ``filters.sync.values.space_keys``."""
+    return {"sync": {"values": {"space_keys": {"operator": operator, "type": "list", "value": keys}}}}
 
 
 @pytest.mark.integration
@@ -97,7 +110,7 @@ class TestConfluenceValidation:
         expected = RecordAssertion(
             external_record_id=page_id,
             record_type=RecordType.CONFLUENCE_PAGE.value,
-            mime_type="text/html",
+            mime_type=MimeTypes.BLOCKS.value,
             record_name=page_item.title,
             external_record_group_id=space_id,
         )
@@ -115,7 +128,7 @@ class TestConfluenceValidation:
         )
         
         # Additional checks
-        assert record.weburl is not None and record.weburl.startswith("https://"), "Page should have webUrl"
+        assert record.weburl is not None and record.weburl.startswith(connector_site_origin()), "Page should have webUrl"
         assert record.source_created_at is not None, "Page should have sourceCreatedAtTimestamp"
         assert record.connector_id == connector_id, "Page should have correct connectorId"
         
@@ -160,7 +173,7 @@ class TestConfluenceValidation:
         logger.info("✅ TC-CF-003: Space %s validated successfully", space_id)
     
     @pytest.mark.order(4)
-    async def test_tc_cf_008_record_relationships(
+    async def test_tc_cf_008_node_relationships(
         self,
         confluence_connector: Dict[str, Any],
         confluence_datasource: ConfluenceDataSource,
@@ -275,6 +288,31 @@ class TestConfluenceValidation:
         )
 
         logger.info("✅ TC-CF-001: User %s (accountId=%s) validated with USER_APP_RELATION", test_email, account_id)
+
+    @pytest.mark.order(5)
+    async def test_tc_cf_auth_001_authenticated_identity(
+        self,
+        confluence_connector: Dict[str, Any],
+        confluence_datasource: ConfluenceDataSource,
+        graph_provider: GraphProviderProtocol,
+    ) -> None:
+        """TC-CF-AUTH-001: the creator is linked to the Confluence account the API token belongs to.
+
+        That link is what lets a creator whose PipesHub email differs see the account's
+        permissions on this connector. Read from the same ``GET /wiki/rest/api/user/current``
+        the connector reads.
+        """
+        response = await confluence_datasource.get_current_user_v1()
+        assert response and response.status == 200, (
+            f"get_current_user_v1 failed: HTTP {getattr(response, 'status', None)}"
+        )
+        me = response.json() or {}
+        await assert_authenticated_identity_link(
+            graph_provider, confluence_connector["connector_id"],
+            (me.get("email") or "").strip() or None,
+            me.get("accountId"),
+        )
+        logger.info("TC-CF-AUTH-001 passed: Confluence account %s", me.get("accountId"))
 
     @pytest.mark.order(6)
     async def test_tc_cf_002_group_properties(
@@ -392,7 +430,7 @@ class TestConfluenceKnowledgeHubAccess:
         snapshot = confluence_connector["content_snapshot"]
 
         if not snapshot.folders:
-            pytest.skip("No folders in IT space snapshot")
+            pytest.skip("No folders in the test space snapshot")
 
         for folder_item in snapshot.folders:
             expected = RecordAssertion(
@@ -407,7 +445,7 @@ class TestConfluenceKnowledgeHubAccess:
                 connector_id, folder_item.id, expected
             )
             assert record.size_in_bytes == 0, "Folder sizeInBytes should be 0"
-            assert record.weburl is not None and record.weburl.startswith("https://"), (
+            assert record.weburl is not None and record.weburl.startswith(connector_site_origin()), (
                 "Folder should have webUrl"
             )
 
@@ -463,7 +501,7 @@ class TestConfluenceKnowledgeHubAccess:
         snapshot = confluence_connector["content_snapshot"]
 
         if not snapshot.all_content:
-            pytest.skip("No content in IT space snapshot")
+            pytest.skip("No content in the test space snapshot")
 
         await assert_kh_snapshot_content(
             pipeshub_client,
@@ -489,7 +527,7 @@ class TestConfluenceFilters:
     """Filter tests for Confluence (TC-CF-036 to TC-CF-045)."""
     
     @pytest.mark.order(13)
-    async def test_tc_cf_036_space_filter_include(
+    async def test_tc_cf_036_space_filter_scopes_the_sync(
         self,
         confluence_connector: Dict[str, Any],
         confluence_datasource: ConfluenceDataSource,
@@ -497,48 +535,82 @@ class TestConfluenceFilters:
         graph_provider: GraphProviderProtocol,
         connector_assertions: ConnectorAssertions,
     ) -> None:
-        """TC-CF-036: Set space_keys filter, verify only content from those spaces is synced."""
+        """TC-CF-036: Filtering the test space out removes it from the sync; restoring the filter brings it back.
+
+        The connector is created with a filter that already selects only the test space, so
+        sending that filter again would change nothing. Instead, the filter is set to a space
+        key that doesn't exist. After the full sync, the test space must no longer be linked
+        to the connector, none of its records may still be in scope, and it must be gone from
+        Knowledge Hub. The original filter is then restored so later tests see the space as
+        before.
+        """
         connector_id = confluence_connector["connector_id"]
         space_key = confluence_connector["space_key"]
+        space_rg_id = confluence_connector["space_record_group_id"]
         snapshot = confluence_connector["content_snapshot"]
-        
-        # Update connector filters using safe method
-        # This automatically handles disabling the connector if active, updating filters,
-        # and re-enabling if it was originally active
-        filters = {
-            "space_keys": {
-                "operator": "IN",
-                "values": [space_key]
-            }
-        }
-        
-        pipeshub_client.update_connector_filters_sync_safe(
-            connector_id, 
-            filters=filters
+
+        baseline_app_edges = await graph_provider.count_app_record_group_edges(connector_id)
+        baseline_scoped = await count_run_records(graph_provider, connector_id, scoped=True)
+        assert baseline_app_edges >= 1 and baseline_scoped > 0, (
+            f"TC-CF-036 baseline: expected the test space in scope, got {baseline_app_edges} "
+            f"App edges and {baseline_scoped} scoped records"
         )
 
-        # Wait for sync to complete
-        await wait_for_sync_completion(
-            pipeshub_client,
-            graph_provider,
-            connector_id,
-            timeout=180,
+        # Later tests need the test space, so restore it even if an assertion fails.
+        try:
+            await apply_filter_full_sync(
+                pipeshub_client, graph_provider, connector_id,
+                _space_filter("in", [_NO_SUCH_SPACE_KEY]),
+            )
+
+            app_edges = await graph_provider.count_app_record_group_edges(connector_id)
+            scoped = await graph_provider.count_records(connector_id, scoped=True)
+            assert app_edges == 0, (
+                f"TC-CF-036: with only {_NO_SUCH_SPACE_KEY!r} included, no space should be linked "
+                f"to the App; got {app_edges} (was {baseline_app_edges}). The filter was not applied."
+            )
+            assert scoped == 0, (
+                f"TC-CF-036: every record should be out of scope; {scoped} still belong to a "
+                f"RecordGroup (was {baseline_scoped})"
+            )
+            kh_items = (
+                pipeshub_client.get_knowledge_hub_children(
+                    "app", connector_id, only_containers=True, limit=KH_CHILDREN_LIMIT,
+                ).get("items")
+                or []
+            )
+            assert find_kh_item(kh_items, node_id=space_rg_id) is None, (
+                f"TC-CF-036: space {space_key} is still listed in Knowledge Hub after being filtered out"
+            )
+        finally:
+            await apply_filter_full_sync(
+                pipeshub_client, graph_provider, connector_id, _space_filter("in", [space_key]),
+            )
+
+        assert await graph_provider.count_app_record_group_edges(connector_id) == baseline_app_edges
+        restored = await count_run_records(graph_provider, connector_id, scoped=True)
+        assert restored == baseline_scoped, (
+            f"TC-CF-036: after restoring the filter {restored} records are in scope, "
+            f"expected {baseline_scoped}"
         )
-        
         await assert_api_content_matches_graph(
             snapshot,
             confluence_datasource,
             graph_provider,
             connector_assertions,
             connector_id,
-            phase="TC-CF-036 after filter sync",
+            phase="TC-CF-036 after restoring the space filter",
         )
-        
-        # Verify only content from filtered space exists
-        record_count = await graph_provider.count_records(connector_id)
-        assert record_count > 0, "Should have records from filtered space"
-        
-        logger.info("✅ TC-CF-036: Space filter applied, %d records synced", record_count)
+        assert_kh_space_visible_for_user(
+            pipeshub_client,
+            connector_id,
+            space_rg_id,
+            confluence_connector["space_name"],
+            space_key=space_key,
+            context="TC-CF-036 after restoring the space filter",
+        )
+
+        logger.info("✅ TC-CF-036: space filter excluded %s and restored it", space_key)
 
 
 @pytest.mark.integration
@@ -631,17 +703,15 @@ class TestConfluenceStream:
         
         # Verify response
         assert response.status_code == 200
-        assert "text/html" in response.headers.get("content-type", "").lower()
-        
-        # Read some content
+        assert MimeTypes.BLOCKS.value in response.headers.get("content-type", "").lower()
+
+        # Pages stream as a blocks document (JSON), their comments included.
         content_chunk = next(response.iter_content(chunk_size=1024))
-        assert len(content_chunk) > 0, "Should have received content"
-        # Content is now in HTML format
-        assert b"<" in content_chunk or b"<!DOCTYPE" in content_chunk.upper(), (
-            "Content should be HTML format"
+        assert content_chunk.lstrip().startswith(b"{"), (
+            f"Content should be a blocks JSON document, got {content_chunk[:80]!r}"
         )
-        
-        logger.info("✅ TC-CF-052: Page content streamed successfully (HTML format)")
+
+        logger.info("✅ TC-CF-052: Page content streamed successfully (blocks)")
 
 
 @pytest.mark.integration

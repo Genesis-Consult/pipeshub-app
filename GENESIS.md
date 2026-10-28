@@ -1,7 +1,6 @@
 # Genesis extensions
 
-This fork is based on upstream PipesHub `v0.8.0`
-(`fbcc838584061338bec9c7d59aa621f67218114c`).
+This fork is based on upstream PipesHub `v1.0.0`.
 Genesis extensions include BookStack attachment indexing, the Bullhorn connector
 with StaffGC access reconciliation, bounded role-based document navigation,
 DOCX conversion safeguards, embedded assistant support, and Internal Search by default.

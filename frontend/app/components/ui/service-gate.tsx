@@ -1,13 +1,13 @@
 'use client';
 
 import { useRouter } from 'next/navigation';
+import { useTranslation } from 'react-i18next';
 import { Flex, Text, Heading, Badge, Button } from '@radix-ui/themes';
 import { MaterialIcon } from '@/app/components/ui/MaterialIcon';
 import {
   useServicesHealthStore,
   selectAppServices,
   APP_SERVICE_LABELS,
-  formatServiceList,
   type AppServices,
 } from '@/lib/store/services-health-store';
 import { useUserStore, selectIsAdmin } from '@/lib/store/user-store';
@@ -23,6 +23,7 @@ export type { AppServiceKey };
 
 export function ServiceGate({ children, services }: ServiceGateProps) {
   const router = useRouter();
+  const { t, i18n } = useTranslation();
   const appServices = useServicesHealthStore(selectAppServices);
   const isAdmin = useUserStore(selectIsAdmin);
 
@@ -70,26 +71,34 @@ export function ServiceGate({ children, services }: ServiceGateProps) {
         </Flex>
 
         <Heading size="5" style={{ color: 'var(--slate-12)' }}>
-          Service Unavailable
+          {t('healthGate.serviceGate.title')}
         </Heading>
 
-        <Text size="2" style={{ color: 'var(--slate-10)', lineHeight: 1.6 }}>
-          This page requires {formatServiceList(labels)} which{' '}
-          {unhealthyServices.length === 1 ? 'is' : 'are'} currently
-          unavailable. It will become available automatically once{' '}
-          {unhealthyServices.length === 1
-            ? 'the service recovers'
-            : 'the services recover'}
-          .
-        </Text>
+        {/* Service names help an admin act; to everyone else they are noise,
+            and the status page they point at is admin-only. Unknown (profile
+            still loading) counts as a member. */}
+        {isAdmin === true ? (
+          <Text size="2" style={{ color: 'var(--slate-10)', lineHeight: 1.6 }}>
+            {t('healthGate.serviceGate.requires', {
+              count: labels.length,
+              services: new Intl.ListFormat(i18n.language, { type: 'conjunction' }).format(labels),
+            })}
+          </Text>
+        ) : (
+          <Text size="2" style={{ color: 'var(--slate-10)', lineHeight: 1.6 }}>
+            {t('healthGate.serviceGate.memberBody')}
+          </Text>
+        )}
 
-        <Flex gap="2" wrap="wrap" justify="center">
-          {unhealthyServices.map((key) => (
-            <Badge key={key} color="red" variant="soft" size="2">
-              {APP_SERVICE_LABELS[key]}
-            </Badge>
-          ))}
-        </Flex>
+        {isAdmin === true && (
+          <Flex gap="2" wrap="wrap" justify="center">
+            {unhealthyServices.map((key) => (
+              <Badge key={key} color="red" variant="soft" size="2">
+                {APP_SERVICE_LABELS[key]}
+              </Badge>
+            ))}
+          </Flex>
+        )}
 
         {isAdmin === true && (
           <Button
@@ -102,14 +111,10 @@ export function ServiceGate({ children, services }: ServiceGateProps) {
             <span className="material-icons-outlined" style={{ fontSize: 16 }}>
               monitor_heart
             </span>
-            View Service Status
+            {t('healthGate.serviceGate.viewStatus')}
           </Button>
         )}
-        {isAdmin === false && (
-          <Text size="2" style={{ color: 'var(--slate-10)', marginTop: 8 }}>
-            Please contact your administrator for assistance.
-          </Text>
-        )}
+
       </Flex>
     </Flex>
   );

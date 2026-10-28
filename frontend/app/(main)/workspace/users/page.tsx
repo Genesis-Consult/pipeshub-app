@@ -1,6 +1,7 @@
 'use client';
 
 import React, { useEffect, useMemo, useCallback, useRef, useState, Suspense } from 'react';
+import { pagePaddingX } from '@/app/components/ui/responsive';
 import { useSearchParams, useRouter } from 'next/navigation';
 import { Flex, Text } from '@radix-ui/themes';
 import { useTranslation } from 'react-i18next';
@@ -28,7 +29,7 @@ import type { ColumnConfig } from '../components';
 import type { FilterChipConfig } from '../components/entity-filter-bar';
 import type { RowAction } from '../components/entity-row-action-menu';
 import { isProcessedError } from '@/lib/api';
-import { USER_ROLES, INVITE_ROLE_OPTIONS } from '../constants';
+import { USER_ROLES, INVITE_ROLE_OPTIONS, isMaxOrgAdminsErrorMessage, userRoleLabel } from '../constants';
 import { useUsersStore } from './store';
 import { UsersApi } from './api';
 import { ProfileApi } from '../profile/api';
@@ -592,7 +593,7 @@ function UsersPageContent() {
       const actions: BulkAction[] = [
         {
           key: 'resend-invite',
-          label: t('workspace.users.bulk.resendInvite', 'Resend Invite'),
+          label: t('workspace.users.bulk.resendInvite'),
           icon: 'send',
           variant: 'default',
           onClick: handleBulkResendInvite,
@@ -606,7 +607,7 @@ function UsersPageContent() {
                 'workspace.users.bulk.adminInviteCantBeCancelled',
                 'Admin invites cannot be cancelled'
               )
-            : t('workspace.users.bulk.cancelInvite', 'Cancel Invite'),
+            : t('workspace.users.bulk.cancelInvite'),
           icon: hasAdminSelected ? 'block' : 'cancel_schedule_send',
           variant: 'danger',
           disabled: hasAdminSelected,
@@ -658,7 +659,7 @@ function UsersPageContent() {
         width: '112px',
         render: (user) => (
           <Text size="2" style={{ color: 'var(--slate-12)' }}>
-            {user.role || 'Member'}
+            {userRoleLabel(user.role, t)}
           </Text>
         ),
       },
@@ -676,6 +677,7 @@ function UsersPageContent() {
       },
       {
         key: 'lastActive',
+        hideOnMobile: true,
         label: t('workspace.users.columns.lastActive'),
         width: '130px',
         render: (user) => (
@@ -686,6 +688,7 @@ function UsersPageContent() {
       },
       {
         key: 'dateJoined',
+        hideOnMobile: true,
         label: t('workspace.users.columns.dateJoined'),
         width: '130px',
         render: (user) => (
@@ -795,16 +798,6 @@ function UsersPageContent() {
   const unblockConfirmKeyword =
     unblockTarget?.name?.trim() || unblockTarget?.email || '';
 
-  // Shared "coming soon" toast helper
-  const showComingSoon = useCallback(() => {
-    addToast({
-      variant: 'info',
-      title: t('workspace.users.actions.comingSoonTitle'),
-      description: t('workspace.users.actions.comingSoonDescription'),
-      duration: 3000,
-    });
-  }, [addToast, t]);
-
   // ── Change Role handler ──
   const handleChangeRole = useCallback(
     async (user: User, newRole: string) => {
@@ -812,9 +805,13 @@ function UsersPageContent() {
       if (newRole === currentRole) return;
 
       try {
-        await ProfileApi.updateUser(user.userId, {
-          role: newRole === USER_ROLES.ADMIN ? 'admin' : 'member',
-        });
+        await ProfileApi.updateUser(
+          user.userId,
+          {
+            role: newRole === USER_ROLES.ADMIN ? 'admin' : 'member',
+          },
+          { suppressErrorToast: true },
+        );
 
         addToast({
           variant: 'success',
@@ -833,13 +830,28 @@ function UsersPageContent() {
         // Refresh users list to reflect the change
         fetchUsers();
       } catch (err: unknown) {
-        const description = isProcessedError(err) ? err.message : undefined;
-        addToast({
-          variant: 'error',
-          title: t('workspace.users.actions.changeRoleError', 'Failed to change role'),
-          ...(description ? { description } : {}),
-          duration: 5000,
-        });
+        const apiMessage = isProcessedError(err) ? err.message : undefined;
+        if (isMaxOrgAdminsErrorMessage(apiMessage)) {
+          addToast({
+            variant: 'error',
+            title: t(
+              'workspace.users.actions.maxAdminsReachedTitle',
+              'Cannot add another admin'
+            ),
+            description: t(
+              'workspace.users.actions.maxAdminsReached',
+              'An organization can have at most 5 admins.'
+            ),
+            duration: 5000,
+          });
+        } else {
+          addToast({
+            variant: 'error',
+            title: t('workspace.users.actions.changeRoleError', 'Failed to change role'),
+            ...(apiMessage ? { description: apiMessage } : {}),
+            duration: 5000,
+          });
+        }
         throw err;
       }
     },
@@ -1060,11 +1072,6 @@ function UsersPageContent() {
             },
           },
           isAdmin && {
-            icon: 'person_off',
-            label: t('workspace.users.actions.deactivate'),
-            onClick: showComingSoon,
-          },
-          isAdmin && {
             icon: 'person_remove',
             label: t('workspace.users.actions.removeFromWorkspace'),
             variant: 'danger' as const,
@@ -1083,7 +1090,6 @@ function UsersPageContent() {
       isAdmin,
       addToast,
       navigateToProfilePanel,
-      showComingSoon,
       requestChangeRole,
       handleResendInvite,
       handleEditInvite,
@@ -1104,8 +1110,7 @@ function UsersPageContent() {
       style={{
         height: '100%',
         width: '100%',
-        paddingLeft: '40px',
-        paddingRight: '40px',
+        paddingInline: pagePaddingX(40),
       }}
     >
       {/* Header */}
@@ -1222,7 +1227,7 @@ function UsersPageContent() {
           defaultValue:
             'Are you sure you want to change {{name}} from {{currentRole}} to {{newRole}}?',
         })}
-        confirmLabel={t('workspace.users.actions.changeRoleConfirmButton', 'Change Role')}
+        confirmLabel={t('workspace.users.actions.changeRoleConfirmButton')}
         cancelLabel={t('workspace.users.actions.cancelButton')}
         confirmVariant="primary"
         isLoading={isChangingRole}

@@ -2,7 +2,8 @@ import 'reflect-metadata'
 import { expect } from 'chai'
 import sinon from 'sinon'
 import { z, ZodError } from 'zod'
-import { ValidationUtils } from '../../../src/libs/utils/validation.utils'
+import { emailCheck, guidCheck, integerCheck, urlCheck } from '../../../src/libs/utils/zod-formats'
+import { ValidationUtils, messageWhenMissing, messageWhenPresent } from '../../../src/libs/utils/validation.utils'
 
 describe('validation.utils', () => {
   afterEach(() => {
@@ -179,7 +180,129 @@ describe('validation.utils', () => {
         { field: 'body.name', message: '', code: 'TOO_SMALL', value: '' },
       ])
 
-      expect(message).to.equal('Validation failed')
+      expect(message).to.equal("Some of the information sent isn't valid. Check the form and try again.")
+    })
+  })
+
+  describe('friendly wording for stock Zod messages', () => {
+    const messagesFor = (schema: z.ZodTypeAny, value: unknown): string[] => {
+      const result = schema.safeParse(value)
+      if (result.success) throw new Error('expected validation to fail')
+      return ValidationUtils.formatZodError(result.error).map((e) => e.message)
+    }
+
+    it('names the field and says what is wrong, without the request part', () => {
+      const schema = z.object({
+        body: z.object({
+          name: z.string(),
+          pageSize: z.number(),
+          email: z.string().email(),
+          title: z.string().min(1),
+          role: z.enum(['admin', 'member']),
+          tags: z.array(z.string()).min(2),
+        }),
+      })
+      expect(
+        messagesFor(schema, { body: { pageSize: 'x', email: 'no', title: '', role: 'boss', tags: ['a'] } }),
+      ).to.have.members([
+        'Name is required.',
+        'Page size must be a number.',
+        'Email must be a valid email address.',
+        "Title can't be empty.",
+        'Role must be one of: admin, member.',
+        'Add at least 2 items to tags.',
+      ])
+    })
+
+    it('treats only the first path entry as the request part', () => {
+      const schema = z.object({ query: z.object({ query: z.string() }) })
+      expect(messagesFor(schema, { query: {} })).to.deep.equal(['Query is required.'])
+    })
+
+    it('keeps a message the schema wrote itself', () => {
+      const schema = z.object({ colour: z.string(messageWhenMissing('Pick a colour first')) })
+      expect(messagesFor(schema, {})).to.deep.equal(['Pick a colour first'])
+    })
+
+    it('keeps the schema message for a missing value only (messageWhenMissing)', () => {
+      const schema = z.object({ colour: z.string(messageWhenMissing('Pick a colour first')) })
+      expect(messagesFor(schema, {})).to.deep.equal(['Pick a colour first'])
+      expect(messagesFor(schema, { colour: 5 })).to.deep.equal(['Colour must be text.'])
+    })
+
+    it('keeps the schema message for a supplied value only (messageWhenPresent)', () => {
+      const schema = z.object({ version: z.number(messageWhenPresent('version must be an integer')) })
+      expect(messagesFor(schema, { version: 'x' })).to.deep.equal(['version must be an integer'])
+      expect(messagesFor(schema, {})).to.deep.equal(['Version is required.'])
+    })
+
+    it('reads a single-option enum and a literal as "isn\'t valid" without a schema message', () => {
+      const schema = z.object({ kind: z.literal('a') })
+      expect(messagesFor(schema, { kind: 'b' })).to.deep.equal(["Kind isn't valid."])
+    })
+
+    it('reports an invalid Date as INVALID_DATE', () => {
+      const schema = z.object({ when: z.date() })
+      const result = schema.safeParse({ when: new Date('nope') })
+      const details = ValidationUtils.formatZodError(result.error as ZodError)
+      expect(details[0]!.code).to.equal('INVALID_DATE')
+      expect(details[0]!.message).to.equal("When isn't valid.")
+    })
+
+    it('reads a missing or wrong-typed enum as a type error, as zod 3 did', () => {
+      const schema = z.object({ role: z.enum(['admin', 'member']) })
+      const detail = (value: unknown) => {
+        const parsed = schema.safeParse(value, { reportInput: true })
+        return ValidationUtils.formatZodError(parsed.error as ZodError).map((d) => [d.code, d.message])
+      }
+      expect(detail({})).to.deep.equal([['INVALID_TYPE', 'Role is required.']])
+      expect(detail({ role: null })).to.deep.equal([['INVALID_TYPE', 'Role is required.']])
+      expect(detail({ role: 5 })).to.deep.equal([['INVALID_TYPE', "Role must be a 'admin' | 'member'."]])
+      expect(detail({ role: 'boss' })).to.deep.equal([['INVALID_ENUM', 'Role must be one of: admin, member.']])
+    })
+
+    it('keeps a schema message on a missing enum but reports the type code', () => {
+      const schema = z.object({ mode: z.enum(['a', 'b'], { error: 'Invalid mode' }) })
+      const parsed = schema.safeParse({}, { reportInput: true })
+      const [d] = ValidationUtils.formatZodError(parsed.error as ZodError)
+      expect([d!.code, d!.message]).to.deep.equal(['INVALID_TYPE', 'Invalid mode'])
+    })
+
+    it('lets a missing or wrong-type value win over a format message', () => {
+      const schema = z.object({
+        email: z.string().check(emailCheck('Invalid email format')),
+        url: z.string().check(urlCheck('Bad url')),
+        id: z.string().check(guidCheck('Bad id')),
+      })
+      expect(messagesFor(schema, {})).to.have.members(['Email is required.', 'Url is required.', 'Id is required.'])
+      expect(messagesFor(schema, { email: 5, url: null, id: [] })).to.have.members(['Email must be text.', 'Url is required.', 'Id must be text.'])
+      expect(messagesFor(schema, { email: 'x', url: 'y', id: 'z' })).to.have.members(['Invalid email format', 'Bad url', 'Bad id'])
+    })
+
+    it('treats the old zod wording used as a schema message as stock', () => {
+      const schema = z.object({ email: z.string().check(emailCheck('Invalid email')) })
+      expect(messagesFor(schema, { email: 'x' })).to.deep.equal(['Email must be a valid email address.'])
+    })
+
+    it('does not add check lines after a type error and does not repeat a line', () => {
+      const schema = z.object({ title: z.string().min(1), tags: z.array(z.string()).max(2) })
+      expect(messagesFor(schema, { title: [], tags: 'abc' })).to.deep.equal(['Title must be text.', 'Tags must be a list.'])
+    })
+
+    it('keeps the minimum line next to a fraction on a whole-number field', () => {
+      const schema = z.object({ n: z.number().check(integerCheck()).min(1) })
+      expect(messagesFor(schema, { n: 0.5 })).to.have.members(['N must be a whole number.', 'N must be at least 1.'])
+      expect(schema.safeParse({ n: 1e21 }).success).to.equal(true)
+    })
+
+    it('names records and whole numbers in plain words', () => {
+      const schema = z.object({ tools: z.record(z.string(), z.string()), count: z.number().int() })
+      expect(messagesFor(schema, { tools: 'x', count: 'y' })).to.have.members(['Tools must be a group of fields.', 'Count must be a number.'])
+    })
+
+    it('falls back to "The request" when the whole body is wrong', () => {
+      const schema = z.object({ body: z.object({ name: z.string() }) })
+      expect(messagesFor(schema, { body: 'nope' })).to.deep.equal(['The request must be a group of fields.'])
     })
   })
 })

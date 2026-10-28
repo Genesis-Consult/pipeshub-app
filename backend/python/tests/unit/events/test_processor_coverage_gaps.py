@@ -30,6 +30,7 @@ from app.models.blocks import (
     TableRowMetadata,
 )
 from app.services.messaging.config import IndexingEvent
+from app.utils.llm import LLM_MISSING_FOR_FILE
 
 log = logging.getLogger("test_processor_coverage_gaps")
 log.setLevel(logging.CRITICAL)
@@ -153,6 +154,7 @@ class TestIndexingErrorReraise:
 
         proc = _make_processor()
         parser = MagicMock()
+        parser.new_document_parser.return_value = parser
         parser.load_workbook_from_binary = MagicMock()
         parser.create_blocks = AsyncMock(
             side_effect=IndexingError("xlsx fail", record_id="r1")
@@ -1240,3 +1242,22 @@ class TestProcessStructuredDocument:
             await _collect(
                 proc.process_structured_document("a.json", "r1", b"{}", "vr1", "json")
             )
+
+
+class TestNoLanguageModelConfigured:
+    @pytest.mark.asyncio
+    async def test_failure_reason_tells_the_admin_to_add_a_model(self) -> None:
+        # The org's AI models config has no LLM bucket at all; this used to
+        # surface as "Failed to process document: 'llm'".
+        config_service = AsyncMock()
+        config_service.get_config = AsyncMock(return_value={})
+        proc = _make_processor(config_service=config_service)
+
+        with pytest.raises(DocumentProcessingError) as exc:
+            await _collect(
+                proc.process_excel_document("a.xlsx", "r1", 1, "UPLOAD", "o1", b"PK", "vr1")
+            )
+
+        # Stored as the record's failure reason as-is, with no "Failed to process document" prefix.
+        assert str(exc.value) == LLM_MISSING_FOR_FILE
+        assert "'llm'" not in str(exc.value)
