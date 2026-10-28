@@ -2,6 +2,7 @@ import asyncio
 import base64
 import binascii
 import json
+import mimetypes
 import uuid
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
@@ -9,7 +10,6 @@ from datetime import datetime, timezone
 from enum import Enum
 from logging import Logger
 from typing import (
-    Set,
     Any,
     Awaitable,
     Callable,
@@ -20,6 +20,7 @@ from typing import (
     Tuple,
 )
 
+from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
 
 from app.config.configuration_service import ConfigurationService
@@ -463,16 +464,14 @@ class BookStackConnector(BaseConnector):
 
         if record_type == "page":
             markdown_response = await self.data_source.export_page_markdown(record_id)
-            if not markdown_response.success:
-                raise HTTPException(
-                    status_code=HttpStatusCode.NOT_FOUND.value,
-                    detail="Record not found or access denied"
-                )
-            raw_markdown = markdown_response.data.get("markdown")
-            if not isinstance(raw_markdown, str):
-                raise HTTPException(
-                    status_code=HttpStatusCode.NOT_FOUND.value,
-                    detail="Record content is unavailable"
+            raw_markdown = (markdown_response.data or {}).get("markdown")
+            if not markdown_response.success or not isinstance(raw_markdown, str):
+                raise_for_stream_fetch(
+                    success=markdown_response.success,
+                    has_payload=isinstance(raw_markdown, str),
+                    connector=self.display_name,
+                    status=markdown_response.status_code,
+                    message=markdown_response.message or markdown_response.error,
                 )
 
             async def page_stream() -> AsyncGenerator[bytes, None]:
@@ -496,9 +495,12 @@ class BookStackConnector(BaseConnector):
 
             attachment_response = await self.data_source.get_attachment(attachment_id)
             if not attachment_response.success or not attachment_response.data:
-                raise HTTPException(
-                    status_code=HttpStatusCode.NOT_FOUND.value,
-                    detail="Attachment not found or access denied"
+                raise_for_stream_fetch(
+                    success=attachment_response.success,
+                    has_payload=bool(attachment_response.data),
+                    connector=self.display_name,
+                    status=attachment_response.status_code,
+                    message=attachment_response.message or attachment_response.error,
                 )
 
             attachment = attachment_response.data

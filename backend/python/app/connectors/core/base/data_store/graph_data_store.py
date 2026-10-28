@@ -1254,6 +1254,36 @@ class GraphTransactionStore(TransactionStore):
         )
 
 
+
+    async def reconcile_app_access_from_role(
+        self,
+        connector_id: str,
+        role_connector_id: str,
+        external_role_id: str,
+    ) -> None:
+        return await self.graph_provider.reconcile_app_access_from_role(
+            connector_id,
+            role_connector_id,
+            external_role_id,
+            transaction=self.txn,
+        )
+
+
+    async def reconcile_app_access_from_group(
+        self,
+        connector_id: str,
+        group_connector_id: str,
+        external_group_id: str,
+    ) -> None:
+        return await self.graph_provider.reconcile_app_access_from_group(
+            connector_id,
+            group_connector_id,
+            external_group_id,
+            transaction=self.txn,
+        )
+
+
+
 class GraphDataStore(DataStoreProvider):
     """
     Graph database data store using IGraphDBProvider.
@@ -1409,31 +1439,3 @@ class GraphDataStore(DataStoreProvider):
                     attempts, _RETRY_ATTEMPTS, delay, str(e)[:200],
                 )
                 await asyncio.sleep(delay)
-
-    async def reconcile_app_access_from_role(
-        self,
-        connector_id: str,
-        role_connector_id: str,
-        external_role_id: str,
-    ) -> None:
-        return await self.graph_provider.reconcile_app_access_from_role(
-            connector_id,
-            role_connector_id,
-            external_role_id,
-            transaction=self.txn,
-        )
-
-
-    async def reconcile_app_access_from_group(
-        self,
-        connector_id: str,
-        group_connector_id: str,
-        external_group_id: str,
-    ) -> None:
-        return await self.graph_provider.reconcile_app_access_from_group(
-            connector_id,
-            group_connector_id,
-            external_group_id,
-            transaction=self.txn,
-        )
-

@@ -777,7 +777,7 @@ class TestBuildCompleteOauthConfig:
         svc._enrich_from_toolset_registry = MagicMock()
 
         with patch(
-            "app.api.routes.toolsets.get_oauth_credentials_for_toolset",
+            "app.edition_config.get_oauth_credentials_for_toolset",
             new_callable=AsyncMock,
             side_effect=Exception("lookup failed"),
         ):
@@ -795,7 +795,7 @@ class TestBuildCompleteOauthConfig:
         svc = _make_service(cs)
 
         with patch(
-            "app.api.routes.toolsets.get_oauth_credentials_for_toolset",
+            "app.edition_config.get_oauth_credentials_for_toolset",
             new_callable=AsyncMock,
             side_effect=Exception("lookup failed"),
         ):
@@ -1043,7 +1043,7 @@ class TestBuildCompleteOauthConfig:
 
         central = {"clientId": "cid", "clientSecret": "csecret", "tokenUrl": "https://provider.example/token"}
         with patch(
-            "app.api.routes.toolsets.get_oauth_credentials_for_toolset",
+            "app.edition_config.get_oauth_credentials_for_toolset",
             new_callable=AsyncMock,
             return_value=central,
         ) as fetch:
@@ -1066,7 +1066,7 @@ class TestBuildCompleteOauthConfig:
 
         central = {"client_id": "cid", "client_secret": "csecret", "tokenUrl": "https://provider.example/token"}
         with patch(
-            "app.api.routes.toolsets.get_oauth_credentials_for_toolset",
+            "app.edition_config.get_oauth_credentials_for_toolset",
             new_callable=AsyncMock,
             return_value=central,
         ):
@@ -1106,7 +1106,7 @@ class TestBuildCompleteOauthConfig:
         svc._get_toolset_oauth_config_from_registry = MagicMock(return_value=None)
 
         with patch(
-            "app.api.routes.toolsets.get_oauth_credentials_for_toolset",
+            "app.edition_config.get_oauth_credentials_for_toolset",
             new_callable=AsyncMock,
             side_effect=RuntimeError("app deleted"),
         ):
@@ -1125,7 +1125,7 @@ class TestBuildCompleteOauthConfig:
         svc._enrich_from_toolset_registry = MagicMock()
 
         with patch(
-            "app.api.routes.toolsets.get_oauth_credentials_for_toolset",
+            "app.edition_config.get_oauth_credentials_for_toolset",
             new_callable=AsyncMock,
             return_value=dict(stored_auth),
         ) as fetch:
@@ -2446,7 +2446,7 @@ class TestOrgLinkedConfigUnchanged:
         cs = AsyncMock()
         cs.get_config = AsyncMock(return_value={"toolsetType": "jira", "oauthConfigId": "cfg1", "orgId": "org1"})
         svc = _make_service(cs)
-        with patch("app.api.routes.toolsets.get_oauth_credentials_for_toolset", new_callable=AsyncMock, return_value=stored):
+        with patch("app.edition_config.get_oauth_credentials_for_toolset", new_callable=AsyncMock, return_value=stored):
             flow = await svc._build_complete_oauth_config("/services/toolsets/inst/user", "jira", {})
         for key, value in stored.items():
             assert flow[key] == value, key
@@ -2466,7 +2466,7 @@ class TestOrgLinkedConfigUnchanged:
         cs.get_config = AsyncMock(return_value={"toolsetType": "gmail", "oauthConfigId": "cfg1", "orgId": "org1"})
         svc = _make_service(cs)
         _real_registry()
-        with patch("app.api.routes.toolsets.get_oauth_credentials_for_toolset", new_callable=AsyncMock, return_value=stored):
+        with patch("app.edition_config.get_oauth_credentials_for_toolset", new_callable=AsyncMock, return_value=stored):
             flow = await svc._build_complete_oauth_config("/services/toolsets/inst/user", "gmail", {})
         assert flow == stored
 
@@ -2497,7 +2497,7 @@ class TestMicrosoftTenantOnRefresh:
         cs = AsyncMock()
         cs.get_config = AsyncMock(return_value={"toolsetType": "outlook", "oauthConfigId": "cfg1", "orgId": "org1"})
         svc = _make_service(cs)
-        with patch("app.api.routes.toolsets.get_oauth_credentials_for_toolset", new_callable=AsyncMock, return_value=stored):
+        with patch("app.edition_config.get_oauth_credentials_for_toolset", new_callable=AsyncMock, return_value=stored):
             flow = await svc._build_complete_oauth_config("/services/toolsets/inst/user", "outlook", {})
         assert flow["tokenUrl"] == stored["tokenUrl"]
         assert flow["authorizeUrl"] == stored["authorizeUrl"]
@@ -2525,7 +2525,7 @@ class TestMicrosoftTenantOnRefresh:
         cs = AsyncMock()
         cs.get_config = AsyncMock(return_value={"toolsetType": "outlook", "oauthConfigId": "cfg1", "orgId": "org1"})
         svc = _make_service(cs)
-        with patch("app.api.routes.toolsets.get_oauth_credentials_for_toolset", new_callable=AsyncMock, return_value=stored):
+        with patch("app.edition_config.get_oauth_credentials_for_toolset", new_callable=AsyncMock, return_value=stored):
             flow = await svc._build_complete_oauth_config("/services/toolsets/inst/user", "outlook", {})
         assert flow["tokenUrl"] == sign_in["tokenUrl"]
         assert flow["tokenUrl"] == "https://login.microsoftonline.com/contoso-tenant/oauth2/v2.0/token"

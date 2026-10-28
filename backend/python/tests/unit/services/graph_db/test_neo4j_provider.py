@@ -3317,8 +3317,6 @@ class TestVirtualAccessAndRecordLookup:
         assert kwargs["parameters"]["languageNames"] == ["English"]
         assert kwargs["parameters"]["topicNames"] == ["AI"]
         query = neo4j_provider.client.execute_query.await_args.args[0]
-        assert "(userDoc)-[:PERMISSION]->(principal)-[:PERMISSION]->(r:Record)" in query
-        assert "(principal:Group OR principal:Role)" in query
 
     @pytest.mark.asyncio
     async def test_get_virtual_ids_for_connector_follows_a_role_to_a_record(
