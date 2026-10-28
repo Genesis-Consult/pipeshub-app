@@ -198,12 +198,12 @@ dependencies = [
     "celery==5.6.3",
     "chardet==7.7.0",
     "confluent-kafka==2.16.0",
-    "cachetools==7.2.4",
+    "cachetools==7.2.5",
     "cloudscraper==1.2.71",
     "cryptography==50.0.2",
     "dateparser>=1.2.0",
     # Free web search when no provider key is set: one query spread over several engines.
-    "ddgs==9.16.0",
+    "ddgs==9.16.1",
     "crawl4ai==0.9.5",
     "curl-cffi==0.16.3",
     # "databricks-sdk>=0.85.0",
@@ -222,7 +222,7 @@ dependencies = [
     "evernote3>=1.25.14",
     "fastapi==0.136.3",
     # Starlette comes in through FastAPI, whose range admits releases with known advisories.
-    "starlette==1.9.0",
+    "starlette==1.10.0",
     "mcp==2.3.0",
     "fastembed==0.9.1",
     "faster-whisper>=1.0.0",
@@ -400,7 +400,7 @@ parsing-service = "app.parsing_main:app"
 extraction-service = "app.extraction_main:app"
 
 [project.optional-dependencies]
-dev = ["ruff==0.17.2", "pyright", "sqlglot>=27,<28", "pytest", "pytest-xdist", "pytest-timeout", "pytest-cov", "pytest-asyncio", "fakeredis[lua]>=2.37", "hypothesis", "graphql-core==3.3.0"]
+dev = ["ruff==0.17.2", "pyright", "sqlglot>=27,<28", "pytest", "pytest-xdist", "pytest-timeout", "pytest-cov", "pytest-asyncio", "fakeredis[lua]>=2.37", "hypothesis", "graphql-core==3.3.1"]
 
 [tool.pyright]
 pythonVersion = "3.12"
