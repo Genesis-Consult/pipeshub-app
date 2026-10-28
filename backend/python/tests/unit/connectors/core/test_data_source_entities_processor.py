@@ -6853,7 +6853,9 @@ class TestKbUploadProcessRecord:
         assert args[0] == "record-1"
         assert args[1] == CollectionNames.RECORDS.value
         assert len(args[2]) == 1
-        assert args[2][0]["_from"] == f"{CollectionNames.ROLES.value}/role-1"
+        assert args[2][0]["from_id"] == "role-1"
+        assert args[2][0]["from_collection"] == CollectionNames.ROLES.value
+        assert args[2][0]["to_id"] == "record-1"
 
 
 class TestOnRecordsDeletedCascade:
