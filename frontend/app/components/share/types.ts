@@ -1,19 +1,25 @@
+'use client';
+
+import type { TFunction } from 'i18next';
+
 // ============================================================================
 // SHARE COMPONENT TYPES (entity-agnostic)
 // ============================================================================
 
 /** Supported entity types for sharing */
-export type ShareEntityType = 'collection' | 'conversation' | 'search' | 'connector' | 'agent';
+export type ShareEntityType = 'collection' | 'conversation' | 'search' | 'connector' | 'agent' | 'project' | 'artifact';
 
 /** Permission roles */
 export type ShareRole = 'OWNER' | 'WRITER' | 'READER';
 
-/** Display labels for roles */
-export const SHARE_ROLE_LABELS: Record<ShareRole, { label: string; description: string }> = {
-  OWNER: { label: 'Full Access', description: 'Shared ownership of the collection' },
-  WRITER: { label: 'Can edit', description: 'Only edit & organise files & folders' },
-  READER: { label: 'Can view', description: 'Only viewing access' },
-};
+/** Localized display labels for roles. */
+export function getShareRoleLabels(t: TFunction): Record<ShareRole, { label: string; description: string }> {
+  return {
+    OWNER: { label: t('shareSidebar.roles.owner.label'), description: t('shareSidebar.roles.owner.description') },
+    WRITER: { label: t('shareSidebar.roles.writer.label'), description: t('shareSidebar.roles.writer.description') },
+    READER: { label: t('shareSidebar.roles.reader.label'), description: t('shareSidebar.roles.reader.description') },
+  };
+}
 
 /** A member with whom the entity is already shared */
 export interface SharedMember {
@@ -80,11 +86,21 @@ export interface ShareAdapter {
 
   supportsRoles: boolean;
   supportsTeams: boolean;
+  /** Teams carry a role like users do (default: teams have no role). */
+  teamsHaveRoles?: boolean;
+  /** Ask before removing someone's access (default: remove straight away). */
+  confirmBeforeRemove?: boolean;
+  /** Narrow the role picker to some roles and/or reword them (default: all three, house labels). */
+  roleOptions?: {
+    roles: ShareRole[];
+    labels?: Record<ShareRole, { label: string; description: string }>;
+  };
 
   getSharedMembers: () => Promise<SharedMember[]>;
   share: (submission: ShareSubmission) => Promise<void>;
   updateRole?: (memberId: string, memberType: 'user' | 'team', newRole: ShareRole) => Promise<void>;
-  removeMember: (memberId: string, memberType: 'user' | 'team') => Promise<void>;
+  /** Resolve `{ removed: false }` when the member had already lost access, so the sidebar doesn't claim it removed them. */
+  removeMember: (memberId: string, memberType: 'user' | 'team') => Promise<void | { removed: boolean }>;
 
   /**
    * Override the user list shown in the share sidebar search/suggestions.

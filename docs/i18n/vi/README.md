@@ -1,6 +1,6 @@
 <div align="center">
 
-**Translations:** [English](../../../README.md) · [Français](../fr/README.md) · [Deutsch](../de/README.md) · [简体中文](../zh-CN/README.md) · [日本語](../ja/README.md) · [Русский](../ru/README.md) · [עברית](../he/README.md) · [한국어](../ko/README.md) · [Español](../es/README.md) · [Português](../pt/README.md) · [Türkçe](../tr/README.md) · **Tiếng Việt** · [Italiano](../it/README.md)
+**Translations:** [English](../../../README.md) · [Français](../fr/README.md) · [Deutsch](../de/README.md) · [简体中文](../zh-CN/README.md) · [日本語](../ja/README.md) · [Русский](../ru/README.md) · [עברית](../he/README.md) · [한국어](../ko/README.md) · [Español](../es/README.md) · [Português](../pt/README.md) · [Türkçe](../tr/README.md) · **Tiếng Việt** · [Italiano](../it/README.md) · [Čeština](../cs/README.md)
 
 </div>
 
@@ -210,16 +210,12 @@ PDF (kể cả bản quét), Microsoft Office (Word, Excel, PowerPoint), Google 
 ### Tôi triển khai PipesHub như thế nào?
 
 ```bash
-# Clone the repository
-git clone https://github.com/pipeshub-ai/pipeshub-ai.git
-cd pipeshub-ai/deployment/docker-compose
-
-# Set Environment Variables (refer to env.template)
-# Start production deployment
-docker compose -f docker-compose.prod.yml -p pipeshub-ai up -d
+curl -fsSL https://get.pipeshub.com/install | bash
 ```
 
-Lưu ý: Hãy dùng HTTPS cho việc triển khai trên đám mây. HTTP có thể gây ra việc chặn bảo mật ở frontend.
+Lệnh này ghi các tệp Compose vào `./pipeshub` và khởi chạy trình cài đặt tương tác. Mở **http://localhost:3000** khi hoàn tất. Hãy dùng HTTPS cho việc triển khai trên đám mây — HTTP có thể gây ra việc chặn bảo mật ở frontend.
+
+Nhà phát triển build từ nguồn nên clone kho lưu trữ và chạy `./install.sh` (hoặc `./install.sh --build`) từ thư mục gốc của kho. Xem [Hướng dẫn triển khai](#-hướng-dẫn-triển-khai).
 
 ### PipesHub hỗ trợ những nhà cung cấp LLM nào?
 

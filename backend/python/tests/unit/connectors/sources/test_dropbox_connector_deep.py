@@ -492,7 +492,7 @@ class TestSyncRecordGroups:
     @pytest.mark.asyncio
     async def test_with_active_folders(self):
         c, dep, *_ = _make_connector()
-        admin = MagicMock(title="team_admin", email="admin@test.com", source_user_id="adm1")
+        admin = MagicMock(source_role="team_admin", email="admin@test.com", source_user_id="adm1")
         users = [admin]
 
         folder = MagicMock()
@@ -514,7 +514,7 @@ class TestSyncRecordGroups:
     @pytest.mark.asyncio
     async def test_skips_inactive_folders(self):
         c, dep, *_ = _make_connector()
-        admin = MagicMock(title="team_admin", email="admin@test.com", source_user_id="adm1")
+        admin = MagicMock(source_role="team_admin", email="admin@test.com", source_user_id="adm1")
 
         folder = MagicMock()
         folder.team_folder_id = "tf1"
@@ -630,8 +630,11 @@ class TestGetSignedUrl:
         c, *_ = _make_connector()
         c.data_source = None
         record = MagicMock()
-        result = await c.get_signed_url(record)
-        assert result is None
+
+        from fastapi import HTTPException
+        with pytest.raises(HTTPException) as exc_info:
+            await c.get_signed_url(record)
+        assert exc_info.value.status_code == 409
 
 
 # ===========================================================================

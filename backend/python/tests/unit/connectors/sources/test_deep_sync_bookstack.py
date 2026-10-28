@@ -8,6 +8,7 @@ import pytest
 
 from app.config.constants.arangodb import Connectors, MimeTypes, OriginTypes
 from app.connectors.core.registry.filters import FilterCollection
+from app.connectors.sources.bookstack.access import BookStackGrants, RoleAccess
 from app.models.entities import AppUser, FileRecord, RecordType
 from app.models.permission import PermissionType
 
@@ -225,10 +226,23 @@ class TestProcessBookstackPage:
             })
         )
         fake_perms = [MagicMock()]
-        with patch.object(connector, "_parse_bookstack_permissions", new_callable=AsyncMock, return_value=fake_perms):
+        # Whether the page inherits is the parser's decision, not the raw "inheriting" flag.
+        grants = BookStackGrants(fake_perms, inherit=False, effective=RoleAccess({}, frozenset()))
+        with patch.object(connector, "_parse_bookstack_permissions", new_callable=AsyncMock, return_value=grants):
             result = await connector._process_bookstack_page(page, {}, [])
         assert result.record.inherit_permissions is False
-        assert len(result.new_permissions) == 1
+        assert list(result.new_permissions) == fake_perms
+
+    async def test_page_inherits_when_the_parser_says_so(self, connector) -> None:
+        page = _make_page()
+        connector.data_source.get_content_permissions = AsyncMock(
+            return_value=_make_response(data={"fallback_permissions": {"inheriting": False}})
+        )
+        grants = BookStackGrants([], inherit=True, effective=RoleAccess({}, frozenset()))
+        with patch.object(connector, "_parse_bookstack_permissions", new_callable=AsyncMock, return_value=grants):
+            result = await connector._process_bookstack_page(page, {}, [])
+        assert result.record.inherit_permissions is True
+        assert result.new_permissions == []
 
     async def test_page_permissions_failure(self, connector):
         page = _make_page()
@@ -259,8 +273,10 @@ class TestBookstackHandleRecordUpdates:
             metadata_changed=False, content_changed=False, permissions_changed=False,
             external_record_id="page/1",
         )
+        connector.data_entities_processor.get_record_by_external_id = AsyncMock(return_value=MagicMock(id="rec-key"))
         await connector._handle_record_updates(update)
-        connector.data_entities_processor.on_record_deleted.assert_called_once()
+        connector.data_entities_processor.get_record_by_external_id.assert_awaited_once_with(connector.connector_id, "page/1")
+        connector.data_entities_processor.on_record_deleted.assert_awaited_once_with(record_id="rec-key")
 
     async def test_new_record_logs_only(self, connector):
         from app.connectors.sources.microsoft.common.msgraph_client import RecordUpdate
@@ -312,6 +328,7 @@ class TestBookstackHandleRecordUpdates:
 
     async def test_exception_handled(self, connector):
         from app.connectors.sources.microsoft.common.msgraph_client import RecordUpdate
+        connector.data_entities_processor.get_record_by_external_id = AsyncMock(return_value=MagicMock(id="rec-key"))
         connector.data_entities_processor.on_record_deleted = AsyncMock(
             side_effect=RuntimeError("err")
         )
@@ -321,6 +338,7 @@ class TestBookstackHandleRecordUpdates:
             external_record_id="page/1",
         )
         await connector._handle_record_updates(update)  # Should not raise
+        connector.data_entities_processor.on_record_deleted.assert_awaited_once_with(record_id="rec-key")
 
 
 # ---------------------------------------------------------------------------

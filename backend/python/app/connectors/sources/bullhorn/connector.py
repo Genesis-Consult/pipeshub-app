@@ -403,7 +403,9 @@ class BullhornConnector(BaseConnector):
         if records:
             for start in range(0, len(records), 100):
                 record_batch = records[start : start + 100]
-                await self.data_entities_processor.on_new_records(record_batch)
+                await self.data_entities_processor.on_new_records(
+                    record_batch, replace_permissions=True,
+                )
             counters["upserted"] += len(records)
         counters["deleted"] += sum(result[1] for result in results)
         counters["without_cv"] += sum(result[2] for result in results)

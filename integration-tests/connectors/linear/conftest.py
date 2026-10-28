@@ -15,10 +15,11 @@ workspace. See ``README.md`` for the shared-workspace contract.
 import logging
 import os
 import uuid
-from typing import Any, AsyncGenerator, Dict, List, Optional
+from typing import Any, AsyncGenerator, Dict
 
-import pytest
 import pytest_asyncio
+
+from helper.source_credentials import source_unavailable
 
 from app.sources.client.linear.linear import (  # type: ignore[import-not-found]
     LinearClient,
@@ -46,8 +47,10 @@ from connectors.linear.linear_test_utils import (  # type: ignore[import-not-fou
     fetch_first_document_in_teams,
     fetch_first_file_in_teams,
     fetch_first_project_in_team,
+    count_shared_team_memberships,
     fetch_teams_by_ids,
     pick_mutation_team,
+    project_home_team,
     reap_own_artifacts,
     sweep_stale_linear_artifacts,
 )
@@ -61,9 +64,10 @@ async def linear_datasource() -> LinearDataSource:
     api_token = os.getenv("LINEAR_TEST_API_TOKEN")
 
     if not api_token:
-        pytest.skip(
-            "Linear credentials not set (LINEAR_TEST_API_TOKEN). "
-            "The API token must have read access to the target workspace."
+        source_unavailable(
+            "The Linear workspace this suite syncs from is not configured. The API "
+            "token must have read access to it.",
+            secrets=["LINEAR_TEST_API_TOKEN"],
         )
 
     config = LinearTokenConfig(token=api_token)
@@ -98,9 +102,10 @@ async def linear_connector(
 
     team_ids = [t.strip() for t in raw_team_ids.split(",") if t.strip()]
     if not team_ids:
-        pytest.skip(
-            "LINEAR_TEST_TEAM_IDS not set. Provide comma-separated team UUIDs "
-            "whose issues should be synced."
+        source_unavailable(
+            "No Linear teams are named for this suite to sync, so it would test "
+            "nothing. Provide comma-separated team ids.",
+            secrets=["LINEAR_TEST_TEAM_IDS"],
         )
 
     connector_name = f"linear-test-{uuid.uuid4().hex[:8]}"
@@ -119,6 +124,8 @@ async def linear_connector(
         "reference_issue_id": None,
         "reference_issue_identifier": None,
         "reference_project_id": None,
+        "reference_project_team_id": None,
+        "expected_shared_memberships": 0,
         "reference_attachment_id": None,
         "reference_attachment_team_id": None,
         "reference_document_id": None,
@@ -175,6 +182,8 @@ async def linear_connector(
             "key": t.get("key"),
             "name": t.get("name"),
             "private": t.get("private", False),
+            "visibility": t.get("visibility") or ("private" if t.get("private") else "public"),
+            "parent_id": (t.get("parent") or {}).get("id"),
         }
         for t in teams
     ]
@@ -242,6 +251,7 @@ async def linear_connector(
     ref_project = await fetch_first_project_in_team(linear_datasource, state["primary_team_id"])
     if ref_project:
         state["reference_project_id"] = ref_project.get("id")
+        state["reference_project_team_id"] = project_home_team(ref_project, team_ids)
         logger.info("SETUP: Reference project found")
     else:
         logger.info("SETUP: No projects in primary team — TC-LINEAR-005 will skip")
@@ -368,7 +378,8 @@ async def linear_connector(
 
     if state.get("reference_file_url"):
         rec = await graph_provider.get_record_by_external_id(
-            connector_id, state["reference_file_url"])
+            connector_id,
+            f"{state['reference_file_url']}#parent={state['reference_file_parent_id']}")
         assert rec is not None, (
             f"SETUP: reference FILE {state['reference_file_url']} missing after sync")
 
@@ -397,6 +408,7 @@ async def linear_connector(
     state["expected_record_groups"] = record_groups
     state["expected_parent_child_edges"] = parent_child_edges
     state["expected_record_group_edges"] = record_group_edges
+    state["expected_shared_memberships"] = await count_shared_team_memberships(linear_datasource, team_ids)
     state["expected_inherit_edges"] = inherit_edges
 
     logger.info(

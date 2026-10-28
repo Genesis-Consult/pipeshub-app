@@ -19,19 +19,51 @@ from collections.abc import AsyncGenerator
 from typing import TYPE_CHECKING, Any
 from urllib.parse import unquote
 
+import httpx
+
+from fastapi import HTTPException
+
 from app.config.constants.arangodb import (
     MimeTypes,
     OriginTypes,
 )
+from app.config.constants.http_status_code import HttpStatusCode
 from app.models.entities import FileRecord, Record, RecordGroupType, RecordType
 from app.models.blocks import ChildRecord, ChildType, CommentAttachment
+from app.modules.parsers.code_parser.secret_scan import redact_secrets
 from app.utils.time_conversion import get_epoch_timestamp_in_ms
 
+from .comments import is_internal_note
 from .constants import IMAGE_EXTENSIONS, UPLOAD_PATTERN
 from .models import FileAttachment, GitlabLiterals, RecordUpdate
 
 if TYPE_CHECKING:
     from app.connectors.sources.gitlab.connector import GitLabConnector
+
+
+_UPLOAD_PATH = re.compile(r"^/api/v4/projects/\d+/uploads/[a-f0-9]{32}/[^/]+$", re.IGNORECASE)
+
+
+def is_upload_url(url: str, base_url: str) -> bool:
+    """Whether ``url`` is a project upload on the configured GitLab instance.
+
+    The connector sends its own token with this request. A "filename" holding
+    ``..`` segments would resolve (httpx removes dot segments) to any other API
+    path on the instance, so the path must still be an upload once resolved.
+    """
+    base = base_url.rstrip("/")
+    if not url or not url.startswith(f"{base}/"):
+        return False
+    try:
+        resolved = httpx.URL(url)
+        # GitLab can run under a relative URL (https://host/gitlab); its API sits below that.
+        prefix = httpx.URL(base).raw_path.decode("ascii", errors="replace").rstrip("/")
+    except (ValueError, httpx.InvalidURL):
+        return False
+    path = resolved.raw_path.decode("ascii", errors="replace")
+    if not path.startswith(f"{prefix}/"):
+        return False
+    return not resolved.query and bool(_UPLOAD_PATH.match(path[len(prefix):]))
 
 
 class AttachmentsHelper:
@@ -60,6 +92,8 @@ class AttachmentsHelper:
             full_match = match.group("full")
             href = match.group("href")
             filename = unquote(match.group("filename"))
+            if match.group("filename") in (".", ".."):
+                continue
             if "." not in filename or filename.endswith("."):
                 extension = "txt"
             else:
@@ -85,6 +119,8 @@ class AttachmentsHelper:
     async def embed_images_as_base64(self, body_content: str, base_project_url: str) -> str:
         """Replace GitLab image attachments with inline base64 data URIs."""
         attachments, markdown_content_clean = await self.parse_gitlab_uploads(body_content)
+        # Every issue/MR body and note passes here; images are appended after the scan.
+        markdown_content_clean = redact_secrets(markdown_content_clean).text
         if not attachments:
             return markdown_content_clean
         _MAX_IMAGE_BYTES = 4 * 1024 * 1024
@@ -92,9 +128,12 @@ class AttachmentsHelper:
             if attach.category != GitlabLiterals.IMAGE.value:
                 continue
             full_attachment_url = f"{base_project_url}{attach.href}"
+            if not is_upload_url(full_attachment_url, self.c._gitlab_base_url):
+                self.logger.warning("Not fetching image %r: not an upload of this project", attach.href)
+                continue
             try:
                 response = await self.c.runtime.ds_call_async(
-                    self.c.data_source.get_img_bytes, full_attachment_url
+                    self.c.data_source.get_img_bytes, full_attachment_url, max_bytes=_MAX_IMAGE_BYTES
                 )
                 if response.success and response.data:
                     if len(response.data) > _MAX_IMAGE_BYTES:
@@ -240,6 +279,8 @@ class AttachmentsHelper:
             return []
         record_updates_batch: list[RecordUpdate] = []
         for note in notes_res.data:
+            if is_internal_note(note):
+                continue
             note_content = getattr(note, "body", "") or ""
             attachments, _ = await self.parse_gitlab_uploads(note_content)
             if attachments:
@@ -276,14 +317,24 @@ class AttachmentsHelper:
     async def fetch_attachment_content(self, record: Record) -> AsyncGenerator[bytes, None]:
         """Stream raw attachment bytes from GitLab."""
         c = self.c
-        try:
-            attachment_id = record.external_record_id
-            if not attachment_id:
-                raise Exception(f"No attachment ID available for record {record.id}")
-            record_url = record.weburl
-            if not record_url:
-                raise ValueError(f"No record URL available for record {record.id}")
-            async for chunk in c.data_source.get_attachment_files_content(record_url):
-                yield chunk
-        except Exception as e:
-            raise Exception(f"Error fetching attachment content for record {record.id}: {e}") from e
+        if not record.external_record_id:
+            raise HTTPException(
+                HttpStatusCode.BAD_REQUEST.value,
+                f"No attachment ID available for record {record.id}",
+            )
+        record_url = record.weburl
+        if not record_url:
+            raise HTTPException(
+                HttpStatusCode.BAD_REQUEST.value,
+                f"No record URL available for record {record.id}",
+            )
+        if not is_upload_url(record_url, c._gitlab_base_url):
+            # A record an older version wrote from a link that leaves /uploads/.
+            raise HTTPException(
+                HttpStatusCode.BAD_REQUEST.value,
+                f"Record {record.id} does not point at a GitLab upload of this instance",
+            )
+        # httpx.HTTPStatusError propagates: its status is what the router maps
+        # to a real response code, and wrapping it here would erase that.
+        async for chunk in c.data_source.get_attachment_files_content(record_url):
+            yield chunk

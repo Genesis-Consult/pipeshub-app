@@ -179,8 +179,66 @@ const messageSchema = new Schema<IMessage>(
       reasoningEffort: { type: String, enum: REASONING_EFFORT_VALUES },
     },
     appliedFilters: {
-      apps: [{ id: String, name: String, nodeType: String, connector: String, _id: false }],
-      kb: [{ id: String, name: String, nodeType: String, connector: String, _id: false }],
+      apps: [
+        {
+          id: String,
+          name: String,
+          nodeType: String,
+          connector: String,
+          extension: String,
+          mimeType: String,
+          mentioned: Boolean,
+          _id: false,
+        },
+      ],
+      kb: [
+        {
+          id: String,
+          name: String,
+          nodeType: String,
+          connector: String,
+          extension: String,
+          mimeType: String,
+          mentioned: Boolean,
+          _id: false,
+        },
+      ],
+      recordGroups: [
+        {
+          id: String,
+          name: String,
+          nodeType: String,
+          connector: String,
+          extension: String,
+          mimeType: String,
+          mentioned: Boolean,
+          _id: false,
+        },
+      ],
+      records: [
+        {
+          id: String,
+          name: String,
+          nodeType: String,
+          connector: String,
+          extension: String,
+          mimeType: String,
+          mentioned: Boolean,
+          _id: false,
+        },
+      ],
+      recordsExact: [
+        {
+          id: String,
+          name: String,
+          nodeType: String,
+          connector: String,
+          extension: String,
+          mimeType: String,
+          mentioned: Boolean,
+          _id: false,
+        },
+      ],
     },
     attachments: [attachmentRefSchema],
     // Reference data for follow-up queries (stores IDs from tool responses)
@@ -223,7 +281,7 @@ const agentConversationSchema = new Schema({
   lastActivityAt: { type: Number, default: Date.now },
   status: {
     type: String,
-    enum: ['None', 'Inprogress', 'Complete', 'Failed'],
+    enum: ['None', 'Inprogress', 'Complete', 'Failed', 'Stopped'],
   },
   failReason: { type: String },
   // Model information used for this conversation

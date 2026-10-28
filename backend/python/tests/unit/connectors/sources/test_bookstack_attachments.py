@@ -301,11 +301,12 @@ async def test_unchanged_attachment_from_neo4j_is_not_a_metadata_update(connecto
 
 @pytest.mark.asyncio
 async def test_deleted_page_cascades_to_attachments_and_vectors(connector) -> None:
-    connector._test_tx.get_record_by_external_id = AsyncMock(
+    connector._fetch_page = AsyncMock(return_value=(True, None))
+    connector._test_processor.get_record_by_external_id = AsyncMock(
         return_value=MagicMock(id="page-record-7")
     )
 
-    await connector._handle_page_delete_event({"detail": "(7) Security policy"})
+    assert await connector._handle_page_delete_event(7) is True
 
     connector._test_processor.on_records_deleted_cascade.assert_awaited_once_with(
         ["page-record-7"],

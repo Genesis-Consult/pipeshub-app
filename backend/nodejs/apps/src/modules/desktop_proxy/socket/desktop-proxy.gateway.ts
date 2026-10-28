@@ -1,36 +1,54 @@
 /**
- * Socket.IO gateway for desktop clients: authenticated REST proxy over `/rest-proxy`.
+ * Socket.IO gateway for desktop clients: authenticates the handshake on
+ * `/rest-proxy`, keeps re-checking the session behind each connected socket,
+ * and routes Local FS messages to `LocalFsRelay`.
  */
 import { Server as HttpServer } from 'http';
 import { Namespace, Server, Socket } from 'socket.io';
 import { AuthTokenService } from '../../../libs/services/authtoken.service';
-import { BadRequestError } from '../../../libs/errors/http.errors';
-import { Logger } from '../../../libs/services/logger.service';
 import {
-  DEFAULT_REST_PROXY_ALLOWED_PREFIXES,
-  normalizeAndAssertRestProxyPath,
-} from './desktop-proxy-allowlist';
-
-type JsonPrimitive = string | number | boolean | null;
-type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
-
-type RestProxyQuery = Record<string, JsonPrimitive | undefined>;
+  BadRequestError,
+  UnauthorizedError,
+} from '../../../libs/errors/http.errors';
+import { Logger } from '../../../libs/services/logger.service';
+import { findSessionRefusal, findSessionRefusals } from '../../../config';
+import { LocalFsRelay } from './local-fs-relay';
+import {
+  DesktopRegisterAck,
+  DesktopRegisterPayload,
+  LocalFsContentAbortPayload,
+  LocalFsContentChunkPayload,
+  LocalFsFetchContentPayload,
+  LocalFsPullRequestPayload,
+  LocalFsPullResult,
+} from '../types/local-fs.types';
 
 type RestProxySocketData = {
   userId: string;
   orgId: string;
+  /** `iat` and `email` of the handshake token, for re-checking the session later. */
+  issuedAt?: number;
+  email?: string;
+  deviceId?: string;
+  deviceName?: string;
 };
 
 type ClientToServerEvents = {
-  'rpc:request': (
-    req: RpcRequest,
-    ack?: (res: RpcResponse) => void,
+  'desktop:register': (
+    payload: DesktopRegisterPayload,
+    ack?: (res: DesktopRegisterAck) => void,
   ) => void;
+  'localfs:content:chunk': (payload: LocalFsContentChunkPayload) => void;
+  'localfs:content:abort': (payload: LocalFsContentAbortPayload) => void;
 };
 
-type ServerToClientEvents = {
-  'rpc:response': (res: RpcResponse) => void;
-};
+/** The edition's session rules; see findSessionRefusal in config.ts. */
+export interface DesktopSessionChecker {
+  findSessionRefusal: typeof findSessionRefusal;
+  findSessionRefusals: typeof findSessionRefusals;
+}
+
+type ServerToClientEvents = Record<string, never>;
 
 type InterServerEvents = Record<string, never>;
 
@@ -41,37 +59,12 @@ type RestProxySocket = Socket<
   RestProxySocketData
 >;
 
-type RpcRequest = {
-  type: 'request';
-  id: string;
-  op: 'restProxy';
-  payload: {
-    method: string;
-    path: string;
-    query?: RestProxyQuery;
-    body?: JsonValue;
-  };
-};
-
-type RpcResponse =
-  | {
-      type: 'response';
-      id: string;
-      ok: true;
-      result: { status: number; body: JsonValue };
-    }
-  | {
-      type: 'response';
-      id: string;
-      ok: false;
-      error: { code: string; message: string; status?: number };
-    };
-
-const ALLOWED_PREFIXES = DEFAULT_REST_PROXY_ALLOWED_PREFIXES;
-const ALLOWED_METHODS = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE']);
 const NAMESPACE = '/rest-proxy';
 const SOCKET_PATH = '/socket.io-rest-proxy';
-const INTERNAL_REST_PROXY_FETCH_TIMEOUT_MS = 30_000;
+// A socket outlives the token it connected with, so removing, disabling or
+// logging out a user has to reach the sockets already open too. This bounds
+// how long one survives that on any replica.
+const SESSION_RECHECK_INTERVAL_MS = 30_000;
 
 export class DesktopProxySocketGateway {
   private readonly logger = Logger.getInstance({
@@ -79,10 +72,16 @@ export class DesktopProxySocketGateway {
   });
   private io: Server | null = null;
   private namespace: Namespace | null = null;
+  private readonly localFsRelay = new LocalFsRelay();
+  private sessionRecheckTimer: NodeJS.Timeout | null = null;
+  private sessionRecheckRunning = false;
 
   constructor(
     private readonly authTokenService: AuthTokenService,
-    private readonly getPort: () => number,
+    private readonly sessions: DesktopSessionChecker = {
+      findSessionRefusal,
+      findSessionRefusals,
+    },
   ) {}
 
   initialize(server: HttpServer): void {
@@ -107,186 +106,210 @@ export class DesktopProxySocketGateway {
     });
     this.namespace = this.io.of(NAMESPACE);
     this.namespace.use((socket: RestProxySocket, next) => {
-      const extractedToken = this.extractToken(this.getHandshakeToken(socket));
-      if (!extractedToken) {
-        next(new BadRequestError('Authentication token missing'));
-        return;
-      }
-      this.authTokenService
-        .verifyToken(extractedToken)
-        .then((decoded) => {
-          socket.data.userId = String(decoded.userId ?? '');
-          socket.data.orgId = String(decoded.orgId ?? '');
-          next();
-        })
-        .catch(() => {
-          next(new BadRequestError('Authentication token expired'));
-        });
+      void this.authenticateHandshake(socket).then(next);
     });
 
     this.namespace.on('connection', (socket: RestProxySocket) => {
+      socket.join(`${socket.data.orgId}:${socket.data.userId}`);
+
       socket.on(
-        'rpc:request',
-        async (req: RpcRequest, ack?: (res: RpcResponse) => void) => {
-          const response = await this.handleRequest(req, socket);
-          if (ack) {
-            ack(response);
-          } else {
-            socket.emit('rpc:response', response);
-          }
+        'desktop:register',
+        (
+          payload: DesktopRegisterPayload,
+          ack?: (res: DesktopRegisterAck) => void,
+        ) => {
+          const result = this.localFsRelay.register(
+            socket,
+            payload?.deviceId,
+            payload?.deviceName,
+          );
+          if (ack) ack(result);
         },
       );
+
+      socket.on('localfs:content:chunk', (payload: LocalFsContentChunkPayload) => {
+        this.localFsRelay.handleContentChunk(socket, payload);
+      });
+
+      socket.on('localfs:content:abort', (payload: LocalFsContentAbortPayload) => {
+        this.localFsRelay.handleContentAbort(socket, payload);
+      });
+
+      socket.on('disconnect', () => {
+        this.localFsRelay.handleDisconnect(socket);
+      });
     });
 
-    this.logger.info('REST proxy Socket.IO namespace initialized');
+    this.sessionRecheckTimer = setInterval(() => {
+      void this.disconnectRevokedSessions();
+    }, SESSION_RECHECK_INTERVAL_MS);
+    this.sessionRecheckTimer.unref();
+
+    this.logger.info('Desktop relay Socket.IO namespace initialized');
   }
 
   shutdown(): void {
+    if (this.sessionRecheckTimer) {
+      clearInterval(this.sessionRecheckTimer);
+      this.sessionRecheckTimer = null;
+    }
     this.namespace?.disconnectSockets(true);
     this.namespace = null;
     void this.io?.close();
     this.io = null;
   }
 
-  private async handleRequest(
-    req: RpcRequest,
-    socket: RestProxySocket,
-  ): Promise<RpcResponse> {
-    if (req.id.trim().length === 0) {
-      return {
-        type: 'response',
-        id: 'unknown',
-        ok: false,
-        error: { code: 'BAD_REQUEST', message: 'Invalid RPC envelope' },
-      };
-    }
-    const { id, payload } = req;
-    const methodRaw = payload.method.trim();
-    const rawPath = payload.path.trim();
-    const method = methodRaw.length > 0 ? methodRaw.toUpperCase() : 'GET';
-    if (!ALLOWED_METHODS.has(method)) {
-      return {
-        type: 'response',
-        id,
-        ok: false,
-        error: {
-          code: 'METHOD_NOT_ALLOWED',
-          message: `Method ${method} is not allowed`,
-        },
-      };
-    }
+  /** False until initialize() runs, which happens after routes are mounted. */
+  isReady(): boolean {
+    return this.namespace !== null;
+  }
 
-    const handshakeToken = this.getHandshakeToken(socket);
-    const extractedForVerify = this.extractToken(handshakeToken);
-    if (extractedForVerify === null) {
-      return {
-        type: 'response',
-        id,
-        ok: false,
-        error: {
-          code: 'UNAUTHORIZED',
-          message: 'Authentication token missing',
-          status: 401,
-        },
-      };
-    }
-    try {
-      await this.authTokenService.verifyToken(extractedForVerify);
-    } catch {
-      return {
-        type: 'response',
-        id,
-        ok: false,
-        error: {
-          code: 'TOKEN_EXPIRED',
-          message: 'Authentication token expired or invalid',
-          status: 401,
-        },
-      };
-    }
+  /**
+   * Any desktop socket of this user on this replica, whether or not it has
+   * registered a device. Every socket joins the org:user room on connect.
+   * `null` before the namespace is attached.
+   */
+  isDesktopConnected(orgId: string, userId: string): boolean | null {
+    if (!this.namespace) return null;
+    const room = this.namespace.adapter.rooms.get(`${orgId}:${userId}`);
+    return (room?.size ?? 0) > 0;
+  }
 
-    const pathCheck = normalizeAndAssertRestProxyPath(
-      rawPath,
-      ALLOWED_PREFIXES,
+  /**
+   * `null` before the namespace is attached: at that point no desktop could
+   * have registered yet, so "offline" would be wrong for every device.
+   */
+  isLocalFsDeviceOnline(
+    orgId: string,
+    userId: string,
+    deviceId: string,
+  ): boolean | null {
+    if (!this.isReady()) return null;
+    return this.localFsRelay.isDeviceOnline(orgId, userId, deviceId);
+  }
+
+  /** Ask the connector's owner device for one page of file events. */
+  async requestLocalFsFileEvents(
+    orgId: string,
+    userId: string,
+    connectorId: string,
+    payload: LocalFsPullRequestPayload,
+  ): Promise<LocalFsPullResult> {
+    return this.localFsRelay.requestFileEvents(
+      orgId,
+      userId,
+      connectorId,
+      payload,
     );
-    if (!pathCheck.ok) {
-      return {
-        type: 'response',
-        id,
-        ok: false,
-        error: {
-          code: 'PATH_NOT_ALLOWED',
-          message: pathCheck.reason,
-        },
-      };
-    }
-
-    const url = this.buildInternalUrl(pathCheck.normalizedPath, payload.query);
-    try {
-      const token = extractedForVerify;
-      const controller = new AbortController();
-      const timer = setTimeout(
-        () => controller.abort(),
-        INTERNAL_REST_PROXY_FETCH_TIMEOUT_MS,
-      );
-      let response: Response;
-      try {
-        response = await fetch(url, {
-          method,
-          signal: controller.signal,
-          headers: {
-            Authorization: `Bearer ${token}`,
-            Accept: 'application/json',
-            'Content-Type': 'application/json',
-          },
-          body:
-            payload.body === undefined ? undefined : JSON.stringify(payload.body),
-        });
-      } finally {
-        clearTimeout(timer);
-      }
-      const text = await response.text();
-      return {
-        type: 'response',
-        id,
-        ok: true,
-        result: {
-          status: response.status,
-          body: this.tryParseJson(text),
-        },
-      };
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      return {
-        type: 'response',
-        id,
-        ok: false,
-        error: { code: 'UPSTREAM_ERROR', message },
-      };
-    }
   }
 
-  private buildInternalUrl(
-    path: string,
-    query: RestProxyQuery | undefined,
-  ): string {
-    const port = this.getPort() || 3000;
-    const url = new URL(`http://127.0.0.1:${port}${path}`);
-    if (query) {
-      for (const [key, value] of Object.entries(query)) {
-        if (value === null || value === undefined) continue;
-        url.searchParams.set(key, String(value));
-      }
-    }
-    return url.toString();
+  /** Fetch one file's bytes from the desktop. Same seam as the pull above. */
+  async requestLocalFsContent(
+    orgId: string,
+    userId: string,
+    connectorId: string,
+    payload: LocalFsFetchContentPayload,
+  ): Promise<Buffer> {
+    return this.localFsRelay.requestContent(
+      orgId,
+      userId,
+      connectorId,
+      payload,
+    );
   }
 
-  private tryParseJson(text: string): JsonValue {
-    if (!text.trim()) return null;
+  /**
+   * Resolves to the error refusing the handshake, or undefined to accept it.
+   * Refusals that mean "sign in again" carry an auth-looking message: the
+   * desktop client stops on those and retries the rest after a delay.
+   */
+  private async authenticateHandshake(
+    socket: RestProxySocket,
+  ): Promise<Error | undefined> {
+    const extractedToken = this.extractToken(this.getHandshakeToken(socket));
+    if (!extractedToken) {
+      return new BadRequestError('Authentication token missing');
+    }
+
+    let decoded: Awaited<ReturnType<AuthTokenService['verifyToken']>>;
     try {
-      return JSON.parse(text) as JsonValue;
+      decoded = await this.authTokenService.verifyToken(extractedToken);
     } catch {
-      return text;
+      return new BadRequestError('Authentication token expired');
+    }
+
+    const userId = String(decoded.userId ?? '');
+    const orgId = String(decoded.orgId ?? '');
+    if (!userId || !orgId) {
+      // Otherwise the socket connects but can never be addressed,
+      // which reads as "desktop offline" forever.
+      return new BadRequestError('Token is missing userId or orgId');
+    }
+
+    // The same rules as every HTTP request: a signature that still verifies
+    // says nothing about whether the user was removed or disabled since.
+    let refusal: string | null;
+    try {
+      refusal = await this.sessions.findSessionRefusal(decoded, this.logger);
+    } catch (error) {
+      // Fail closed, as HTTP does. The message must not look like an auth
+      // failure, so the desktop client keeps retrying until the check works.
+      this.logger.error('Desktop handshake: session check failed', {
+        error,
+        orgId,
+        userId,
+      });
+      return new Error('Unable to check the session right now');
+    }
+    if (refusal) {
+      return new UnauthorizedError(`Authentication refused: ${refusal}`);
+    }
+
+    socket.data.userId = userId;
+    socket.data.orgId = orgId;
+    socket.data.issuedAt =
+      typeof decoded.iat === 'number' ? decoded.iat : undefined;
+    socket.data.email =
+      typeof decoded.email === 'string' ? decoded.email : undefined;
+    return undefined;
+  }
+
+  /**
+   * Disconnects this replica's sockets whose session no longer holds. Each
+   * replica checks only the sockets it holds, so this needs no cross-replica
+   * fan-out. The client reconnects, and the handshake refuses it.
+   */
+  private async disconnectRevokedSessions(): Promise<void> {
+    if (!this.namespace || this.sessionRecheckRunning) return;
+    const sockets = (
+      [...this.namespace.sockets.values()] as RestProxySocket[]
+    ).filter((socket) => socket.data.userId !== '' && socket.data.orgId !== '');
+    if (sockets.length === 0) return;
+
+    this.sessionRecheckRunning = true;
+    try {
+      const refusals = await this.sessions.findSessionRefusals(
+        sockets.map((socket) => ({
+          userId: socket.data.userId,
+          orgId: socket.data.orgId,
+          iat: socket.data.issuedAt,
+          email: socket.data.email,
+        })),
+      );
+      sockets.forEach((socket, i) => {
+        if (!refusals[i]) return;
+        this.logger.info('Disconnecting desktop socket: session revoked', {
+          orgId: socket.data.orgId,
+          userId: socket.data.userId,
+          reason: refusals[i],
+        });
+        socket.disconnect(true);
+      });
+    } catch (error) {
+      // Leave the sockets up: a database blip must not drop every desktop.
+      this.logger.error('Desktop session re-check failed', { error });
+    } finally {
+      this.sessionRecheckRunning = false;
     }
   }
 

@@ -3,13 +3,22 @@
 import { useEffect, useLayoutEffect, useCallback, useMemo, useState, Suspense } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { useTranslation } from 'react-i18next';
+import { Button } from '@radix-ui/themes';
+import { useIsMobile } from '@/lib/hooks/use-is-mobile';
 import { MaterialIcon } from '@/app/components/ui/MaterialIcon';
 import { useUserStore, selectIsAdmin, selectIsProfileInitialized } from '@/lib/store/user-store';
+import { useFeatureFlagsStore, selectVectorStoreRebuildEnabled } from '@/lib/store/feature-flags-store';
 import { useToastStore } from '@/lib/store/toast-store';
+import { isProcessedError } from '@/lib/api';
 import { ServiceGate } from '@/app/components/ui/service-gate';
 import { useConnectorsStore } from '../store';
 import { ConnectorsApi } from '../api';
-import { startConnectorSync } from '../utils/connector-sync-actions';
+import {
+  startConnectorSync,
+  toggleConnectorSyncOn,
+} from '../utils/connector-sync-actions';
+import { CONNECTOR_INSTANCE_STATUS } from '../constants';
+import { localFsDesktopToast } from '../utils/local-fs-helpers';
 import { filterConnectorsForScope } from '../utils/filter-connectors-by-scope';
 import { fetchFilteredConnectorLists } from '../utils/fetch-filtered-connector-lists';
 import {
@@ -24,9 +33,9 @@ import {
   ConfigSuccessDialog,
 } from '../components';
 import { AdminAccessRequiredDialog } from '../components/admin-access-required-dialog';
+import { DemoDataRemovalNotice } from '../demo-data/components';
 import type { AdminAccessDialogPhase } from '../components/admin-access-required-dialog';
 import { shouldPromptAdminAccess } from '../utils/admin-access-helpers';
-import { CONNECTOR_INSTANCE_STATUS } from '../constants';
 import { getConnectorDocumentationUrl } from '../utils/connector-metadata';
 import { useResolvedConnectorTypeParam } from '../utils/resolve-connector-type-param';
 import type { Connector, ConnectorInstance, TeamFilterTab } from '../types';
@@ -58,7 +67,9 @@ function TeamConnectorsPageContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const addToast = useToastStore((s) => s.addToast);
+  const isAdmin = useUserStore(selectIsAdmin);
   const { t } = useTranslation();
+  const vectorStoreRebuildEnabled = useFeatureFlagsStore(selectVectorStoreRebuildEnabled);
 
   const teamTabs = [
     { value: 'all', label: t('workspace.actions.tabs.all') },
@@ -403,22 +414,38 @@ function TeamConnectorsPageContent() {
     async (instance: ConnectorInstance) => {
       if (!instance._key || instance.status === CONNECTOR_INSTANCE_STATUS.DELETING) return;
       try {
-        await ConnectorsApi.toggleConnector(instance._key, 'sync');
+        if (!instance.isActive) {
+          const outcome = await toggleConnectorSyncOn(instance._key, instance.type);
+          if (outcome.kind === 'requires-desktop') {
+            addToast(localFsDesktopToast(outcome));
+            return;
+          }
+        } else {
+          await ConnectorsApi.toggleConnector(instance._key, 'sync');
+        }
+        await refreshConnectorRowQuiet(instance._key);
         addToast({
           variant: 'success',
           title: instance.isActive ? 'Connector sync disabled' : 'Connector sync enabled',
           duration: 2500,
         });
-        await refreshConnectorRowQuiet(instance._key);
-        await refreshConnectorsListsQuiet();
-      } catch {
-        addToast({
-          variant: 'error',
-          title: 'Could not update connector',
-        });
+        try {
+          await refreshConnectorsListsQuiet();
+        } catch {
+          addToast({
+            variant: 'error',
+            title: t('workspace.connectors.toasts.refreshInstancesError'),
+          });
+        }
+      } catch (err: unknown) {
+        if (!isProcessedError(err)) {
+          addToast({ variant: 'error', title: 'Could not update connector' });
+        }
+        // A failed toggle may still have been committed server-side; show what's really there.
+        await refreshConnectorRowQuiet(instance._key).catch(() => {});
       }
     },
-    [addToast, refreshConnectorRowQuiet, refreshConnectorsListsQuiet]
+    [addToast, refreshConnectorRowQuiet, refreshConnectorsListsQuiet, t]
   );
 
   const handleInstanceChevron = useCallback(
@@ -436,7 +463,15 @@ function TeamConnectorsPageContent() {
     if (!instanceId) return;
 
     try {
-      await startConnectorSync({ _key: instanceId, type: connectorTypeInfo?.type });
+      const outcome = await startConnectorSync({
+        _key: instanceId,
+        type: connectorTypeInfo?.type,
+      });
+      if (outcome?.kind === 'requires-desktop') {
+        addToast(localFsDesktopToast(outcome));
+        await refreshConnectorRowQuiet(instanceId);
+        return;
+      }
       addToast({
         variant: 'success',
         title: t('workspace.connectors.toasts.syncStarted', { name: connectorTypeInfo?.name ?? 'connector' }),
@@ -526,6 +561,7 @@ function TeamConnectorsPageContent() {
             onClick={handleNavigateToPersonal}
           />
         }
+        banner={<DemoDataRemovalNotice isAdmin={isAdmin} />}
         registryConnectors={registryConnectors}
         activeConnectors={activeConnectors}
         onSetup={handleSetup}
@@ -550,51 +586,21 @@ function TeamConnectorsPageContent() {
 // Sub-component: trailing nav button
 // ========================================
 
-function NavigateButton({
-  label,
-  onClick,
-}: {
-  label: string;
-  onClick: () => void;
-}) {
-  const [isHovered, setIsHovered] = useState(false);
-
+function NavigateButton({ label, onClick }: { label: string; onClick: () => void }) {
+  const isMobile = useIsMobile();
+  // Phones get a light text link; wider screens keep the soft button.
   return (
-    <button
-      type="button"
+    <Button
+      size="2"
+      variant={isMobile ? 'ghost' : 'soft'}
+      color="gray"
+      className="touch-hit"
       onClick={onClick}
-      onMouseEnter={() => setIsHovered(true)}
-      onMouseLeave={() => setIsHovered(false)}
-      style={{
-        appearance: 'none',
-        margin: 0,
-        padding: '0 var(--space-3)',
-        font: 'inherit',
-        outline: 'none',
-        border: 'none',
-        display: 'flex',
-        alignItems: 'center',
-        gap: 'var(--space-2)',
-        height: 'var(--space-6)',
-        borderRadius: 'var(--radius-2)',
-        backgroundColor: isHovered ? 'var(--gray-a4)' : 'var(--gray-a3)',
-        cursor: 'pointer',
-        transition: 'background-color 150ms ease',
-      }}
+      style={{ cursor: 'pointer' }}
     >
-      <span
-        style={{
-          fontSize: 14,
-          fontWeight: 500,
-          lineHeight: '20px',
-          color: 'var(--gray-11)',
-          whiteSpace: 'nowrap',
-        }}
-      >
-        {label}
-      </span>
+      {label}
       <MaterialIcon name="arrow_forward" size={16} color="var(--gray-11)" />
-    </button>
+    </Button>
   );
 }
 

@@ -49,9 +49,18 @@ const chatSessionSchema = new Schema<IChatSessionDocument>(
     isArchived: { type: Boolean, default: false },
     archivedBy: { type: Schema.Types.ObjectId },
     lastActivityAt: { type: Number, default: Date.now },
+    /**
+     * Owner's pin. Deliberately no default: pinning writes `true`, unpinning
+     * removes the field, so every unpinned row (including those created before
+     * this field existed) is "missing". A stored `false` would sort ahead of
+     * missing rows in a descending sort and scramble recency order.
+     */
+    isPinned: { type: Boolean },
+    /** Identifies the run that currently owns the thread, so only it can release or keep it alive. Internal: never selected. */
+    activeRunId: { type: String, select: false },
     status: {
       type: String,
-      enum: ['None', 'Inprogress', 'Complete', 'Failed'],
+      enum: ['None', 'Inprogress', 'Complete', 'Failed', 'Stopped'],
     },
     failReason: { type: String },
     // Model information used for this session
@@ -92,6 +101,18 @@ const chatSessionSchema = new Schema<IChatSessionDocument>(
     compactedSummary: { type: String },
     compactedAtTurnIndex: { type: Number },
     compactedAtTimestamp: { type: Number },
+
+    // ---- Project linking (optional on both chat and agent sessions) ----
+    /** Reference to `projects` collection. Absent = not linked to a project. */
+    projectId: { type: Schema.Types.ObjectId, index: true },
+    /**
+     * Per-conversation override of the owning project's `chatSharing`
+     * default. 'project' exposes this chat to every project member with at
+     * least viewer access; 'private' (default) keeps it visible only to its
+     * owner even inside a shared project. See ProjectService.computeRole /
+     * getProjectConversations for the read-side of this rule.
+     */
+    projectVisibility: { type: String, enum: ['private', 'project'] },
   },
   { timestamps: true, collection: 'chatSessions' },
 );
@@ -107,6 +128,7 @@ chatSessionSchema.index({ sessionType: 1, orgId: 1, initiator: 1 });
 chatSessionSchema.index({ agentKey: 1, orgId: 1 });
 chatSessionSchema.index({ userId: 1, agentKey: 1 });
 chatSessionSchema.index({ isShared: 1 });
+chatSessionSchema.index({ projectId: 1, orgId: 1, isDeleted: 1, lastActivityAt: -1 });
 chatSessionSchema.index({ lastActivityAt: -1 });
 
 export const ChatSession: Model<IChatSessionDocument> =

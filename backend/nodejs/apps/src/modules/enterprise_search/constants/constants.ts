@@ -15,6 +15,9 @@ export const CONVERSATION_STATUS = {
   FAILED: 'Failed' as const,
   INPROGRESS: 'Inprogress' as const,
   NONE: 'None' as const,
+  /** Cooperatively cancelled by the user, or abandoned after the detached-run
+   * cap — the persisted message carries whatever partial answer had streamed. */
+  STOPPED: 'Stopped' as const,
 } as const;
 
 // Create a type from the object values

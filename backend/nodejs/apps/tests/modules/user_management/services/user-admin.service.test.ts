@@ -10,7 +10,10 @@ import {
   isUserOrgAdmin,
   findOrgAdminUserIds,
   assertCanDemoteAdmin,
+  assertCanPromoteAdmin,
   saveUserEnsuringOrgRetainsAdmin,
+  saveUserEnsuringAdminCap,
+  MAX_ORG_ADMINS_MESSAGE,
 } from '../../../../src/modules/user_management/services/user-admin.service';
 import { Users } from '../../../../src/modules/user_management/schema/users.schema';
 import { Org } from '../../../../src/modules/user_management/schema/org.schema';
@@ -28,6 +31,31 @@ function stubUsersFindOne(role: 'admin' | 'member' | null | undefined) {
       lean: sinon.stub().resolves(doc),
     }),
   } as any);
+}
+
+/**
+ * Like stubUsersFindOne, but for a record that is a machine identity.
+ *
+ * Hands back the `select` stub so a test can also check what was asked for.
+ * This mock answers with `kind` whatever the projection says, so without that
+ * check the clamp could stop working in production — `kind` dropped from the
+ * projection, so always undefined, so never clamped — while these tests stay
+ * green.
+ */
+function stubServiceAccountFindOne(role: 'admin' | 'member') {
+  const select = sinon.stub().returns({
+    lean: sinon.stub().resolves({ role, kind: 'service' }),
+  });
+  sinon.stub(Users, 'findOne').returns({ select } as any);
+  return { select };
+}
+
+/** The fields the clamp needs the repository to have asked for. */
+function expectProjectionCarriesKind(select: sinon.SinonStub): void {
+  expect(select.calledOnce).to.equal(true);
+  const projection = String(select.firstCall.args[0] ?? '');
+  expect(projection, 'the role lookup must select kind').to.contain('kind');
+  expect(projection, 'the role lookup must still select role').to.contain('role');
 }
 
 describe('user-admin.service', () => {
@@ -161,6 +189,14 @@ describe('user-admin.service', () => {
     });
   });
 
+  describe('isUserOrgAdmin with a service account', () => {
+    it('refuses, even when the stored role is admin', async () => {
+      const { select } = stubServiceAccountFindOne('admin');
+      expect(await isUserOrgAdmin(userId, orgId)).to.equal(false);
+      expectProjectionCarriesKind(select);
+    });
+  });
+
   describe('getActiveUserOrgRole', () => {
     it('returns admin for an active admin', async () => {
       stubUsersFindOne('admin');
@@ -180,6 +216,30 @@ describe('user-admin.service', () => {
     it('returns null for a missing or deleted user', async () => {
       stubUsersFindOne(undefined);
       expect(await getActiveUserOrgRole(userId, orgId)).to.equal(null);
+    });
+
+    /**
+     * A service account reads as a member whatever its record says.
+     *
+     * The schema refuses it the admin role on every write path, so a record
+     * like this should not exist. These hold the clamp in place anyway: the
+     * two sibling queries in the repository already drop service accounts,
+     * and this one cannot, because the same lookup answers
+     * `GET /api/v1/users/me/role` for the service account itself.
+     */
+    it('reads a service account as a member even if its record says admin', async () => {
+      const { select } = stubServiceAccountFindOne('admin');
+      expect(await getActiveUserOrgRole(userId, orgId)).to.equal('member');
+      expectProjectionCarriesKind(select);
+    });
+
+    it('still answers for a service account rather than refusing it', async () => {
+      // Filtering service accounts out of this query would return null here,
+      // and the route turns null into "User not found, please login again" —
+      // signing out every service account that asks what it is.
+      const { select } = stubServiceAccountFindOne('member');
+      expect(await getActiveUserOrgRole(userId, orgId)).to.equal('member');
+      expectProjectionCarriesKind(select);
     });
 
     it('returns null for invalid ObjectIds without querying', async () => {
@@ -216,6 +276,10 @@ describe('user-admin.service', () => {
         orgId,
         role: 'admin',
         isDeleted: { $ne: true },
+        // Service accounts are excluded so they cannot be counted as one of
+        // an organisation's administrators: were one counted, the last person
+        // who can actually sign in could be demoted.
+        kind: { $ne: 'service' },
       });
     });
 
@@ -288,6 +352,35 @@ describe('user-admin.service', () => {
 
       expect(sessionStub.calledOnce).to.equal(true);
       expect(sessionStub.firstCall.args[0]).to.equal(session);
+    });
+  });
+
+  describe('assertCanPromoteAdmin', () => {
+    it('allows promotion when current count plus additional stays at 5', async () => {
+      const countStub = sinon.stub(Users, 'countDocuments').resolves(4);
+
+      await assertCanPromoteAdmin(orgId);
+
+      expect(countStub.calledOnce).to.equal(true);
+    });
+
+    it('rejects when promoting would exceed 5 admins', async () => {
+      sinon.stub(Users, 'countDocuments').resolves(5);
+
+      try {
+        await assertCanPromoteAdmin(orgId);
+        expect.fail('expected BadRequestError');
+      } catch (error: any) {
+        expect(error.message).to.equal(MAX_ORG_ADMINS_MESSAGE);
+      }
+    });
+
+    it('skips the count when additionalAdmins is 0', async () => {
+      const countStub = sinon.stub(Users, 'countDocuments');
+
+      await assertCanPromoteAdmin(orgId, 0);
+
+      expect(countStub.called).to.equal(false);
     });
   });
 
@@ -400,6 +493,83 @@ describe('user-admin.service', () => {
         expect(error.message).to.equal(
           'Cannot demote the last admin. Promote another user to admin first.',
         );
+      }
+
+      expect(save.called).to.equal(false);
+    });
+  });
+
+  describe('saveUserEnsuringAdminCap', () => {
+    it('checks then saves when replica set is unavailable and the cap is not exceeded', async () => {
+      const save = sinon.stub().resolves();
+      const user = {
+        _id: userId,
+        orgId,
+        role: 'admin',
+        save,
+      };
+      const countStub = sinon.stub(Users, 'countDocuments');
+      countStub.onFirstCall().resolves(4);
+      countStub.onSecondCall().resolves(5);
+
+      await saveUserEnsuringAdminCap(user as any, false);
+
+      expect(save.calledOnce).to.equal(true);
+      expect(countStub.callCount).to.equal(2);
+    });
+
+    it('restores member when non-RS save leaves the org over the cap', async () => {
+      const save = sinon.stub().resolves();
+      const user = {
+        _id: userId,
+        orgId,
+        role: 'admin',
+        save,
+      };
+      const countStub = sinon.stub(Users, 'countDocuments');
+      countStub.onFirstCall().resolves(4);
+      countStub.onSecondCall().resolves(6);
+      const updateStub = sinon.stub(Users, 'updateOne').resolves({} as any);
+
+      try {
+        await saveUserEnsuringAdminCap(user as any, false);
+        expect.fail('expected BadRequestError');
+      } catch (error: any) {
+        expect(error.message).to.equal(MAX_ORG_ADMINS_MESSAGE);
+      }
+
+      expect(save.calledOnce).to.equal(true);
+      expect(updateStub.calledOnce).to.equal(true);
+      expect(updateStub.firstCall.args[1]).to.deep.equal({
+        $set: { role: 'member' },
+      });
+      expect(user.role).to.equal('member');
+    });
+
+    it('does not save when pre-check finds the org is already at 5 admins', async () => {
+      const save = sinon.stub().resolves();
+      const user = {
+        _id: userId,
+        orgId,
+        save,
+      };
+      const withTransaction = sinon.stub().callsFake(async (fn: () => Promise<void>) => {
+        await fn();
+      });
+      sinon.stub(mongoose, 'startSession').resolves({
+        withTransaction,
+        endSession: sinon.stub().resolves(),
+      } as any);
+      sinon.stub(Org, 'updateOne').resolves({} as any);
+      sinon.stub(Users, 'countDocuments').returns({
+        session: sinon.stub().callsFake(() => Promise.resolve(5)),
+      } as any);
+
+      try {
+        await saveUserEnsuringAdminCap(user as any, true);
+        expect.fail('expected BadRequestError');
+      } catch (error: any) {
+        expect(error.message).to.equal(MAX_ORG_ADMINS_MESSAGE);
       }
 
       expect(save.called).to.equal(false);

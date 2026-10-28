@@ -107,18 +107,18 @@ test.describe('Knowledge Base Upload', () => {
 
   test('Save is disabled until at least one file is selected', async ({ page }) => {
     const input = await openUploadSidebar(page, kbId);
-    test.skip(!input, 'Upload affordance not reachable');
+    expect(input, 'Upload Data entry point should be available').not.toBeNull();
 
-    const save = page.getByRole('button', { name: 'Save' });
+    const save = page.getByTestId('upload-sidebar-save');
     await expect(save).toBeDisabled();
   });
 
-  test('one file within limits renders a completed row', async ({ page }) => {
+  test('one file within limits renders a completed row @smoke', async ({ page }) => {
     const input = await openUploadSidebar(page, kbId);
-    test.skip(!input, 'Upload affordance not reachable');
+    expect(input, 'Upload Data entry point should be available').not.toBeNull();
 
     await input!.setInputFiles(makeFiles(1, { prefix: 'ok-single' }));
-    await page.getByRole('button', { name: 'Save' }).click();
+    await page.getByTestId('upload-sidebar-save').click();
 
     await expect(page.getByTestId('upload-progress-tracker')).toBeVisible({ timeout: 15_000 });
     await expect(completedRows(page)).toHaveCount(1, { timeout: 30_000 });
@@ -127,12 +127,12 @@ test.describe('Knowledge Base Upload', () => {
 
   test('12 files across multiple batches all complete', async ({ page }) => {
     const input = await openUploadSidebar(page, kbId);
-    test.skip(!input, 'Upload affordance not reachable');
+    expect(input, 'Upload Data entry point should be available').not.toBeNull();
 
     // 12 files exercises multi-batch fan-out (size-aware batching groups by
     // cumulative file size, but tiny files still fit in one batch by size).
     await input!.setInputFiles(makeFiles(12, { prefix: 'ok-multi' }));
-    await page.getByRole('button', { name: 'Save' }).click();
+    await page.getByTestId('upload-sidebar-save').click();
 
     const tracker = page.getByTestId('upload-progress-tracker');
     await expect(tracker).toBeVisible({ timeout: 15_000 });
@@ -142,7 +142,7 @@ test.describe('Knowledge Base Upload', () => {
 
   test('uploads a folder, preserving hierarchy, and completes each file', async ({ page }) => {
     const input = await openUploadSidebar(page, kbId);
-    test.skip(!input, 'Upload affordance not reachable');
+    expect(input, 'Upload Data entry point should be available').not.toBeNull();
 
     // webkitdirectory upload needs real files on disk so the browser can derive
     // webkitRelativePath (the folder hierarchy the backend reconstructs).
@@ -152,7 +152,7 @@ test.describe('Knowledge Base Upload', () => {
     writeFileSync(join(dir, 'sub', 'ok-folder-nested.pdf'), 'nested content');
     try {
       await page.getByTestId('upload-input-folder').setInputFiles(dir);
-      await page.getByRole('button', { name: 'Save' }).click();
+      await page.getByTestId('upload-sidebar-save').click();
 
       await expect(page.getByTestId('upload-progress-tracker')).toBeVisible({ timeout: 15_000 });
       await expect(completedRows(page)).toHaveCount(2, { timeout: 30_000 });
@@ -166,7 +166,7 @@ test.describe('Knowledge Base Upload', () => {
     page,
   }) => {
     const input = await openUploadSidebar(page, kbId);
-    test.skip(!input, 'Upload affordance not reachable');
+    expect(input, 'Upload Data entry point should be available').not.toBeNull();
 
     // All files go to disk so we can pass a uniform string[] to setInputFiles
     // (Playwright does not allow mixing buffer objects with path strings).
@@ -182,7 +182,7 @@ test.describe('Knowledge Base Upload', () => {
         join(dir, 'oversize.pdf'),
         join(dir, 'bad-mixed-00.xyz'),
       ]);
-      await page.getByRole('button', { name: 'Save' }).click();
+      await page.getByTestId('upload-sidebar-save').click();
 
       await expect(page.getByTestId('upload-progress-tracker')).toBeVisible({ timeout: 15_000 });
       // 2 valid files complete; 1 oversize + 1 unsupported type fail.
@@ -195,14 +195,14 @@ test.describe('Knowledge Base Upload', () => {
 
   test('all unsupported types: every file is rejected', async ({ page }) => {
     const input = await openUploadSidebar(page, kbId);
-    test.skip(!input, 'Upload affordance not reachable');
+    expect(input, 'Upload Data entry point should be available').not.toBeNull();
 
     // .exe is in extensionToMimeType → backend accepts it.
     // .xyz is not in the map → rejected as UNSUPPORTED_TYPE.
     await input!.setInputFiles(
       makeFiles(3, { prefix: 'bad-all', ext: 'xyz', mimeType: 'application/octet-stream' }),
     );
-    await page.getByRole('button', { name: 'Save' }).click();
+    await page.getByTestId('upload-sidebar-save').click();
 
     await expect(page.getByTestId('upload-progress-tracker')).toBeVisible({ timeout: 15_000 });
     await expect(failedRows(page)).toHaveCount(3, { timeout: 30_000 });
@@ -211,16 +211,16 @@ test.describe('Knowledge Base Upload', () => {
 
   test('failed row shows the rejection message for an oversized file', async ({ page }) => {
     const input = await openUploadSidebar(page, kbId);
-    test.skip(!input, 'Upload affordance not reachable');
+    expect(input, 'Upload Data entry point should be available').not.toBeNull();
 
     const { paths, cleanup } = writeOversizeFiles(realMaxBytes, 1);
     try {
       await input!.setInputFiles(paths);
-      await page.getByRole('button', { name: 'Save' }).click();
+      await page.getByTestId('upload-sidebar-save').click();
 
       const row = failedRows(page).first();
       await expect(row).toBeVisible({ timeout: 15_000 });
-      await expect(row).toContainText(/exceed|size|limit/i, { timeout: 30_000 });
+      await expect(row).toContainText(/larger than the \d+ MB limit/i, { timeout: 30_000 });
     } finally {
       cleanup();
     }
@@ -228,13 +228,13 @@ test.describe('Knowledge Base Upload', () => {
 
   test('the Failed tab filters the tracker to failed rows', async ({ page }) => {
     const input = await openUploadSidebar(page, kbId);
-    test.skip(!input, 'Upload affordance not reachable');
+    expect(input, 'Upload Data entry point should be available').not.toBeNull();
 
     await input!.setInputFiles([
       ...makeFiles(2, { prefix: 'ok-tab' }),
       ...makeFiles(2, { prefix: 'bad-tab', ext: 'xyz', mimeType: 'application/octet-stream' }),
     ]);
-    await page.getByRole('button', { name: 'Save' }).click();
+    await page.getByTestId('upload-sidebar-save').click();
 
     await expect(page.getByTestId('upload-progress-tracker')).toBeVisible({ timeout: 15_000 });
     await expect(completedRows(page)).toHaveCount(2, { timeout: 30_000 });
@@ -252,7 +252,7 @@ test.describe('Knowledge Base Upload', () => {
     });
 
     const input = await openUploadSidebar(page, kbId);
-    test.skip(!input, 'Upload affordance not reachable');
+    expect(input, 'Upload Data entry point should be available').not.toBeNull();
 
     await input!.setInputFiles(makeFiles(1, { prefix: 'ok-dismiss' }));
     await expect(page.getByTestId('upload-selected-file-row')).toHaveCount(1);
@@ -272,12 +272,12 @@ test.describe('Knowledge Base Upload', () => {
   test('uploads 50 files in one go without breaking the tracker', async ({ page }) => {
     test.setTimeout(150_000); // ~5s sidebar + 90s 50-file upload + 55s headroom
     const input = await openUploadSidebar(page, kbId);
-    test.skip(!input, 'Upload affordance not reachable');
+    expect(input, 'Upload Data entry point should be available').not.toBeNull();
 
     // 50 tiny files → size-batched (all fit well under 95MB budget). Verifies
     // the tracker handles a larger set without row-cap truncation or counter desync.
     await input!.setInputFiles(makeFiles(50, { prefix: 'ok-scale' }));
-    await page.getByRole('button', { name: 'Save' }).click();
+    await page.getByTestId('upload-sidebar-save').click();
 
     const tracker = page.getByTestId('upload-progress-tracker');
     await expect(tracker).toBeVisible({ timeout: 15_000 });
@@ -287,7 +287,7 @@ test.describe('Knowledge Base Upload', () => {
 
   test('file with a multi-dot name completes (last-dot extension rule)', async ({ page }) => {
     const input = await openUploadSidebar(page, kbId);
-    test.skip(!input, 'Upload affordance not reachable');
+    expect(input, 'Upload Data entry point should be available').not.toBeNull();
 
     // "v2" is NOT the extension — "pdf" (after the last dot) is.
     // Regression guard: an earlier bug extracted "v2" as the extension and
@@ -295,7 +295,7 @@ test.describe('Knowledge Base Upload', () => {
     await input!.setInputFiles([
       { name: 'report.v2.pdf', mimeType: 'application/pdf', buffer: validPdfBuffer(256, 'multi-dot') },
     ]);
-    await page.getByRole('button', { name: 'Save' }).click();
+    await page.getByTestId('upload-sidebar-save').click();
 
     await expect(page.getByTestId('upload-progress-tracker')).toBeVisible({ timeout: 15_000 });
     await expect(completedRows(page)).toHaveCount(1, { timeout: 30_000 });
@@ -304,7 +304,7 @@ test.describe('Knowledge Base Upload', () => {
 
   test('within-batch duplicate: second copy of same filename fails', async ({ page }) => {
     const input = await openUploadSidebar(page, kbId);
-    test.skip(!input, 'Upload affordance not reachable');
+    expect(input, 'Upload Data entry point should be available').not.toBeNull();
 
     // Two entries with identical names in one setInputFiles call exercises the
     // Python service's within-batch duplicate detection. The first copy must
@@ -313,7 +313,7 @@ test.describe('Knowledge Base Upload', () => {
       { name: 'within-batch-dup.pdf', mimeType: 'application/pdf', buffer: validPdfBuffer(256, 'copy-A') },
       { name: 'within-batch-dup.pdf', mimeType: 'application/pdf', buffer: validPdfBuffer(256, 'copy-B') },
     ]);
-    await page.getByRole('button', { name: 'Save' }).click();
+    await page.getByTestId('upload-sidebar-save').click();
 
     await expect(page.getByTestId('upload-progress-tracker')).toBeVisible({ timeout: 15_000 });
     await expect(completedRows(page)).toHaveCount(1, { timeout: 30_000 });
@@ -324,7 +324,7 @@ test.describe('Knowledge Base Upload', () => {
   test('file at exactly the size limit is not rejected as oversized', async ({ page }) => {
     test.setTimeout(120_000);
     const input = await openUploadSidebar(page, kbId);
-    test.skip(!input, 'Upload affordance not reachable');
+    expect(input, 'Upload Data entry point should be available').not.toBeNull();
 
     // Boundary: the size check is strictly greater-than, so exactly realMaxBytes
     // must pass the file processor. Whether indexing succeeds is separate.
@@ -332,7 +332,7 @@ test.describe('Knowledge Base Upload', () => {
     const { path: filePath, cleanup } = writeExactSizeFile(realMaxBytes);
     try {
       await input!.setInputFiles(filePath);
-      await page.getByRole('button', { name: 'Save' }).click();
+      await page.getByTestId('upload-sidebar-save').click();
 
       const tracker = page.getByTestId('upload-progress-tracker');
       await expect(tracker).toBeVisible({ timeout: 15_000 });
@@ -343,7 +343,7 @@ test.describe('Knowledge Base Upload', () => {
       ).toHaveCount(0, { timeout: 90_000 });
 
       // Size-limit rejections emit a specific phrase; it must not appear here.
-      await expect(tracker).not.toContainText(/exceed|size limit/i);
+      await expect(tracker).not.toContainText(/larger than the \d+ MB limit/i);
     } finally {
       cleanup();
     }
@@ -351,13 +351,13 @@ test.describe('Knowledge Base Upload', () => {
 
   test('filename with spaces and special characters completes', async ({ page }) => {
     const input = await openUploadSidebar(page, kbId);
-    test.skip(!input, 'Upload affordance not reachable');
+    expect(input, 'Upload Data entry point should be available').not.toBeNull();
 
     await input!.setInputFiles([
       { name: 'my report (draft) v2.pdf', mimeType: 'application/pdf', buffer: validPdfBuffer(256, 'spaces') },
       { name: 'file-with-hyphens_and_underscores.pdf', mimeType: 'application/pdf', buffer: validPdfBuffer(256, 'hyphens') },
     ]);
-    await page.getByRole('button', { name: 'Save' }).click();
+    await page.getByTestId('upload-sidebar-save').click();
 
     await expect(page.getByTestId('upload-progress-tracker')).toBeVisible({ timeout: 15_000 });
     await expect(completedRows(page)).toHaveCount(2, { timeout: 30_000 });
@@ -366,7 +366,7 @@ test.describe('Knowledge Base Upload', () => {
 
   test('folder upload with mixed types: pdf files complete, xyz files fail', async ({ page }) => {
     const input = await openUploadSidebar(page, kbId);
-    test.skip(!input, 'Upload affordance not reachable');
+    expect(input, 'Upload Data entry point should be available').not.toBeNull();
 
     const dir = mkdtempSync(join(tmpdir(), 'e2e-mixed-'));
     writeFileSync(join(dir, 'mixed-ok-0.pdf'), 'valid pdf');
@@ -375,7 +375,7 @@ test.describe('Knowledge Base Upload', () => {
     writeFileSync(join(dir, 'mixed-bad-1.xyz'), 'unsupported 2');
     try {
       await page.getByTestId('upload-input-folder').setInputFiles(dir);
-      await page.getByRole('button', { name: 'Save' }).click();
+      await page.getByTestId('upload-sidebar-save').click();
 
       await expect(page.getByTestId('upload-progress-tracker')).toBeVisible({ timeout: 15_000 });
       await expect(completedRows(page)).toHaveCount(2, { timeout: 30_000 });
@@ -387,10 +387,10 @@ test.describe('Knowledge Base Upload', () => {
 
   test('All tab is selected by default when tracker opens', async ({ page }) => {
     const input = await openUploadSidebar(page, kbId);
-    test.skip(!input, 'Upload affordance not reachable');
+    expect(input, 'Upload Data entry point should be available').not.toBeNull();
 
     await input!.setInputFiles(makeFiles(1, { prefix: 'tab-default' }));
-    await page.getByRole('button', { name: 'Save' }).click();
+    await page.getByTestId('upload-sidebar-save').click();
 
     const tracker = page.getByTestId('upload-progress-tracker');
     await expect(tracker).toBeVisible({ timeout: 15_000 });
@@ -403,12 +403,12 @@ test.describe('Knowledge Base Upload', () => {
 
   test('Failed tab badge shows the correct failed count', async ({ page }) => {
     const input = await openUploadSidebar(page, kbId);
-    test.skip(!input, 'Upload affordance not reachable');
+    expect(input, 'Upload Data entry point should be available').not.toBeNull();
 
     await input!.setInputFiles(
       makeFiles(3, { prefix: 'tab-badge-bad', ext: 'xyz', mimeType: 'application/octet-stream' }),
     );
-    await page.getByRole('button', { name: 'Save' }).click();
+    await page.getByTestId('upload-sidebar-save').click();
 
     const tracker = page.getByTestId('upload-progress-tracker');
     await expect(tracker).toBeVisible({ timeout: 15_000 });
@@ -421,7 +421,7 @@ test.describe('Knowledge Base Upload', () => {
 
   test('upload sidebar renders both File and Folder inputs', async ({ page }) => {
     const input = await openUploadSidebar(page, kbId);
-    test.skip(!input, 'Upload affordance not reachable');
+    expect(input, 'Upload Data entry point should be available').not.toBeNull();
 
     // Both inputs must be attached when the sidebar is open.
     // If either disappears the entire upload flow breaks silently.
@@ -431,7 +431,7 @@ test.describe('Knowledge Base Upload', () => {
 
   test('files whose name contains a known extension all complete', async ({ page }) => {
     const input = await openUploadSidebar(page, kbId);
-    test.skip(!input, 'Upload affordance not reachable');
+    expect(input, 'Upload Data entry point should be available').not.toBeNull();
 
     // Regression for the hasExtension storage-guard bug that incorrectly
     // rejected files whose document name ends with a known extension string.
@@ -444,7 +444,7 @@ test.describe('Knowledge Base Upload', () => {
       { name: 'v2-test.pdf.docx.pdf', mimeType: 'application/pdf', buffer: validPdfBuffer(256, 'e') },
 
     ]);
-    await page.getByRole('button', { name: 'Save' }).click();
+    await page.getByTestId('upload-sidebar-save').click();
 
     await expect(page.getByTestId('upload-progress-tracker')).toBeVisible({ timeout: 15_000 });
     await expect(completedRows(page)).toHaveCount(5, { timeout: 30_000 });
@@ -481,20 +481,20 @@ test.describe('Knowledge Base Upload — Duplicate Detection', () => {
   test('duplicate names are reported as failed', async ({ page }) => {
     // First upload: file is accepted.
     const input = await openUploadSidebar(page, kbId);
-    test.skip(!input, 'Upload affordance not reachable');
+    expect(input, 'Upload Data entry point should be available').not.toBeNull();
 
     await input!.setInputFiles(makeFiles(1, { prefix: 'dup' }));
-    await page.getByRole('button', { name: 'Save' }).click();
+    await page.getByTestId('upload-sidebar-save').click();
 
     await expect(page.getByTestId('upload-progress-tracker')).toBeVisible({ timeout: 15_000 });
     await expect(completedRows(page)).toHaveCount(1, { timeout: 30_000 });
 
     // Second upload: same file name → backend emits DUPLICATE_NAME.
     const input2 = await openUploadSidebar(page, kbId);
-    test.skip(!input2, 'Upload affordance not reachable for second upload');
+    expect(input2, 'Upload Data entry point should be available for the second upload').not.toBeNull();
 
     await input2!.setInputFiles(makeFiles(1, { prefix: 'dup' }));
-    await page.getByRole('button', { name: 'Save' }).click();
+    await page.getByTestId('upload-sidebar-save').click();
 
     await expect(page.getByTestId('upload-progress-tracker')).toBeVisible({ timeout: 15_000 });
     const dupRow = failedRows(page).first();
@@ -507,7 +507,7 @@ test.describe('Knowledge Base Upload — Duplicate Detection', () => {
 
   test('three files where two share a name: two complete, one fails as duplicate', async ({ page }) => {
     const input = await openUploadSidebar(page, kbId);
-    test.skip(!input, 'Upload affordance not reachable');
+    expect(input, 'Upload Data entry point should be available').not.toBeNull();
 
     // Batch of 3: first and third share a name. The Python service processes
     // them in order; the third is detected as a within-batch duplicate.
@@ -516,7 +516,7 @@ test.describe('Knowledge Base Upload — Duplicate Detection', () => {
       { name: 'triple-1.pdf', mimeType: 'application/pdf', buffer: validPdfBuffer(256, 'second') },
       { name: 'triple-0.pdf', mimeType: 'application/pdf', buffer: validPdfBuffer(256, 'third') },
     ]);
-    await page.getByRole('button', { name: 'Save' }).click();
+    await page.getByTestId('upload-sidebar-save').click();
 
     await expect(page.getByTestId('upload-progress-tracker')).toBeVisible({ timeout: 15_000 });
     await expect(completedRows(page)).toHaveCount(2, { timeout: 30_000 });
@@ -546,13 +546,13 @@ test.describe('Knowledge Base Upload — Size-Aware Batching', () => {
   test('52 tiny files split across two batches by count cap', async ({ page }) => {
     test.setTimeout(180_000);
     const input = await openUploadSidebar(page, kbId);
-    test.skip(!input, 'Upload affordance not reachable');
+    expect(input, 'Upload Data entry point should be available').not.toBeNull();
 
     // 52 tiny files exceed maxFilesPerBatch (50), so the batcher must split
     // into two batches: 50 + 2. This exercises the file-count cap without
     // overwhelming the backend with two large concurrent uploads.
     await input!.setInputFiles(makeFiles(52, { prefix: 'sb-tiny' }));
-    await page.getByRole('button', { name: 'Save' }).click();
+    await page.getByTestId('upload-sidebar-save').click();
 
     const tracker = page.getByTestId('upload-progress-tracker');
     await expect(tracker).toBeVisible({ timeout: 15_000 });
@@ -562,7 +562,7 @@ test.describe('Knowledge Base Upload — Size-Aware Batching', () => {
 
   test('folder with varied file sizes preserves hierarchy after size-sorting', async ({ page }) => {
     const input = await openUploadSidebar(page, kbId);
-    test.skip(!input, 'Upload affordance not reachable');
+    expect(input, 'Upload Data entry point should be available').not.toBeNull();
 
     // Create a folder with files of different sizes. Size-aware batching sorts
     // files within the folder group by size ascending, which changes which files
@@ -579,7 +579,7 @@ test.describe('Knowledge Base Upload — Size-Aware Batching', () => {
     writeFileSync(join(dir, 'docs', 'sb-tiny-nested.pdf'), 'small');
     try {
       await page.getByTestId('upload-input-folder').setInputFiles(dir);
-      await page.getByRole('button', { name: 'Save' }).click();
+      await page.getByTestId('upload-sidebar-save').click();
 
       await expect(page.getByTestId('upload-progress-tracker')).toBeVisible({ timeout: 15_000 });
       await expect(completedRows(page)).toHaveCount(4, { timeout: 60_000 });
@@ -591,7 +591,7 @@ test.describe('Knowledge Base Upload — Size-Aware Batching', () => {
 
   test('deeply nested folder structure intact after size-based batching', async ({ page }) => {
     const input = await openUploadSidebar(page, kbId);
-    test.skip(!input, 'Upload affordance not reachable');
+    expect(input, 'Upload Data entry point should be available').not.toBeNull();
 
     // 3 levels deep: root/level1/level2. Files at each level have different
     // sizes so the size-sort reorders them. The backend must still create the
@@ -606,7 +606,7 @@ test.describe('Knowledge Base Upload — Size-Aware Batching', () => {
     writeFileSync(join(level2, 'sb-deep.pdf'), Buffer.alloc(500, 'D'));
     try {
       await page.getByTestId('upload-input-folder').setInputFiles(dir);
-      await page.getByRole('button', { name: 'Save' }).click();
+      await page.getByTestId('upload-sidebar-save').click();
 
       await expect(page.getByTestId('upload-progress-tracker')).toBeVisible({ timeout: 15_000 });
       await expect(completedRows(page)).toHaveCount(3, { timeout: 60_000 });
@@ -646,12 +646,12 @@ test.describe('Knowledge Base Upload — Client-Side Size Validation', () => {
     });
 
     const input = await openUploadSidebar(page, kbId);
-    test.skip(!input, 'Upload affordance not reachable');
+    expect(input, 'Upload Data entry point should be available').not.toBeNull();
 
     const { paths, cleanup } = writeOversizeFiles(realMaxBytes, 1);
     try {
       await input!.setInputFiles(paths);
-      await page.getByRole('button', { name: 'Save' }).click();
+      await page.getByTestId('upload-sidebar-save').click();
 
       const tracker = page.getByTestId('upload-progress-tracker');
       await expect(tracker).toBeVisible({ timeout: 15_000 });
@@ -660,7 +660,7 @@ test.describe('Knowledge Base Upload — Client-Side Size Validation', () => {
       // a few seconds, not the 30-60s a backend round-trip would take.
       await expect(failedRows(page)).toHaveCount(1, { timeout: 10_000 });
       await expect(completedRows(page)).toHaveCount(0);
-      await expect(failedRows(page).first()).toContainText(/exceed|size.*limit/i);
+      await expect(failedRows(page).first()).toContainText(/larger than the \d+ MB limit/i);
 
       // The gate must prevent any upload request from reaching the server.
       expect(uploadCalls).toBe(0);
@@ -676,12 +676,12 @@ test.describe('Knowledge Base Upload — Client-Side Size Validation', () => {
     });
 
     const input = await openUploadSidebar(page, kbId);
-    test.skip(!input, 'Upload affordance not reachable');
+    expect(input, 'Upload Data entry point should be available').not.toBeNull();
 
     const { paths, cleanup } = writeOversizeFiles(realMaxBytes, 2, { prefix: 'cs-big' });
     try {
       await input!.setInputFiles(paths);
-      await page.getByRole('button', { name: 'Save' }).click();
+      await page.getByTestId('upload-sidebar-save').click();
 
       const tracker = page.getByTestId('upload-progress-tracker');
       await expect(tracker).toBeVisible({ timeout: 15_000 });
@@ -698,7 +698,7 @@ test.describe('Knowledge Base Upload — Client-Side Size Validation', () => {
     page,
   }) => {
     const input = await openUploadSidebar(page, kbId);
-    test.skip(!input, 'Upload affordance not reachable');
+    expect(input, 'Upload Data entry point should be available').not.toBeNull();
 
     // All files written to disk — Playwright does not allow mixing buffer
     // objects with path strings in a single setInputFiles call.
@@ -712,7 +712,7 @@ test.describe('Knowledge Base Upload — Client-Side Size Validation', () => {
         join(dir, 'cs-ok-1.pdf'),
         join(dir, 'cs-toobig.pdf'),
       ]);
-      await page.getByRole('button', { name: 'Save' }).click();
+      await page.getByTestId('upload-sidebar-save').click();
 
       const tracker = page.getByTestId('upload-progress-tracker');
       await expect(tracker).toBeVisible({ timeout: 15_000 });
@@ -721,7 +721,7 @@ test.describe('Knowledge Base Upload — Client-Side Size Validation', () => {
       // The 2 valid files proceed to the backend and complete normally.
       await expect(completedRows(page)).toHaveCount(2, { timeout: 60_000 });
       await expect(failedRows(page)).toHaveCount(1, { timeout: 10_000 });
-      await expect(failedRows(page).first()).toContainText(/exceed|size.*limit/i);
+      await expect(failedRows(page).first()).toContainText(/larger than the \d+ MB limit/i);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -731,19 +731,19 @@ test.describe('Knowledge Base Upload — Client-Side Size Validation', () => {
     page,
   }) => {
     const input = await openUploadSidebar(page, kbId);
-    test.skip(!input, 'Upload affordance not reachable');
+    expect(input, 'Upload Data entry point should be available').not.toBeNull();
 
     const { paths, cleanup } = writeOversizeFiles(realMaxBytes, 1, { prefix: 'cs-msg' });
     try {
       await input!.setInputFiles(paths);
-      await page.getByRole('button', { name: 'Save' }).click();
+      await page.getByTestId('upload-sidebar-save').click();
 
       const row = failedRows(page).first();
       await expect(row).toBeVisible({ timeout: 10_000 });
 
-      // Must contain the exact phrasing: "File exceeds the XX MB size limit"
+      // Must match the backend's phrasing: "This file is larger than the XX MB limit"
       const limitMB = Math.round(realMaxBytes / (1024 * 1024));
-      await expect(row).toContainText(`exceeds the ${limitMB} MB size limit`);
+      await expect(row).toContainText(`larger than the ${limitMB} MB limit`);
     } finally {
       cleanup();
     }

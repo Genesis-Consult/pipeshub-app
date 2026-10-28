@@ -1,7 +1,7 @@
 """
 Integration tests for the Redis vector DB provider.
 
-Requires: docker compose -f deployment/docker-compose/docker-compose.integration.vector-db.yml up -d
+Requires: docker compose -f tests/integration/compose/vector-db.yml up -d
 Run: pytest tests/integration/vector_db/test_redis_integration.py -m integration --timeout=120
 """
 
@@ -20,11 +20,15 @@ from tests.integration.vector_db.helpers import (
     make_collection_config,
     make_dense,
     org_filter,
+    point_id,
     sample_points,
 )
 from tests.integration.vector_db.conftest import make_collection
 
-pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
+# loop_scope matches the module-scoped provider fixtures in conftest.
+# Without it each test gets its own loop and the shared client raises
+# "Event loop is closed" on first use.
+pytestmark = [pytest.mark.integration, pytest.mark.asyncio(loop_scope="module")]
 
 
 # ---------------------------------------------------------------------------
@@ -138,7 +142,7 @@ class TestRedisUpsertQuery:
             results = results_list[0]
             assert len(results) > 0
             # doc-python should rank highest (cosine similarity = 1.0)
-            assert results[0].id == "doc-python"
+            assert results[0].id == point_id("doc-python")
         finally:
             await redis_service.delete_collection(col)
 
@@ -169,7 +173,7 @@ class TestRedisUpsertQuery:
         points_a = sample_points("org-a")
         points_b = [
             VectorPoint(
-                id="doc-b1",
+                id=point_id("doc-b1"),
                 dense_vector=make_dense([0.5, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
                 payload={
                     "page_content": "Ruby on Rails",
@@ -190,7 +194,7 @@ class TestRedisUpsertQuery:
             )
             results = (await redis_service.query_nearest_points(col, [req]))[0]
             ids = {r.id for r in results}
-            assert "doc-b1" not in ids
+            assert point_id("doc-b1") not in ids
             assert all(r.payload.get("metadata", {}).get("orgId") == "org-a" for r in results)
         finally:
             await redis_service.delete_collection(col)
@@ -224,7 +228,7 @@ class TestRedisMutations:
                 filter=org_filter("org1"),
             )
             results = (await redis_service.query_nearest_points(col, [req]))[0]
-            assert not any(r.id == "doc-python" for r in results)
+            assert not any(r.id == point_id("doc-python") for r in results)
         finally:
             await redis_service.delete_collection(col)
 
@@ -272,5 +276,40 @@ class TestRedisDimensionMismatch:
             await redis_service.create_collection(col, cfg_small)
             info = await redis_service.get_collection_info(col)
             assert info.dense_dimension == DIM
+        finally:
+            await redis_service.delete_collection(col)
+
+
+# ---------------------------------------------------------------------------
+# Wire protocol
+# ---------------------------------------------------------------------------
+
+class TestRedisRespShapes:
+    """The vector store parses RESP2 arrays out of raw FT.* replies.
+
+    redis-py 6+ defaults to RESP3, where the same commands return maps; the
+    parsers then fail on every call. The providers pin protocol 2.
+    """
+
+    async def test_service_client_is_pinned_to_resp2(self, redis_service) -> None:
+        client = redis_service.get_service_client()
+        assert client.connection_pool.connection_kwargs.get("protocol") == 2
+
+    async def test_ft_info_and_ft_search_replies_are_arrays(self, redis_service) -> None:
+        col = make_collection("redis_resp2")
+        pts = sample_points("org1")
+        idx = f"{col}_idx"
+        try:
+            await redis_service.create_collection(col, make_collection_config())
+            await redis_service.upsert_points(col, pts)
+            await _wait_index_ready(redis_service, col, expected_docs=len(pts))
+
+            client = redis_service.get_service_client()
+            info = await client.execute_command("FT.INFO", idx)
+            assert isinstance(info, list), type(info)
+
+            found = await client.execute_command("FT.SEARCH", idx, "*", "NOCONTENT")
+            assert isinstance(found, list), type(found)
+            assert found[0] == len(pts)
         finally:
             await redis_service.delete_collection(col)

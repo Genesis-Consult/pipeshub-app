@@ -41,6 +41,7 @@ def mock_data_entities_processor():
     proc.on_new_app_roles = AsyncMock()
     proc.on_app_role_deleted = AsyncMock()
     proc.on_record_deleted = AsyncMock()
+    proc.on_records_deleted_cascade = AsyncMock()
     proc.on_record_metadata_update = AsyncMock()
     proc.on_record_content_update = AsyncMock()
     proc.on_updated_record_permissions = AsyncMock()
@@ -99,11 +100,12 @@ def connector(mock_logger, mock_data_entities_processor,
     return c
 
 
-def _make_response(success=True, data=None, error=None):
+def _make_response(success=True, data=None, error=None, status_code=None):
     r = MagicMock()
     r.success = success
     r.data = data
     r.error = error
+    r.status_code = status_code
     return r
 
 
@@ -444,8 +446,10 @@ class TestHandleRecordUpdatesComprehensive:
             content_changed=False, permissions_changed=False,
             external_record_id="page/1",
         )
+        mock_data_entities_processor.get_record_by_external_id = AsyncMock(return_value=MagicMock(id="rec-key"))
         await connector._handle_record_updates(ru)
-        mock_data_entities_processor.on_record_deleted.assert_awaited_once()
+        mock_data_entities_processor.get_record_by_external_id.assert_awaited_once_with(connector.connector_id, "page/1")
+        mock_data_entities_processor.on_record_deleted.assert_awaited_once_with(record_id="rec-key")
 
     @pytest.mark.asyncio
     async def test_new_record(self, connector, mock_data_entities_processor):
@@ -492,6 +496,7 @@ class TestHandleRecordUpdatesComprehensive:
 
     @pytest.mark.asyncio
     async def test_exception_handled(self, connector, mock_data_entities_processor):
+        mock_data_entities_processor.get_record_by_external_id = AsyncMock(return_value=MagicMock(id="rec-key"))
         mock_data_entities_processor.on_record_deleted = AsyncMock(side_effect=Exception("fail"))
         ru = RecordUpdate(
             record=None, is_new=False, is_updated=False,
@@ -501,6 +506,7 @@ class TestHandleRecordUpdatesComprehensive:
         )
         # Should not raise
         await connector._handle_record_updates(ru)
+        mock_data_entities_processor.on_record_deleted.assert_awaited_once_with(record_id="rec-key")
 
 
 # ===========================================================================
@@ -519,12 +525,13 @@ class TestStreamRecordComprehensive:
     async def test_stream_not_found(self, connector):
         connector.data_source = AsyncMock()
         connector.data_source.export_page_markdown = AsyncMock(
-            return_value=_make_response(success=False)
+            return_value=_make_response(success=False, status_code=404)
         )
         record = MagicMock()
         record.external_record_id = "page/1"
-        with pytest.raises(HTTPException):
+        with pytest.raises(HTTPException) as ei:
             await connector.stream_record(record)
+        assert ei.value.status_code == 404
 
 
 # ===========================================================================

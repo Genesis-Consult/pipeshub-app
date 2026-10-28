@@ -1,6 +1,6 @@
 <div align="center">
 
-**Translations:** [English](../../../README.md) · [Français](../fr/README.md) · [Deutsch](../de/README.md) · [简体中文](../zh-CN/README.md) · [日本語](../ja/README.md) · **Русский** · [עברית](../he/README.md) · [한국어](../ko/README.md) · [Español](../es/README.md) · [Português](../pt/README.md) · [Türkçe](../tr/README.md) · [Tiếng Việt](../vi/README.md) · [Italiano](../it/README.md)
+**Translations:** [English](../../../README.md) · [Français](../fr/README.md) · [Deutsch](../de/README.md) · [简体中文](../zh-CN/README.md) · [日本語](../ja/README.md) · **Русский** · [עברית](../he/README.md) · [한국어](../ko/README.md) · [Español](../es/README.md) · [Português](../pt/README.md) · [Türkçe](../tr/README.md) · [Tiếng Việt](../vi/README.md) · [Italiano](../it/README.md) · [Čeština](../cs/README.md)
 
 </div>
 
@@ -210,16 +210,12 @@ PDF (включая сканы), Microsoft Office (Word, Excel, PowerPoint), Goo
 ### Как развернуть PipesHub?
 
 ```bash
-# Clone the repository
-git clone https://github.com/pipeshub-ai/pipeshub-ai.git
-cd pipeshub-ai/deployment/docker-compose
-
-# Set Environment Variables (refer to env.template)
-# Start production deployment
-docker compose -f docker-compose.prod.yml -p pipeshub-ai up -d
+curl -fsSL https://get.pipeshub.com/install | bash
 ```
 
-Примечание: Используйте HTTPS для облачных развёртываний. HTTP может привести к блокировкам безопасности на фронтенде.
+Эта команда запишет файлы Compose в `./pipeshub` и запустит интерактивный установщик. Откройте **http://localhost:3000** по завершении. Используйте HTTPS для облачных развёртываний — HTTP может привести к блокировкам безопасности на фронтенде.
+
+Разработчики, собирающие из исходников, должны клонировать репозиторий и запустить `./install.sh` (или `./install.sh --build`) из корня репозитория. См. [Руководство по развёртыванию](#-руководство-по-развёртыванию).
 
 ### Каких провайдеров LLM поддерживает PipesHub?
 

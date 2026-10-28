@@ -2,6 +2,7 @@
 // Workspace-wide constants
 // ========================================
 
+import type { TFunction } from 'i18next';
 import { GroupType } from './groups/types';
 
 // ── Group types ──────────────────────────────────────────────────
@@ -48,6 +49,19 @@ export const USER_ROLES = {
 
 export type UserRoleValue = (typeof USER_ROLES)[keyof typeof USER_ROLES];
 
+const ROLE_LABEL_KEYS: Record<string, string> = {
+  admin: 'workspace.users.roles.admin',
+  member: 'workspace.users.roles.member',
+  guest: 'workspace.users.roles.guest',
+};
+
+/** Translated label for a role from the server; a role we don't know is shown as sent. */
+export function userRoleLabel(role: string | null | undefined, t: TFunction): string {
+  if (!role) return t('workspace.users.roles.member');
+  const key = ROLE_LABEL_KEYS[role.toLowerCase()];
+  return key ? t(key) : role;
+}
+
 // ── Role option definitions (shared across components) ───────────
 
 /**
@@ -93,3 +107,17 @@ export const ALL_ROLE_OPTIONS: RoleOptionDef[] = [
 export const INVITE_ROLE_OPTIONS: RoleOptionDef[] = ALL_ROLE_OPTIONS.filter(
   (r) => r.value !== USER_ROLES.GUEST
 );
+
+export const MAX_ORG_ADMINS_API_MESSAGE =
+  'An organization can have at most 5 admins.';
+
+export function isMaxOrgAdminsErrorMessage(message: string | undefined): boolean {
+  if (!message) return false;
+  return (
+    message === MAX_ORG_ADMINS_API_MESSAGE ||
+    message.includes('already 5 admins') ||
+    message.includes('at most 5 admins') ||
+    message.includes('would exceed the limit of 5 admins') ||
+    message.includes('maximum of 5 admins')
+  );
+}

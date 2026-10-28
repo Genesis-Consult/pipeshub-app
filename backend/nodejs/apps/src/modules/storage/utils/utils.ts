@@ -4,14 +4,21 @@ import {
   BadRequestError,
   InternalServerError,
   NotFoundError,
+  ServiceUnavailableError,
 } from '../../../libs/errors/http.errors';
 import mongoose from 'mongoose';
 import { Logger } from '../../../libs/services/logger.service';
 import { getMimeType } from '../mimetypes/mimetypes';
-import { Document, StorageVendor } from '../types/storage.service.types';
+import {
+  Document,
+  FilePayload,
+  StorageServiceResponse,
+  StorageVendor,
+} from '../types/storage.service.types';
 import { HTTP_STATUS } from '../../../libs/enums/http-status.enum';
 import { ErrorMetadata } from '../../../libs/errors/base.error';
 import { createReadStream } from 'fs';
+import { STORAGE_WRITE_FAILED_MESSAGE } from '../constants/constants';
 import fs from 'fs';
 import { StorageServiceAdapter } from '../adapter/base-storage.adapter';
 import {
@@ -22,6 +29,37 @@ import {
 const logger = Logger.getInstance({
   service: 'storage',
 });
+
+/**
+ * Write a file to the storage vendor, or fail with a message the uploader can act on.
+ * The vendor's own error (a path, an OS code, an S3 or Azure response) goes to the log only.
+ */
+export async function writeToStorage(
+  adapter: StorageServiceAdapter,
+  payload: FilePayload,
+  context: Record<string, unknown> = {},
+): Promise<StorageServiceResponse<string>> {
+  let response: StorageServiceResponse<string>;
+  try {
+    response = await adapter.uploadDocumentToStorageService(payload);
+  } catch (error) {
+    logger.error('Writing a file to storage failed', {
+      ...context,
+      error: error instanceof Error ? error.message : String(error),
+      metadata: (error as { metadata?: unknown }).metadata,
+    });
+    throw new ServiceUnavailableError(STORAGE_WRITE_FAILED_MESSAGE);
+  }
+  if (response.statusCode !== HTTP_STATUS.OK || !response.data) {
+    logger.error('Writing a file to storage failed', {
+      ...context,
+      statusCode: response.statusCode,
+      error: response.msg,
+    });
+    throw new ServiceUnavailableError(STORAGE_WRITE_FAILED_MESSAGE);
+  }
+  return response;
+}
 
 // Interface for document storage info response
 export interface DocumentInfoResponse {
@@ -81,6 +119,8 @@ async function getDocumentInfoFromDb(
     const document = lean ? await query.lean<Document>().exec() : await query;
 
     if (!document) {
+      // Callers probe for documents that may be gone (deduplicated content
+      // removed with another connector); that is not a server fault.
       throw new NotFoundError('Document not found');
     }
     return { document };
@@ -122,7 +162,7 @@ export async function getDocumentInfo(
     const orgId = extractOrgId(req);
     const documentId = req.params.documentId;
 
-    const orgID = new mongoose.Types.ObjectId(orgId);
+    const orgID = toObjectId(orgId, 'organization');
     if (!documentId) {
       throw new NotFoundError('Document ID is required');
     }
@@ -204,6 +244,33 @@ export function getFullDocumentPath(
 }
 
 /**
+ * The folder holding a virtual record's content revisions.
+ * e.g. 'org1/PipesHub/record-revisions/vr-1'
+ *
+ * Not under `records/`: older records are filed flat at `records/{id}`, and a
+ * move of one of them into its folder path (move-tree) would carry or collide
+ * with revisions stored beneath the same folder.
+ */
+export function getArtifactSetFolder(
+  orgId: string,
+  virtualRecordId: string,
+): string {
+  return getFullDocumentPath(orgId, `record-revisions/${virtualRecordId}`);
+}
+
+/**
+ * Where one content revision of a virtual record keeps its files.
+ * e.g. 'org1/PipesHub/record-revisions/vr-1/0123abcd'
+ */
+export function getArtifactSetRoot(
+  orgId: string,
+  virtualRecordId: string,
+  rev: string,
+): string {
+  return `${getArtifactSetFolder(orgId, virtualRecordId)}/${rev}`;
+}
+
+/**
  * Returns the versioned snapshot path for a specific version number.
  * e.g. 'org1/PipesHub/Finance/doc1/versions/v3.pdf'
  */
@@ -230,6 +297,41 @@ export function getCurrentFilePath(
   return isVersioned
     ? `${rootPath}/current/${documentName}${ext}`
     : `${rootPath}/${documentName}${ext}`;
+}
+
+/**
+ * Every file a document keeps in storage: the current one and one per version,
+ * each as a document-shaped value a storage adapter can delete. Versions that
+ * point at the same place as another copy are listed once.
+ */
+export function storedCopies(document: Document): Document[] {
+  const base: Document =
+    typeof (document as { toObject?: () => Document }).toObject === 'function'
+      ? (document as unknown as { toObject: () => Document }).toObject()
+      : document;
+  const locations = [
+    { s3: base.s3, azureBlob: base.azureBlob, local: base.local },
+    ...(base.versionHistory ?? []).map((version) => ({
+      s3: version.s3,
+      azureBlob: version.azureBlob,
+      local: version.local,
+    })),
+  ];
+  const seen = new Set<string>();
+  const copies: Document[] = [];
+  for (const location of locations) {
+    const key =
+      location.s3?.url ??
+      location.azureBlob?.url ??
+      location.local?.localPath ??
+      location.local?.url;
+    if (key === undefined || key === '' || seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    copies.push({ ...base, ...location });
+  }
+  return copies;
 }
 
 /**
@@ -340,10 +442,10 @@ export async function createPlaceholderDocument(
       documentName,
       documentPath: fullDocumentPath,
       alternateDocumentName,
-      orgId: new mongoose.Types.ObjectId(orgId),
+      orgId: toObjectId(orgId, 'organization'),
       isVersionedFile: isVersionedFile,
       permissions: permissions,
-      initiatorUserId: userId ? new mongoose.Types.ObjectId(userId) : null,
+      initiatorUserId: userId ? toObjectId(userId, 'user') : null,
       customMetadata,
       sizeInBytes: size,
       storageVendor: storageVendor ?? StorageVendor.S3,
@@ -501,6 +603,24 @@ export function serveFileFromLocalStorage(document: Document, res: Response, ver
     logger.error('Error serving local file:', error);
     throw error;
   }
+}
+
+/**
+ * The org and user ids come from the caller's token. A malformed one makes
+ * `new ObjectId` throw a BSONError, which reaches the client as a 500.
+ * isValidObjectId is not enough: it passes a number, which ObjectId turns into
+ * a made-up timestamp id that matches nothing.
+ */
+export function toObjectId(
+  id: unknown,
+  kind: 'organization' | 'user',
+): mongoose.Types.ObjectId {
+  if (typeof id !== 'string' || !mongoose.isObjectIdOrHexString(id)) {
+    throw new BadRequestError(
+      `The ${kind} id in the storage token isn't valid. Issue the token with the 24-character id of an existing ${kind}, then try again.`,
+    );
+  }
+  return new mongoose.Types.ObjectId(id);
 }
 
 export function extractOrgId(

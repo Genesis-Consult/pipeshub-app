@@ -1,6 +1,6 @@
 <div align="center">
 
-**Translations:** [English](../../../README.md) · [Français](../fr/README.md) · [Deutsch](../de/README.md) · [简体中文](../zh-CN/README.md) · [日本語](../ja/README.md) · [Русский](../ru/README.md) · **עברית** · [한국어](../ko/README.md) · [Español](../es/README.md) · [Português](../pt/README.md) · [Türkçe](../tr/README.md) · [Tiếng Việt](../vi/README.md) · [Italiano](../it/README.md)
+**Translations:** [English](../../../README.md) · [Français](../fr/README.md) · [Deutsch](../de/README.md) · [简体中文](../zh-CN/README.md) · [日本語](../ja/README.md) · [Русский](../ru/README.md) · **עברית** · [한국어](../ko/README.md) · [Español](../es/README.md) · [Português](../pt/README.md) · [Türkçe](../tr/README.md) · [Tiếng Việt](../vi/README.md) · [Italiano](../it/README.md) · [Čeština](../cs/README.md)
 
 </div>
 
@@ -212,16 +212,12 @@ PDF (כולל סריקות), Microsoft Office (Word, Excel, PowerPoint), Google 
 ### כיצד אני פורס את PipesHub?
 
 ```bash
-# Clone the repository
-git clone https://github.com/pipeshub-ai/pipeshub-ai.git
-cd pipeshub-ai/deployment/docker-compose
-
-# Set Environment Variables (refer to env.template)
-# Start production deployment
-docker compose -f docker-compose.prod.yml -p pipeshub-ai up -d
+curl -fsSL https://get.pipeshub.com/install | bash
 ```
 
-הערה: השתמש ב-HTTPS לפריסות בענן. HTTP עלול לגרום לחסימות אבטחה בצד הלקוח.
+זה כותב את קובצי ה-Compose ל-`./pipeshub` ומפעיל את מתקין האינטראקטיבי. פתח את **http://localhost:3000** לאחר הסיום. השתמש ב-HTTPS לפריסות בענן — HTTP עלול לגרום לחסימות אבטחה בצד הלקוח.
+
+מפתחים הבונים מקוד מקור צריכים לשכפל את המאגר ולהפעיל את `./install.sh` (או `./install.sh --build`) משורש המאגר. ראו את [מדריך הפריסה](#-מדריך-פריסה).
 
 ### אילו ספקי LLM PipesHub תומך בהם?
 

@@ -12,7 +12,10 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from fastapi import HTTPException
 
+from app.config.constants.http_status_code import HttpStatusCode
+from app.connectors.core.base.error.stream_errors import to_stream_error
 from app.connectors.sources.gitlab.attachments import AttachmentsHelper
 from app.connectors.sources.gitlab.constants import UPLOAD_PATTERN
 
@@ -126,6 +129,14 @@ class TestParseGitlabUploads:
 
 
 class TestEmbedImagesAsBase64:
+    async def test_secrets_in_the_body_are_redacted(self) -> None:
+        _, helper = _make_attachment_helper()
+
+        result = await helper.embed_images_as_base64(
+            "key AKIAIOSFODNN7EXAMPLA", "https://gitlab.com/api/v4/projects/1"
+        )
+        assert result == "key «REDACTED:aws-access-key»"
+
     async def test_image_embedded_when_under_size_limit(self) -> None:
         c, helper = _make_attachment_helper()
         text = f"![img](/uploads/{_HASH32}/img.png)"
@@ -388,6 +399,59 @@ class TestMakeFilesRecordsFromNotes:
 # ===========================================================================
 
 
+class TestUploadLinksStayInUploads:
+    async def test_a_filename_with_dot_segments_is_not_an_attachment(self) -> None:
+        """``..`` would resolve to another API path, fetched with the connector's token."""
+        _, helper = _make_attachment_helper()
+        text = f"[x](/uploads/{_HASH32}/../../../../projects/7/repository/files/s.yml/raw?ref=main)"
+        attachments, _ = await helper.parse_gitlab_uploads(text)
+        assert attachments == []
+
+    async def test_a_stored_record_that_leaves_uploads_is_refused_before_any_request(self) -> None:
+        c, helper = _make_attachment_helper()
+        record = MagicMock()
+        record.id = "rec-1"
+        record.weburl = (f"{c._gitlab_base_url}/api/v4/projects/42/uploads/{_HASH32}"
+                         "/../../../../projects/7/repository/files/s.yml/raw")
+        record.external_record_id = record.weburl
+        c.data_source.get_attachment_files_content = MagicMock()
+        with pytest.raises(HTTPException):
+            async for _ in helper.fetch_attachment_content(record):
+                pass
+        c.data_source.get_attachment_files_content.assert_not_called()
+
+    def test_is_upload_url(self) -> None:
+        from app.connectors.sources.gitlab.attachments import is_upload_url
+
+        base = "https://gitlab.example.com"
+        good = f"{base}/api/v4/projects/1/uploads/{_HASH32}/r%C3%A9sum%C3%A9.pdf"
+        assert is_upload_url(good, base)
+        assert not is_upload_url(f"{base}/api/v4/projects/1/uploads/{_HASH32}/../../../2/variables", base)
+        assert not is_upload_url(f"https://evil.example/api/v4/projects/1/uploads/{_HASH32}/a.pdf", base)
+
+    def test_is_upload_url_under_a_relative_url_install(self) -> None:
+        from app.connectors.sources.gitlab.attachments import is_upload_url
+
+        base = "https://example.com/gitlab"
+        assert is_upload_url(f"{base}/api/v4/projects/1/uploads/{_HASH32}/a.pdf", base)
+        assert is_upload_url(f"{base}/api/v4/projects/1/uploads/{_HASH32}/a.pdf", f"{base}/")
+        assert not is_upload_url(f"{base}/api/v4/projects/1/uploads/{_HASH32}/../../../2/variables", base)
+        # Climbing out of the prefix lands outside the instance's API.
+        assert not is_upload_url(f"{base}/api/v4/projects/1/uploads/{_HASH32}/../../../../../../api/v4/user", base)
+        assert not is_upload_url(f"https://example.com/api/v4/projects/1/uploads/{_HASH32}/a.pdf", base)
+        assert not is_upload_url(f"{base}.evil.example/api/v4/projects/1/uploads/{_HASH32}/a.pdf", base)
+        assert not is_upload_url(f"{base}/api/v4/projects/1/uploads/{_HASH32}/a.pdf?x=1", base)
+
+
+class TestInternalNotes:
+    async def test_attachments_of_an_internal_note_are_not_filed_under_the_issue(self) -> None:
+        c, helper = _make_attachment_helper()
+        issue = MagicMock(project_id=42, iid=1, title="t")
+        note = MagicMock(body=f"[doc.pdf](/uploads/{_HASH32}/doc.pdf)", internal=True)
+        c.runtime.ds_call = AsyncMock(return_value=MagicMock(success=True, data=[note], error=None))
+        assert await helper.make_files_records_from_notes(issue, _record()) == []
+
+
 class TestMakeFilesRecordsFromNotesMr:
     async def test_happy_path_returns_file_records(self) -> None:
         """MR notes with attachments produce FileRecord updates."""
@@ -436,8 +500,8 @@ class TestFetchAttachmentContent:
 
         record = MagicMock()
         record.id = "rec-1"
-        record.external_record_id = "https://gitlab.com/uploads/abc/file.pdf"
-        record.weburl = "https://gitlab.com/uploads/abc/file.pdf"
+        record.external_record_id = f"{c._gitlab_base_url}/api/v4/projects/42/uploads/{_HASH32}/file.pdf"
+        record.weburl = record.external_record_id
 
         async def _gen():
             yield b"chunk1"
@@ -451,21 +515,41 @@ class TestFetchAttachmentContent:
 
         assert chunks == [b"chunk1", b"chunk2"]
 
-    async def test_streaming_error_wrapped(self) -> None:
-        """Exception during streaming is wrapped in a generic Exception."""
+    async def test_streaming_error_propagates_with_source_status(self) -> None:
+        """The SDK error must reach the router intact: re-wrapping it in a bare
+        Exception erased the status and turned every download failure into a 500."""
+        import httpx
+
         c, helper = _make_attachment_helper()
 
         record = MagicMock()
         record.id = "rec-1"
-        record.external_record_id = "https://gitlab.com/uploads/abc/file.pdf"
-        record.weburl = "https://gitlab.com/uploads/abc/file.pdf"
+        record.external_record_id = f"{c._gitlab_base_url}/api/v4/projects/42/uploads/{_HASH32}/file.pdf"
+        record.weburl = record.external_record_id
+
+        request = httpx.Request("GET", record.weburl)
+        response = httpx.Response(HttpStatusCode.NOT_FOUND.value, request=request)
 
         async def _gen_fail():
-            raise IOError("network failure")
+            raise httpx.HTTPStatusError("gone", request=request, response=response)
             yield b""  # noqa: unreachable — marks as async generator
 
         c.data_source.get_attachment_files_content = MagicMock(return_value=_gen_fail())
 
-        with pytest.raises(Exception):
+        with pytest.raises(httpx.HTTPStatusError) as exc:
             async for _ in helper.fetch_attachment_content(record):
                 pass
+        assert to_stream_error(exc.value).status_code == HttpStatusCode.NOT_FOUND.value
+
+    async def test_missing_weburl_is_a_client_error(self) -> None:
+        c, helper = _make_attachment_helper()
+
+        record = MagicMock()
+        record.id = "rec-1"
+        record.external_record_id = "att-1"
+        record.weburl = None
+
+        with pytest.raises(HTTPException) as exc:
+            async for _ in helper.fetch_attachment_content(record):
+                pass
+        assert exc.value.status_code == HttpStatusCode.BAD_REQUEST.value

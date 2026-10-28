@@ -16,9 +16,10 @@ import type { SelectOption, CheckboxOption, TagItem } from '../../components';
 import { useUsersStore } from '../store';
 import { UsersApi } from '../api';
 import { GroupsApi } from '../../groups/api';
-import { USER_ROLES, INVITE_ROLE_OPTIONS } from '../../constants';
+import { USER_ROLES, INVITE_ROLE_OPTIONS, isMaxOrgAdminsErrorMessage } from '../../constants';
 import { GroupType, type Group } from '../../groups/types';
 import { useUserStore, selectIsAdmin } from '@/lib/store/user-store';
+import { isProcessedError } from '@/lib/api';
 
 // ========================================
 // Constants
@@ -195,9 +196,13 @@ export function InviteUsersSidebar({
 
         // Update role if changed (stored on User.role, not admin group)
         if (newRole !== currentRole) {
-          await UsersApi.updateUser(userId, {
-            role: newRole === USER_ROLES.ADMIN ? 'admin' : 'member',
-          });
+          await UsersApi.updateUser(
+            userId,
+            {
+              role: newRole === USER_ROLES.ADMIN ? 'admin' : 'member',
+            },
+            { suppressErrorToast: true },
+          );
         }
 
         // Update group memberships
@@ -236,7 +241,7 @@ export function InviteUsersSidebar({
         });
       } else {
         // ── Create mode: send new invite ──
-        await UsersApi.inviteUsers(
+        const { queued } = await UsersApi.inviteUsers(
           validEmails,
           inviteGroupIds.length > 0 ? inviteGroupIds : undefined,
           isAdmin ? inviteRole || USER_ROLES.MEMBER : USER_ROLES.MEMBER,
@@ -246,28 +251,57 @@ export function InviteUsersSidebar({
           validEmails.length === 1
             ? validEmails[0]
             : `${validEmails.length} users`;
-        addToast({
-          variant: 'success',
-          title: t('workspace.users.invite.successTitle', 'Invite sent!'),
-          description: t('workspace.users.invite.successDescription', {
-            email: emailDisplay,
-            defaultValue: `${emailDisplay} has been invited`,
-          }),
-          duration: 3000,
-        });
+        addToast(
+          queued
+            ? {
+                variant: 'success',
+                title: t('workspace.users.invite.queuedTitle', 'Invites queued'),
+                description: t('workspace.users.invite.queuedDescription', {
+                  email: emailDisplay,
+                  defaultValue: `Emails to ${emailDisplay} are being sent in the background. You'll get a notification if any can't be delivered.`,
+                }),
+                duration: 5000,
+              }
+            : {
+                variant: 'success',
+                title: t('workspace.users.invite.successTitle', 'Invite sent!'),
+                description: t('workspace.users.invite.successDescription', {
+                  email: emailDisplay,
+                  defaultValue: `${emailDisplay} has been invited`,
+                }),
+                duration: 3000,
+              },
+        );
       }
 
       // Close panel and refresh parent list
       closeInvitePanel();
       onInviteSuccess?.();
-    } catch {
-      addToast({
-        variant: 'error',
-        title: isEditMode
-          ? t('workspace.users.invite.editError', 'Failed to update invite')
-          : t('workspace.users.invite.errorGeneric', 'Failed to send invite'),
-        duration: 5000,
-      });
+    } catch (err: unknown) {
+      const apiMessage = isProcessedError(err) ? err.message : undefined;
+      if (isMaxOrgAdminsErrorMessage(apiMessage)) {
+        addToast({
+          variant: 'error',
+          title: t(
+            'workspace.users.actions.maxAdminsReachedTitle',
+            'Cannot add another admin'
+          ),
+          description: t(
+            'workspace.users.actions.maxAdminsReached',
+            'An organization can have at most 5 admins.'
+          ),
+          duration: 5000,
+        });
+      } else {
+        addToast({
+          variant: 'error',
+          title: isEditMode
+            ? t('workspace.users.invite.editError', 'Failed to update invite')
+            : t('workspace.users.invite.errorGeneric', 'Failed to send invite'),
+          ...(apiMessage ? { description: apiMessage } : {}),
+          duration: 5000,
+        });
+      }
     } finally {
       setIsInviting(false);
     }
@@ -438,7 +472,7 @@ export function InviteUsersSidebar({
   // Panel title & button labels change in edit mode
   const panelTitle = isEditMode
     ? t('workspace.users.invite.editTitle', 'Edit Invite')
-    : t('workspace.users.invite.title', 'Invite User(s)');
+    : t('workspace.users.invite.title');
 
   const primaryLabel = isEditMode
     ? t('workspace.users.invite.update', 'Update Invite')
@@ -585,7 +619,7 @@ export function InviteUsersSidebar({
         </FormField>
 
         {/* Role dropdown */}
-        <FormField label={t('workspace.users.invite.roleLabel', 'Assign Role')}>
+        <FormField label={t('workspace.users.invite.roleLabel')}>
           <SelectDropdown
             value={isAdmin ? inviteRole : USER_ROLES.MEMBER}
             onChange={setInviteRole}

@@ -45,6 +45,8 @@ async def test_drive_content_detection_uses_persisted_file_hash(
     connector._pass_extension_filter = MagicMock(return_value=True)
     connector._create_file_record = AsyncMock(return_value=stored_file)
     connector._get_item_permissions = AsyncMock(return_value=[])
+    connector._drive_item_access = AsyncMock(return_value=(True, []))
+    connector._parent_external_id = MagicMock(return_value=None)
     item = SimpleNamespace(
         id='external-1', name='example.docx', root=None, deleted=None,
         e_tag=etag, file=SimpleNamespace(hashes=SimpleNamespace(quick_xor_hash=current_hash)),

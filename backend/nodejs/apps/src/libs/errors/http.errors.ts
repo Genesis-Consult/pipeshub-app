@@ -39,6 +39,12 @@ export class LargePayloadError extends HttpError {
   }
 }
 
+export class PaymentRequiredError extends HttpError {
+  constructor(message: string, metadata?: ErrorMetadata) {
+    super('PAYMENT_REQUIRED', message, HTTP_STATUS.PAYMENT_REQUIRED, metadata);
+  }
+}
+
 export class ForbiddenError extends HttpError {
   constructor(message: string, metadata?: ErrorMetadata) {
     super('FORBIDDEN', message, HTTP_STATUS.FORBIDDEN, metadata);
@@ -108,6 +114,17 @@ export class UnprocessableEntityError extends HttpError {
       'UNPROCESSABLE_ENTITY',
       message,
       HTTP_STATUS.UNPROCESSABLE_ENTITY,
+      metadata,
+    );
+  }
+}
+
+export class UnsupportedMediaTypeError extends HttpError {
+  constructor(message: string, metadata?: ErrorMetadata) {
+    super(
+      'UNSUPPORTED_MEDIA_TYPE',
+      message,
+      HTTP_STATUS.UNSUPPORTED_MEDIA_TYPE,
       metadata,
     );
   }
