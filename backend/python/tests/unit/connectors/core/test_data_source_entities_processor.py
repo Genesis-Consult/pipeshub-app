@@ -457,7 +457,7 @@ class TestHandleRecordPermissionsRole:
         await proc._handle_record_permissions(record, [permission], tx_store)
 
         tx_store.get_app_role_by_external_id.assert_awaited_once_with(
-            external_id="5", connector_id="bookstack-connector"
+            external_id="5", connector_id="bookstack-connector", raise_on_error=True
         )
         tx_store.batch_create_edges.assert_awaited_once()
 
@@ -6845,14 +6845,15 @@ class TestKbUploadProcessRecord:
             entity_type=EntityType.ROLE,
         )
 
-        with patch.object(proc, "_handle_record_permissions", new_callable=AsyncMock):
-            await proc._process_record(record, [permission], tx_store)
+        tx_store.get_app_role_by_external_id.return_value = MagicMock(id="role-1")
+        await proc._process_record(record, [permission], tx_store, replace_permissions=True)
 
-        tx_store.delete_edges_to.assert_awaited_once_with(
-            to_id="record-1",
-            to_collection=CollectionNames.RECORDS.value,
-            collection=CollectionNames.PERMISSION.value,
-        )
+        tx_store.replace_edges_to.assert_awaited_once()
+        args = tx_store.replace_edges_to.await_args.args
+        assert args[0] == "record-1"
+        assert args[1] == CollectionNames.RECORDS.value
+        assert len(args[2]) == 1
+        assert args[2][0]["_from"] == f"{CollectionNames.ROLES.value}/role-1"
 
 
 class TestOnRecordsDeletedCascade:

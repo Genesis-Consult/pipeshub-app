@@ -510,7 +510,7 @@ services:
   # backend/python/app/sandbox/docker_proxy.py.
   docker-socket-proxy:
     profiles: ["sandbox"]
-    image: ${PIPESHUB_IMAGE:-pipeshubai/pipeshub-ai}:${IMAGE_TAG:-latest}
+    image: ${PIPESHUB_IMAGE_REPOSITORY:-pipeshubai/pipeshub-ai}:${IMAGE_TAG:-latest}
     restart: always
     # Root only to open the root-owned socket; it holds no capabilities.
     user: "0:0"

@@ -1592,9 +1592,13 @@ class SharePointConnector(BaseConnector):
                 except GraphQueryError as read_error:
                     self.logger.warning(f"Re-indexing {item_id}: its stored file record could not be read: {read_error}")
                     existing_file_record = None
-                if existing_file_record is None or existing_file_record.quick_xor_hash != current_hash:
+                if existing_file_record is None:
                     content_changed = True
-                    is_updated = True
+                elif current_hash is not None and existing_file_record.quick_xor_hash is not None:
+                    content_changed = existing_file_record.quick_xor_hash != current_hash
+                else:
+                    content_changed = metadata_changed
+                is_updated = is_updated or content_changed
 
         if is_root:
             access: tuple[bool, list[Permission]] | None = (True, [])

@@ -41,6 +41,7 @@ def mock_data_entities_processor():
     proc.on_new_app_roles = AsyncMock()
     proc.on_app_role_deleted = AsyncMock()
     proc.on_record_deleted = AsyncMock()
+    proc.on_records_deleted_cascade = AsyncMock()
     proc.on_record_metadata_update = AsyncMock()
     proc.on_record_content_update = AsyncMock()
     proc.on_updated_record_permissions = AsyncMock()

@@ -44,6 +44,9 @@ jobs:
           tests/unit/services/graph_db
           tests/unit/utils/test_docx_preflight.py
           tests/unit/utils/test_libreoffice_convert.py
+          tests/unit/sandbox
+          tests/unit/api/routes/test_toolset_instance_secrets.py
+          tests/unit/modules/parsers/test_image_parser_ssrf.py
           --tb=short
   node:
     runs-on: ubuntu-latest

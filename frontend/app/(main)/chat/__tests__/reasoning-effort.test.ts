@@ -392,6 +392,7 @@ describe('streamRegenerateForSlot — reasoningEffort forwarding', () => {
   // Python turns web search off when `tools` is a list without a web_search entry; omitted, it keeps every tool.
   it('leaves the tool list out when every tool is selected, as a normal send does', async () => {
     registerModel(ASSISTANT_CTX, { isReasoning: false });
+    useChatStore.getState().setQueryMode('agent');
     useChatStore.setState({
       universalAgentStreamTools: null,
       universalAgentToolCatalogFullNames: ['jira.search_issues', 'slack.send_message'],
@@ -401,6 +402,7 @@ describe('streamRegenerateForSlot — reasoningEffort forwarding', () => {
 
   it('sends the chosen tools when only some are selected', async () => {
     registerModel(ASSISTANT_CTX, { isReasoning: false });
+    useChatStore.getState().setQueryMode('agent');
     useChatStore.setState({
       universalAgentStreamTools: ['inst-1:jira.search_issues'],
       universalAgentToolCatalogFullNames: ['inst-1:jira.search_issues', 'inst-1:slack.send_message'],
