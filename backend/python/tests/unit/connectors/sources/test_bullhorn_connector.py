@@ -12,6 +12,7 @@ original_registry_module = sys.modules.get(registry_module_name)
 
 streaming_module = types.ModuleType(streaming_module_name)
 streaming_module.create_stream_record_response = MagicMock()
+streaming_module.invoke_with_structured_output_and_reflection = AsyncMock()
 sys.modules[streaming_module_name] = streaming_module
 registry_module = types.ModuleType(registry_module_name)
 
@@ -64,6 +65,7 @@ def build_connector(
                 "client_secret": "client-secret",
                 "username": "api-user",
                 "password": "password",
+                "data_center": "ger",
             }
         }
     )
@@ -80,15 +82,24 @@ def build_connector(
 
 
 @pytest.mark.asyncio
-async def test_init_reconciles_visibility_from_staff_group() -> None:
+@pytest.mark.parametrize(
+    "override", ["", "https://cls71.bullhornstaffing.com/BullhornSTAFFING"]
+)
+async def test_init_reconciles_visibility_from_staff_group(override: str) -> None:
     connector, tx_store = build_connector()
+    connector.config_service.get_config.return_value["auth"][
+        "candidate_ui_base_url"
+    ] = override
+    discovered_url = "https://cls72.bullhornstaffing.com/BullhornSTAFFING"
 
     with patch(
         "app.connectors.sources.bullhorn.connector.BullhornClient"
     ) as client_class:
         client_class.return_value.test_connection = AsyncMock(return_value=True)
+        client_class.return_value.candidate_ui_base_url = discovered_url
         assert await connector.init() is True
 
+    assert connector.candidate_ui_base_url == (override or discovered_url)
     tx_store.reconcile_app_access_from_group.assert_awaited_once_with(
         "bullhorn-app",
         BullhornConnector.DEFAULT_STAFF_GROUP_CONNECTOR_ID,

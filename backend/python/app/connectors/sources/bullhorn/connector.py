@@ -99,19 +99,11 @@ if TYPE_CHECKING:
                         is_secret=True,
                     ),
                     AuthField(
-                        name="data_center",
-                        display_name="Bullhorn Data Center",
-                        description="Bullhorn data-center code, for example ger",
-                        default_value="ger",
-                        max_length=30,
-                    ),
-                    AuthField(
                         name="candidate_ui_base_url",
                         display_name="Candidate UI Base URL",
                         description=(
-                            "Optional Bullhorn Staffing URL used for result links, "
-                            "for example https://cls70.bullhornstaffing.com/"
-                            "BullhornSTAFFING"
+                            "Optional override for the Bullhorn Staffing URL used "
+                            "in result links. Leave blank to discover it automatically."
                         ),
                         required=False,
                         max_length=2048,
@@ -254,12 +246,14 @@ class BullhornConnector(BaseConnector):
                 client_secret=auth["client_secret"],
                 username=auth["username"],
                 password=auth["password"],
-                data_center=str(auth.get("data_center") or "ger").strip().lower(),
             ),
             self.logger,
         )
         try:
-            return await self.client.test_connection()
+            connected = await self.client.test_connection()
+            if not self.candidate_ui_base_url:
+                self.candidate_ui_base_url = self.client.candidate_ui_base_url
+            return connected
         except BullhornApiError as exc:
             await self.client.close()
             self.client = None

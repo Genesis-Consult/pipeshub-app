@@ -6,6 +6,7 @@ import asyncio
 import base64
 import binascii
 import random
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -33,7 +34,6 @@ class BullhornCredentials:
     client_secret: str
     username: str
     password: str
-    data_center: str = "ger"
 
 
 @dataclass(frozen=True)
@@ -68,6 +68,7 @@ class BullhornResume:
 class BullhornClient:
     """Caches one Bullhorn REST session and refreshes it only when required."""
 
+    LOGIN_INFO_URL = "https://rest.bullhornstaffing.com/rest-services/loginInfo"
     CANDIDATE_FIELDS = ",".join(
         [
             "id",
@@ -134,17 +135,61 @@ class BullhornClient:
         self._refresh_token: str | None = None
         self._rest_url: str | None = None
         self._rest_token: str | None = None
+        self.candidate_ui_base_url = ""
 
-    @property
-    def _auth_base_url(self) -> str:
-        return f"https://auth-{self.credentials.data_center}.bullhornstaffing.com/oauth"
+    @staticmethod
+    def _validate_login_info_url(value: object, paths: tuple[str, ...]) -> str:
+        url = urlparse(value.strip()) if isinstance(value, str) else urlparse("")
+        if (
+            url.scheme != "https"
+            or not url.hostname
+            or not re.fullmatch(r"(?:[a-z0-9-]+\.)+bullhornstaffing\.com", url.hostname)
+            or url.username is not None
+            or url.port not in (None, 443)
+            or url.params
+            or url.query
+            or url.fragment
+            or url.path.removesuffix("/") not in paths
+        ):
+            raise ValueError("Invalid Bullhorn URL")
+        return url.geturl().rstrip("/")
 
-    @property
-    def _rest_login_url(self) -> str:
-        return (
-            f"https://rest-{self.credentials.data_center}.bullhornstaffing.com/"
-            "rest-services/login"
-        )
+    async def _discover_login_urls(self) -> tuple[str, str, str]:
+        try:
+            info = await self._request_json(
+                "GET",
+                self.LOGIN_INFO_URL,
+                params={"username": self.credentials.username},
+                authenticated=False,
+                allow_redirects=False,
+            )
+        except BullhornApiError as exc:
+            detail = f" (HTTP {exc.status})" if exc.status is not None else ""
+            raise BullhornApiError(
+                f"Bullhorn loginInfo request failed{detail}"
+            ) from None
+        except ValueError:
+            raise BullhornApiError("Bullhorn loginInfo returned invalid JSON") from None
+
+        try:
+            oauth_url = self._validate_login_info_url(info.get("oauthUrl"), ("/oauth",))
+            rest_url = self._validate_login_info_url(
+                info.get("restUrl"), ("/rest-services",)
+            )
+        except ValueError:
+            raise BullhornApiError(
+                "Bullhorn loginInfo returned invalid API URLs"
+            ) from None
+
+        try:
+            ats_url = self._validate_login_info_url(
+                info.get("atsUrl"), ("", "/BullhornSTAFFING")
+            )
+        except ValueError:
+            ats_url = ""
+        if ats_url and not urlparse(ats_url).path:
+            ats_url = f"{ats_url}/BullhornSTAFFING"
+        return oauth_url, rest_url, ats_url
 
     async def open(self) -> None:
         if self._session is None or self._session.closed:
@@ -161,11 +206,12 @@ class BullhornClient:
         async with self._auth_lock:
             if self._rest_token and self._rest_url and not force:
                 return
+            oauth_url, rest_url, ats_url = await self._discover_login_urls()
             try:
                 token_payload = (
-                    await self._refresh_access_token()
+                    await self._refresh_access_token(oauth_url)
                     if self._refresh_token and not force
-                    else await self._authorize_with_credentials()
+                    else await self._authorize_with_credentials(oauth_url)
                 )
             except BullhornApiError:
                 if not self._refresh_token or force:
@@ -175,7 +221,7 @@ class BullhornClient:
                     "authorization code"
                 )
                 self._refresh_token = None
-                token_payload = await self._authorize_with_credentials()
+                token_payload = await self._authorize_with_credentials(oauth_url)
 
             access_token = token_payload.get("access_token")
             self._refresh_token = token_payload.get("refresh_token")
@@ -184,7 +230,7 @@ class BullhornClient:
 
             login_payload = await self._request_json(
                 "POST",
-                self._rest_login_url,
+                f"{rest_url}/login",
                 params={"version": "*", "access_token": access_token},
                 authenticated=False,
             )
@@ -193,6 +239,7 @@ class BullhornClient:
             if not self._rest_token or not self._rest_url:
                 raise BullhornApiError("Bullhorn REST login response is incomplete")
             self._rest_url = self._rest_url.rstrip("/") + "/"
+            self.candidate_ui_base_url = ats_url
 
     async def test_connection(self) -> bool:
         await self.authenticate()
@@ -344,7 +391,7 @@ class BullhornClient:
                 return result
             start += len(rows)
 
-    async def _authorize_with_credentials(self) -> dict[str, Any]:
+    async def _authorize_with_credentials(self, oauth_url: str) -> dict[str, Any]:
         assert self._session is not None
         params = {
             "client_id": self.credentials.client_id,
@@ -355,7 +402,7 @@ class BullhornClient:
         }
         try:
             async with self._session.get(
-                f"{self._auth_base_url}/authorize",
+                f"{oauth_url}/authorize",
                 params=params,
                 allow_redirects=False,
             ) as response:
@@ -374,7 +421,7 @@ class BullhornClient:
             raise BullhornApiError("Bullhorn authorization redirect omitted code")
         return await self._request_json(
             "POST",
-            f"{self._auth_base_url}/token",
+            f"{oauth_url}/token",
             data={
                 "grant_type": "authorization_code",
                 "code": code,
@@ -384,10 +431,10 @@ class BullhornClient:
             authenticated=False,
         )
 
-    async def _refresh_access_token(self) -> dict[str, Any]:
+    async def _refresh_access_token(self, oauth_url: str) -> dict[str, Any]:
         return await self._request_json(
             "POST",
-            f"{self._auth_base_url}/token",
+            f"{oauth_url}/token",
             data={
                 "grant_type": "refresh_token",
                 "refresh_token": self._refresh_token,
@@ -429,6 +476,7 @@ class BullhornClient:
         data: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
         authenticated: bool,
+        allow_redirects: bool = True,
     ) -> dict[str, Any]:
         await self.open()
         assert self._session is not None
@@ -436,9 +484,18 @@ class BullhornClient:
             try:
                 await self._wait_for_rate_limit()
                 async with self._session.request(
-                    method, url, params=params, data=data, headers=headers
+                    method,
+                    url,
+                    params=params,
+                    data=data,
+                    headers=headers,
+                    allow_redirects=allow_redirects,
                 ) as response:
                     await self._apply_rate_limit_headers(response.headers)
+                    if not allow_redirects and 300 <= response.status < 400:
+                        raise BullhornApiError(
+                            "Unexpected Bullhorn redirect", status=response.status
+                        )
                     if response.status == 401 and authenticated:
                         raise BullhornApiError(
                             "Bullhorn REST session expired", status=401

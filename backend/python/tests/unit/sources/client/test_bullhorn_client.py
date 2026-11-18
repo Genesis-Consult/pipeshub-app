@@ -1,5 +1,5 @@
 import base64
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -17,6 +17,100 @@ def client() -> BullhornClient:
         BullhornCredentials("client", "secret", "user", "password"),
         AsyncMock(),
     )
+
+
+@pytest.mark.asyncio
+async def test_authentication_uses_discovered_urls_and_refreshes_them(
+    client: BullhornClient,
+) -> None:
+    request_json = AsyncMock(
+        side_effect=[
+            {
+                "oauthUrl": "https://auth-frk.bullhornstaffing.com/oauth/",
+                "restUrl": "https://rest-frk.bullhornstaffing.com/rest-services/",
+                "atsUrl": "https://cls72.bullhornstaffing.com",
+            },
+            {"access_token": "first-access", "refresh_token": "refresh"},
+            {
+                "BhRestToken": "first-session",
+                "restUrl": "https://rest72.bullhornstaffing.com/rest-services/company/",
+            },
+            BullhornApiError("Session expired", status=401),
+            {
+                "oauthUrl": "https://auth-fra.bullhornstaffing.com/oauth",
+                "restUrl": "https://rest-fra.bullhornstaffing.com/rest-services",
+            },
+            {"access_token": "second-access"},
+            {
+                "BhRestToken": "second-session",
+                "restUrl": "https://rest71.bullhornstaffing.com/rest-services/company",
+            },
+            {"data": []},
+        ]
+    )
+    client._request_json = request_json  # type: ignore[method-assign]
+    session = MagicMock(closed=False)
+    session.get.return_value.__aenter__.return_value = MagicMock(
+        status=302, headers={"Location": "https://example.test/callback?code=code"}
+    )
+    client._session = session
+
+    await client.authenticate()
+    assert (
+        client.candidate_ui_base_url
+        == "https://cls72.bullhornstaffing.com/BullhornSTAFFING"
+    )
+    assert await client.test_connection()
+
+    session.get.assert_called_once()
+    assert session.get.call_args.args == (
+        "https://auth-frk.bullhornstaffing.com/oauth/authorize",
+    )
+    calls = request_json.await_args_list
+    assert [call.args[1] for call in calls] == [
+        "https://rest.bullhornstaffing.com/rest-services/loginInfo",
+        "https://auth-frk.bullhornstaffing.com/oauth/token",
+        "https://rest-frk.bullhornstaffing.com/rest-services/login",
+        "https://rest72.bullhornstaffing.com/rest-services/company/search/Candidate",
+        "https://rest.bullhornstaffing.com/rest-services/loginInfo",
+        "https://auth-fra.bullhornstaffing.com/oauth/token",
+        "https://rest-fra.bullhornstaffing.com/rest-services/login",
+        "https://rest71.bullhornstaffing.com/rest-services/company/search/Candidate",
+    ]
+    assert calls[0].kwargs["params"] == {"username": "user"}
+    assert calls[0].kwargs["allow_redirects"] is False
+    assert calls[5].kwargs["data"]["refresh_token"] == "refresh"
+    assert calls[7].kwargs["headers"] == {"BhRestToken": "second-session"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "url",
+    [
+        None,
+        "https://auth-frk.bullhornstaffing.com.example.test/oauth",
+        "https://auth-frk.bullhornstaffing.com:8443/oauth",
+    ],
+)
+async def test_authentication_rejects_untrusted_login_info_before_sending_password(
+    client: BullhornClient,
+    url: str | None,
+) -> None:
+    request_json = AsyncMock(
+        return_value={
+            "oauthUrl": url,
+            "restUrl": "https://rest-frk.bullhornstaffing.com/rest-services",
+        }
+    )
+    client._request_json = request_json  # type: ignore[method-assign]
+    session = MagicMock(closed=False)
+    client._session = session
+
+    with pytest.raises(BullhornApiError, match="invalid API URLs"):
+        await client.authenticate()
+
+    request_json.assert_awaited_once()
+    session.get.assert_not_called()
 
 
 def candidate(*, parsed_resume_file_id: int | None = None) -> BullhornCandidate:
